@@ -1,0 +1,15 @@
+[package]
+name = "oot"
+version = "0.1.0"
+edition = "2021"
+description = "Git settles lines. Oot settles meaning."
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+anyhow = "1"
+tree-sitter = "0.23"
+tree-sitter-rust = "0.23"

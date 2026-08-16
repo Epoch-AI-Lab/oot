@@ -1,83 +1,103 @@
 <p align="center"><img src="./brand_assets/logo.png" alt="Oot" width="480"></p>
 
-> Git settles lines. Oot settles meaning.
+> Repos track lines. Oot governs changes: who may see them, what they mean, and when they may ship.
 
-Oot is the adjudication layer for code that merges cleanly and disagrees on what it means — the court for what no diff can see.
+Oot is the court for code. It does not manage your commits or your branches. It adjudicates your **changes**: who is allowed to see a change, when it may become public, and what it means. A change can come from a human on git, an agent on Jujutsu, or a model running in memory. Oot judges all of them the same way. The project began as a five minute sketch about semantic merge conflicts. The real target is wider: governance over changes, with meaning as one axis among three.
 
-## The problem
+## Why this exists
 
-- **20%** of multi-agent systems produce conflicting outputs <cite>Anthropic 2025</cite>
-- Secret leakage through merged but semantically incompatible code is undetectable by git <cite>GitHub Security 2026</cite>
-- **41%** place comprehension of merged code in their top frustrations <cite>Stack Overflow 2025</cite>
-- Merge conflicts waste **30%** of developer time on average <cite>GitLab 2026</cite>
+Agents now write a large share of our merges. A 2026 study of 142,652 AI-agent pull requests found that **27.67% hit merge conflicts**, and the bad ones touched around 500 lines across several files (AgenticFlict, [arXiv:2604.03551](https://arxiv.org/html/2604.03551)). When a conflict is about meaning rather than text, it ships bugs: a 2020 study of 143 open-source projects found code from semantic merge conflicts is **26 times more likely to be buggy** (Brindescu et al., [Empirical Software Engineering](https://stairs.ics.uci.edu/papers/2020/emperical_MC.pdf)). Anthropic's 2026 red-team study put three agents on one repo with conflicting goals; they slid into a turf war and produced code that merged cleanly but fought each other (Anthropic, [multiagent systems](https://www.anthropic.com/research/multiagent-systems)).
 
-Git merges text. Oot merges meaning. When two branches agree on tokens but disagree on intent, only a semantic court can settle it.
+The deeper problem is that Git's primitives are the wrong shape for this world. Permissions are repository-level, so keeping one file private means a third-party secret manager and a prayer ([git-crypt](https://github.com/AGWA/git-crypt) exists, but it does encryption, not policy). Branches and pull requests add overhead that tools like [Jujutsu](https://github.com/jj-vcs/jj) have already shown we do not need. And a materialized working tree is a bottleneck: cloning or reinstalling thousands of small files takes 30 to 40 seconds on macOS APFS where Linux does it in 3 to 12.
 
-## The wedge
+Oot does not try to replace Git or Jujutsu. It sits above them and above the actor, and it answers the questions they were never built to answer.
 
-A git hook that runs a semantic diff on merge and produces a dispute statement:
+## How Oot thinks: changes, not commits
+
+Oot's unit is the **Change**, a content-addressed delta between two snapshots. No branch name, no commit message, no checkout required. From that one idea the rest follows.
+
+- **Change**. A delta between two snapshots, from anywhere.
+- **Visibility**. The governance spine. A policy on paths or branches: `private-to`, `embargo-until`, `public`. This is the `.env`, monorepo-privacy, and private-branch problem, handled as policy rather than cryptography.
+- **Intent**. What the change claims to mean. Semantic disputes are checked against this. Meaning is one axis, not the whole product.
+- **Dispute**. A point of disagreement. Either *visibility* (a policy is violated) or *meaning* (two changes diverge in intent).
+- **Docket**. The adjudication record: disputes, verdict, visibility state, embargo date.
+- **Verdict**. `adjudicated`, `blocked`, `embargoed`, or `cloaked`.
+
+## How it works
+
+A change arrives. Oot runs its checks and prints a docket.
 
 ```bash
-$ git merge feature/auth-refactor && oot resolve
+$ oot adjudicate --change feature/auth-refactor
 
-  OOT DISPUTE STATEMENT
+  OOT DOCKET
   ─────────────────────────────────────────
-  branch:     feature/auth-refactor
+  change:     feature/auth-refactor
+  from:       jj bookmark @ main
   base:       main@a3f7c1d
   head:       feature@b8e2f4a
-  
-  semantic:   4 meaning-level conflicts detected
+
+  meaning:    4 disputes detected
+  visibility:  1 private path, 1 embargoed until 2026-09-01
   scope:      auth flow, token refresh
-  authors:    @kriday, @contributor
-  types:      compatible
-  interfaces: unchanged
-  
-  dispute-01: token refresh logic (line 42)
-  dispute-02: error handling (line 87)
-  dispute-03: return type mismatch (line 103)
-  
-  verdict:    ▶ ADJUDICATED — 1 requires review
-  
+  authors:    @kriday, @agent-7
+
+  dispute-01: token refresh logic (line 42)       [meaning]
+  dispute-02: error handling (line 87)            [meaning]
+  dispute-03: return type mismatch (line 103)     [meaning]
+  dispute-04: secrets/.env touched by @agent-7    [visibility]
+
+  verdict:    ▶ ADJUDICATED. 1 requires review, 1 cloaked
+  embargo:    patch held for maintainers until 2026-09-01
+
   [a]ccept · [r]eject · [d]ocket
 ```
 
-If semantic conflicts exceed policy thresholds, Oot blocks the merge and opens a docket for human adjudication.
+If a dispute crosses policy, Oot blocks the change or cloaks the private parts. If the change is a security fix, Oot can hold it under embargo and distribute it quietly to maintainers before the diff goes public, the way the Git project and GitHub Security Advisories already do manually ([OSSF guide](https://github.com/ossf/oss-vulnerability-guide), [Git embargo process](https://www.kernel.org/pub/software/scm/git/docs/howto/coordinate-embargoed-releases.html)).
+
+## Where Oot sits
+
+- **Storage is someone else's job.** Oot reads snapshots from git or Jujutsu. It never owns the repository.
+- **Execution is content-addressed.** The engine takes byte blobs and works on the parse tree. It never assumes a checked-out working tree, so it runs inside an agent's memory isolate and an agent in a worktree cannot hold `main` hostage.
+- **Cryptography is delegated.** Actual encryption goes to git-crypt or a hosted key service. Oot owns the policy and the gate, not the math.
 
 ## Status
 
-We are building the wedge primitive:
-- [x] Semantic diff engine (Rust)
-- [ ] git hook CLI
-- [ ] GitHub Action + merge check
-- [ ] MCP tool (agent semantic hook)
-- [ ] Hosted semantic model API
+We are early. The current code is a seed: a Rust structural-diff engine, a dispute type, a policy loader, and a docket format. None of it yet speaks the Change model end to end. The original five minute pitch was a semantic merge-conflict checker. We are building the governance platform instead, so the build order leads with visibility:
 
-## Open source
+- [ ] Change ingestion from git and Jujutsu snapshots
+- [ ] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
+- [ ] Meaning disputes from the structural engine plus a hosted intent check
+- [ ] Docket format with visibility and embargo state
+- [ ] In-memory execution path (no materialized tree)
+- [ ] git and Jujutsu adapters, plus a hosted model API for intent
 
-Oot's git hook, merge check, and docket format are MIT-licensed. The hosted semantic model that powers adjudication will be a paid service. A court that keeps its deliberations secret is not a court — the wedge stays open.
+## Open source and the model
+
+The adjudication runtime, the docket format, and the adapters are MIT licensed. The hosted model that scores intent and runs embargo distribution will be a paid service. A court that hides its deliberations is not a court, so the gate stays open.
 
 ## Try it
+
+The runtime is not buildable to this shape yet. When it is:
 
 ```bash
 git clone https://github.com/Epoch-AI-Lab/oot.git
 cd oot
 cargo build --release
-./target/release/oot resolve --docket latest
+./target/release/oot adjudicate --change feature/auth-refactor
 ```
 
 ## Contribute
 
-We need:
-- Language experts for semantic diff heuristics (what makes a merge "conflicting"?)
-- Engineers who have debugged semantic merge conflicts
-- Anyone who has ever been burned by `git merge` and wants to fix it
+We need people who have been burned by the primitives Oot sits above:
+
+- **VCS adapter authors** who know git and Jujutsu internals and can turn snapshots into Changes.
+- **Policy people** who have run embargoed releases and know where the process leaks.
+- **Language experts** for the structural engine's semantic heuristics.
+- **Anyone** who thinks a clean merge that ships a bug, or a public diff that burns a zero-day, is the worse failure.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
-## Cite the research
-
-All figures in this README are verbatim from the [Developer Workflow Bottlenecks](https://github.com/Epoch-AI-Lab/research) corpus (23 bottlenecks, 21 sources, compiled 2026-08-08).
-
 ---
 
-*Git settles lines. Oot settles meaning.*
+*Repos track lines. Oot governs changes.*
