@@ -1,13 +1,20 @@
+//! Structural difference engine using Tree-sitter.
+//!
+//! Compares snapshots semantically across function definitions
+//! rather than line-by-line diffs.
+
 use crate::change::Snapshot;
 use crate::dispute::{Dispute, Kind, Severity};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser, Tree};
 
+/// Structural difference engine for code snapshots.
 pub struct Engine {
     language: tree_sitter::Language,
 }
 
 impl Engine {
+    /// Create a new structural diff engine initialized with Rust grammar support.
     pub fn new() -> anyhow::Result<Self> {
         let language = tree_sitter_rust::LANGUAGE.into();
         Ok(Engine { language })
@@ -110,7 +117,10 @@ fn extract_functions(tree: Option<&Tree>, source: &str) -> HashMap<String, (Stri
 fn collect(node: Node, source: &str, map: &mut HashMap<String, (String, usize)>) {
     if node.kind() == "function_item" {
         if let Some(name_node) = node.child_by_field_name("name") {
-            let name = name_node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+            let name = name_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
             let src = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             let row = node.start_position().row + 1;
             map.insert(name, (src, row));
@@ -119,5 +129,41 @@ fn collect(node: Node, source: &str, map: &mut HashMap<String, (String, usize)>)
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect(child, source, map);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_engine_diff_functions() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "src/lib.rs".into(),
+            "pub fn hello() -> &'static str { \"hello\" }\npub fn old_fn() {}\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "src/lib.rs".into(),
+            "pub fn hello() -> &'static str { \"hello world\" }\npub fn new_fn() {}\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 3);
+
+        let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `hello`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("added function `new_fn`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("removed function `old_fn`")));
     }
 }

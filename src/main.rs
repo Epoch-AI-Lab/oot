@@ -1,14 +1,16 @@
-mod change;
-mod dispute;
-mod docket;
-mod engine;
-mod policy;
-mod visibility;
+//! Command-line entry point for Oot.
+//!
+//! Adjudicates changes across snapshots against meaning and visibility policies.
 
-use change::{Change, Snapshot, Source};
 use clap::{Parser, Subcommand};
-use dispute::{Docket, Kind, Severity, Verdict};
+use oot::change::{Change, Snapshot, Source};
+use oot::dispute::{Docket, Kind, Severity, Verdict};
+use oot::docket;
+use oot::engine::Engine;
+use oot::policy::MeaningPolicy;
+use oot::visibility::VisibilityPolicy;
 
+/// Command-line parser for the Oot CLI.
 #[derive(Parser)]
 #[command(name = "oot", about = "Git settles lines. Oot settles meaning.")]
 struct Cli {
@@ -16,11 +18,12 @@ struct Cli {
     command: Commands,
 }
 
+/// Available CLI subcommands.
 #[derive(Subcommand)]
 enum Commands {
     /// Adjudicate a Change and print its docket.
     Adjudicate {
-        /// Change name.
+        /// Change name or identifier.
         #[arg(long)]
         change: Option<String>,
         /// Where the change came from: git, jj, or memory.
@@ -35,6 +38,9 @@ enum Commands {
         /// Comma-separated authors.
         #[arg(long)]
         authors: Option<String>,
+        /// Stated intent or purpose of the change.
+        #[arg(long)]
+        intent: Option<String>,
         /// Path to a meaning-policy TOML file.
         #[arg(long)]
         policy: Option<String>,
@@ -44,6 +50,9 @@ enum Commands {
         /// Load and print a previously saved docket instead of adjudicating.
         #[arg(long)]
         docket: Option<String>,
+        /// Path to save the resulting docket as JSON.
+        #[arg(long, short = 'o')]
+        output: Option<String>,
     },
 }
 
@@ -56,9 +65,11 @@ fn main() -> anyhow::Result<()> {
             base,
             head,
             authors,
+            intent,
             policy,
             visibility,
             docket,
+            output,
         } => {
             if let Some(path) = docket {
                 let d = docket::load(std::path::Path::new(&path))?;
@@ -75,15 +86,21 @@ fn main() -> anyhow::Result<()> {
             };
 
             let mut base_snap = Snapshot::default();
-            load_dir(std::path::Path::new(&base_dir), std::path::Path::new(&base_dir), &mut base_snap.files)?;
+            load_dir(
+                std::path::Path::new(&base_dir),
+                std::path::Path::new(&base_dir),
+                &mut base_snap.files,
+            )?;
             let mut head_snap = Snapshot::default();
-            load_dir(std::path::Path::new(&head_dir), std::path::Path::new(&head_dir), &mut head_snap.files)?;
+            load_dir(
+                std::path::Path::new(&head_dir),
+                std::path::Path::new(&head_dir),
+                &mut head_snap.files,
+            )?;
 
             let change = Change {
                 name: change.unwrap_or_else(|| "unnamed".into()),
-                source: source
-                    .unwrap_or_else(|| "git".into())
-                    .parse::<Source>()?,
+                source: source.unwrap_or_else(|| "git".into()).parse::<Source>()?,
                 base_ref: base_dir.clone(),
                 head_ref: head_dir.clone(),
                 base: base_snap,
@@ -91,19 +108,19 @@ fn main() -> anyhow::Result<()> {
                 authors: authors
                     .map(|a| a.split(',').map(|s| s.trim().to_string()).collect())
                     .unwrap_or_else(|| vec!["@you".into()]),
-                intent: None,
+                intent: intent.clone(),
             };
 
             let meaning_policy = match policy {
-                Some(p) => policy::MeaningPolicy::load(std::path::Path::new(&p))?,
-                None => policy::MeaningPolicy::default(),
+                Some(p) => MeaningPolicy::load(std::path::Path::new(&p))?,
+                None => MeaningPolicy::default(),
             };
             let visibility_policy = match visibility {
-                Some(v) => visibility::VisibilityPolicy::load(std::path::Path::new(&v))?,
-                None => visibility::VisibilityPolicy::default(),
+                Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
+                None => VisibilityPolicy::default(),
             };
 
-            let eng = engine::Engine::new()?;
+            let eng = Engine::new()?;
             let vis_disputes = visibility_policy.check(&change);
             let cloaked = vis_disputes
                 .iter()
@@ -119,23 +136,31 @@ fn main() -> anyhow::Result<()> {
                 meaning_policy.evaluate(&disputes)
             };
 
+            let scope = change.intent.clone().unwrap_or_else(|| "auto".into());
+
             let docket = Docket {
                 change: change.name.clone(),
                 source: change.source.as_str().to_string(),
                 base: change.base_ref.clone(),
                 head: change.head_ref.clone(),
                 disputes,
-                scope: "auto".into(),
+                scope,
                 authors: change.authors.clone(),
                 verdict,
                 embargo: visibility_policy.embargo_note(),
             };
+
             print!("{}", docket.render());
+
+            if let Some(out_path) = output {
+                docket::save(&docket, std::path::Path::new(&out_path))?;
+            }
         }
     }
     Ok(())
 }
 
+/// Recursively read files in a directory into a HashMap of relative paths to contents.
 fn load_dir(
     root: &std::path::Path,
     dir: &std::path::Path,
