@@ -3,6 +3,7 @@
 //! Adjudicates changes across snapshots against meaning and visibility policies.
 
 use clap::{Parser, Subcommand};
+use oot::adapter::{GitAdapter, GitAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
 use oot::dispute::{Docket, Kind, Severity, Verdict};
 use oot::docket;
@@ -35,6 +36,18 @@ enum Commands {
         /// Head snapshot directory.
         #[arg(long)]
         head: Option<String>,
+        /// Git base reference (e.g. `main` or commit SHA).
+        #[arg(long)]
+        base_ref: Option<String>,
+        /// Git head reference (e.g. `feature/auth` or commit SHA).
+        #[arg(long)]
+        head_ref: Option<String>,
+        /// Explicit merge-base commit SHA/ref override for 3-way Git adjudication.
+        #[arg(long)]
+        merge_base: Option<String>,
+        /// Path to the Git repository root (defaults to discovering from current directory).
+        #[arg(long)]
+        repo: Option<String>,
         /// Comma-separated authors.
         #[arg(long)]
         authors: Option<String>,
@@ -64,6 +77,10 @@ fn main() -> anyhow::Result<()> {
             source,
             base,
             head,
+            base_ref,
+            head_ref,
+            merge_base,
+            repo,
             authors,
             intent,
             policy,
@@ -77,10 +94,53 @@ fn main() -> anyhow::Result<()> {
                 return Ok(());
             }
 
+            let meaning_policy = match policy {
+                Some(p) => MeaningPolicy::load(std::path::Path::new(&p))?,
+                None => MeaningPolicy::default(),
+            };
+            let visibility_policy = match visibility {
+                Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
+                None => VisibilityPolicy::default(),
+            };
+            let eng = Engine::new()?;
+
+            // Git 3-way In-Memory Adjudication
+            if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
+                let git_adapter = match repo {
+                    Some(r) => GitAdapter::new(r)?,
+                    None => GitAdapter::discover()?,
+                };
+
+                let options = GitAdjudicateOptions {
+                    custom_merge_base: merge_base,
+                    change_name: change,
+                    intent,
+                };
+
+                let doc = git_adapter.adjudicate_3way(
+                    &b_ref,
+                    &h_ref,
+                    &eng,
+                    &meaning_policy,
+                    &visibility_policy,
+                    &options,
+                )?;
+
+                print!("{}", doc.render());
+
+                if let Some(out_path) = output {
+                    docket::save(&doc, std::path::Path::new(&out_path))?;
+                }
+                return Ok(());
+            }
+
+            // Materialized Directory Snapshot Adjudication
             let (base_dir, head_dir) = match (base, head) {
                 (Some(b), Some(h)) => (b, h),
                 _ => {
-                    eprintln!("provide --docket <file> or --base <dir> --head <dir>");
+                    eprintln!(
+                        "provide --docket <file>, --base <dir> --head <dir>, or --base-ref <ref> --head-ref <ref>"
+                    );
                     std::process::exit(2);
                 }
             };
@@ -111,16 +171,6 @@ fn main() -> anyhow::Result<()> {
                 intent: intent.clone(),
             };
 
-            let meaning_policy = match policy {
-                Some(p) => MeaningPolicy::load(std::path::Path::new(&p))?,
-                None => MeaningPolicy::default(),
-            };
-            let visibility_policy = match visibility {
-                Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
-                None => VisibilityPolicy::default(),
-            };
-
-            let eng = Engine::new()?;
             let vis_disputes = visibility_policy.check(&change);
             let cloaked = vis_disputes
                 .iter()
