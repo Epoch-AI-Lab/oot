@@ -186,7 +186,7 @@ fn test_cli_missing_base_and_docket_fails() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("provide --docket <file> or --base <dir> --head <dir>"));
+    assert!(stderr.contains("provide --docket <file>"));
 }
 
 #[test]
@@ -200,7 +200,7 @@ fn test_cli_missing_head_fails() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("provide --docket <file> or --base <dir> --head <dir>"));
+    assert!(stderr.contains("provide --docket <file>"));
 }
 
 #[test]
