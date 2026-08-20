@@ -33,6 +33,7 @@ impl Engine {
     /// Compare two snapshots and report Meaning disputes: functions that
     /// changed, were added, or were removed between base and head.
     pub fn diff_snapshots(&self, base: &Snapshot, head: &Snapshot) -> anyhow::Result<Vec<Dispute>> {
+        let mut parser = Parser::new();
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -49,10 +50,16 @@ impl Engine {
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
-                    let base_fns =
-                        extract_functions(parse_source(&config.language, b).as_ref(), b, config);
-                    let head_fns =
-                        extract_functions(parse_source(&config.language, h).as_ref(), h, config);
+                    let base_fns = extract_functions(
+                        parse_source(&mut parser, &config.language, b).as_ref(),
+                        b,
+                        config,
+                    );
+                    let head_fns = extract_functions(
+                        parse_source(&mut parser, &config.language, h).as_ref(),
+                        h,
+                        config,
+                    );
                     for (name, (h_src, h_row)) in &head_fns {
                         match base_fns.get(name) {
                             Some((b_src, _)) if b_src != h_src => {
@@ -120,6 +127,7 @@ impl Engine {
         ours: &Snapshot,
         theirs: &Snapshot,
     ) -> anyhow::Result<Vec<Dispute>> {
+        let mut parser = Parser::new();
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -144,17 +152,17 @@ impl Engine {
                 // File exists in all three
                 (Some(b_src), Some(o_src), Some(t_src)) => {
                     let b_fns = extract_functions(
-                        parse_source(&config.language, b_src).as_ref(),
+                        parse_source(&mut parser, &config.language, b_src).as_ref(),
                         b_src,
                         config,
                     );
                     let o_fns = extract_functions(
-                        parse_source(&config.language, o_src).as_ref(),
+                        parse_source(&mut parser, &config.language, o_src).as_ref(),
                         o_src,
                         config,
                     );
                     let t_fns = extract_functions(
-                        parse_source(&config.language, t_src).as_ref(),
+                        parse_source(&mut parser, &config.language, t_src).as_ref(),
                         t_src,
                         config,
                     );
@@ -313,8 +321,7 @@ impl Engine {
     }
 }
 
-fn parse_source(language: &Language, source: &str) -> Option<Tree> {
-    let mut parser = Parser::new();
+fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
     parser.set_language(language).ok()?;
     parser.parse(source, None)
 }
@@ -350,16 +357,31 @@ fn collect(
     map: &mut HashMap<String, (String, usize)>,
     config: &LangConfig,
 ) {
-    if config.function_kinds.contains(&node.kind()) {
-        insert_named(node, "name", node, source, map);
+    for kind in config.function_kinds {
+        if node.kind() == kind.node_kind {
+            if let Some(key) = config.function_key(kind, node, source) {
+                insert(key, node, source, map);
+            }
+        }
     }
     for wrapped in config.wrapped_functions {
-        if node.kind() == wrapped.node_kind {
-            if let Some(body) = node.child_by_field_name(wrapped.body_field) {
-                if wrapped.body_kinds.contains(&body.kind()) {
-                    insert_named(node, wrapped.name_field, body, source, map);
-                }
-            }
+        if node.kind() != wrapped.node_kind {
+            continue;
+        }
+        let (Some(name_node), Some(body)) = (
+            node.child_by_field_name(wrapped.name_field),
+            node.child_by_field_name(wrapped.body_field),
+        ) else {
+            continue;
+        };
+        if wrapped.name_kinds.contains(&name_node.kind())
+            && wrapped.body_kinds.contains(&body.kind())
+        {
+            let key = name_node
+                .utf8_text(source.as_bytes())
+                .unwrap_or("")
+                .to_string();
+            insert(key, body, source, map);
         }
     }
     let mut cursor = node.walk();
@@ -368,28 +390,14 @@ fn collect(
     }
 }
 
-/// Record a function in `map` using the identifier carried in `name_field` of
-/// `name_holder` and the body text from `body`.
-fn insert_named(
-    name_holder: Node,
-    name_field: &str,
-    body: Node,
-    source: &str,
-    map: &mut HashMap<String, (String, usize)>,
-) {
-    let Some(name_node) = name_holder.child_by_field_name(name_field) else {
-        return;
-    };
-    let name = name_node
-        .utf8_text(source.as_bytes())
-        .unwrap_or("")
-        .to_string();
-    if name.is_empty() {
+/// Record a named function under `key`, with `body` as its source.
+fn insert(key: String, body: Node, source: &str, map: &mut HashMap<String, (String, usize)>) {
+    if key.is_empty() {
         return;
     }
     let src = body.utf8_text(source.as_bytes()).unwrap_or("").to_string();
     let row = body.start_position().row + 1;
-    map.insert(name, (src, row));
+    map.insert(key, (src, row));
 }
 
 #[cfg(test)]
@@ -518,7 +526,7 @@ mod tests {
             .any(|d| d.contains("both sides changed `greet`")));
         assert!(details
             .iter()
-            .any(|d| d.contains("both sides changed `inc`")));
+            .any(|d| d.contains("both sides changed `(*counter).inc`")));
     }
 
     #[test]
@@ -571,6 +579,73 @@ mod tests {
         let disputes = eng.diff_snapshots(&base, &head).unwrap();
         assert_eq!(disputes.len(), 1);
         assert_eq!(disputes[0].detail, "both sides changed `double`");
+    }
+
+    #[test]
+    fn test_engine_js_class_field_arrow() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "class Counter {\n  constructor() { this.n = 0; }\n  next = () => this.n++;\n}\n"
+                .into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "class Counter {\n  constructor() { this.n = 0; }\n  next = () => ++this.n;\n}\n"
+                .into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].detail, "both sides changed `next`");
+    }
+
+    #[test]
+    fn test_engine_js_member_assignment_ignored() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "const obj = {};\nobj.handle = () => 1;\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "const obj = {};\nobj.handle = () => 2;\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert!(
+            disputes.is_empty(),
+            "member-expression assignment should not be treated as a named function"
+        );
+    }
+
+    #[test]
+    fn test_engine_go_method_collision_disambiguated() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "server.go".into(),
+            "package main\n\ntype A struct{ v int }\n\nfunc (a *A) hit() {\n\ta.v = 1\n}\n\ntype B struct{ v int }\n\nfunc (b *B) hit() {\n\tb.v = 1\n}\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "server.go".into(),
+            "package main\n\ntype A struct{ v int }\n\nfunc (a *A) hit() {\n\ta.v = 2\n}\n\ntype B struct{ v int }\n\nfunc (b *B) hit() {\n\tb.v = 1\n}\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].detail, "both sides changed `(*A).hit`");
     }
 
     #[test]
