@@ -10,7 +10,11 @@
 use tree_sitter::Language;
 
 /// Callable node kinds that can sit on the right of a name.
-const CALLABLE_KINDS: &[&str] = &["arrow_function", "function_expression", "generator_function"];
+const CALLABLE_KINDS: &[&str] = &[
+    "arrow_function",
+    "function_expression",
+    "generator_function",
+];
 
 /// A wrapper node that carries a callable in one field and the function's
 /// name in another. JavaScript's `const f = () => {}` keeps the callable on

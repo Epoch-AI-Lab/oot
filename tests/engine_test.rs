@@ -276,7 +276,8 @@ fn test_engine_mixed_language_snapshot() {
     );
     base.files.insert(
         "server.go".to_string(),
-        "package main\n\nfunc greet(name string) string {\n\treturn \"hi \" + name\n}\n".to_string(),
+        "package main\n\nfunc greet(name string) string {\n\treturn \"hi \" + name\n}\n"
+            .to_string(),
     );
 
     let mut head = Snapshot::default();
@@ -290,7 +291,8 @@ fn test_engine_mixed_language_snapshot() {
     );
     head.files.insert(
         "server.go".to_string(),
-        "package main\n\nfunc greet(name string) string {\n\treturn \"hello \" + name\n}\n".to_string(),
+        "package main\n\nfunc greet(name string) string {\n\treturn \"hello \" + name\n}\n"
+            .to_string(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");

@@ -487,7 +487,9 @@ mod tests {
         assert_eq!(disputes.len(), 2);
 
         let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
-        assert!(details.iter().any(|d| d.contains("both sides changed `greet`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `greet`")));
         assert!(details.iter().any(|d| d.contains("added function `bye`")));
     }
 
@@ -511,8 +513,12 @@ mod tests {
         assert_eq!(disputes.len(), 2);
 
         let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
-        assert!(details.iter().any(|d| d.contains("both sides changed `greet`")));
-        assert!(details.iter().any(|d| d.contains("both sides changed `inc`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `greet`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `inc`")));
     }
 
     #[test]
@@ -535,7 +541,9 @@ mod tests {
         assert_eq!(disputes.len(), 3);
 
         let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
-        assert!(details.iter().any(|d| d.contains("both sides changed `add`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `add`")));
         assert!(details
             .iter()
             .any(|d| d.contains("both sides changed `double`")));
@@ -582,9 +590,11 @@ mod tests {
             .insert("app.py".into(), "def f():\n    return 2\n".into());
 
         let mut theirs = Snapshot::default();
-        theirs.files
+        theirs
+            .files
             .insert("lib.rs".into(), "pub fn f() -> i32 { 3 }\n".into());
-        theirs.files
+        theirs
+            .files
             .insert("app.py".into(), "def f():\n    return 3\n".into());
 
         let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
