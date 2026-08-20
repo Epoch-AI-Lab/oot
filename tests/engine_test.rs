@@ -1,5 +1,5 @@
 use oot::change::Snapshot;
-use oot::dispute::{Kind, Severity};
+use oot::dispute::{Dispute, Kind, Severity};
 use oot::engine::Engine;
 
 #[test]
@@ -259,4 +259,59 @@ fn test_engine_multiple_files_and_functions() {
         .iter()
         .any(|d| d.detail == "both sides changed `fa1`"));
     assert!(disputes.iter().any(|d| d.detail == "added function `fa3`"));
+}
+
+#[test]
+fn test_engine_mixed_language_snapshot() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "app.py".to_string(),
+        "def greet(name):\n    return f\"hi {name}\"\n".to_string(),
+    );
+    base.files.insert(
+        "index.js".to_string(),
+        "const double = (x) => x * 2;\n".to_string(),
+    );
+    base.files.insert(
+        "server.go".to_string(),
+        "package main\n\nfunc greet(name string) string {\n\treturn \"hi \" + name\n}\n".to_string(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "app.py".to_string(),
+        "def greet(name):\n    return f\"hello {name}\"\n".to_string(),
+    );
+    head.files.insert(
+        "index.js".to_string(),
+        "const double = (x) => x * 3;\n".to_string(),
+    );
+    head.files.insert(
+        "server.go".to_string(),
+        "package main\n\nfunc greet(name string) string {\n\treturn \"hello \" + name\n}\n".to_string(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 3);
+
+    let greets: Vec<&Dispute> = disputes
+        .iter()
+        .filter(|d| d.detail == "both sides changed `greet`")
+        .collect();
+    assert_eq!(greets.len(), 2, "one greet change per language file");
+    assert!(
+        greets.iter().any(|d| d.location.starts_with("app.py:")),
+        "python greet dispute should point into app.py"
+    );
+    assert!(
+        greets.iter().any(|d| d.location.starts_with("server.go:")),
+        "go greet dispute should point into server.go"
+    );
+
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `double`"));
 }

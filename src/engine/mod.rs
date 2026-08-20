@@ -5,27 +5,34 @@
 
 use crate::change::Snapshot;
 use crate::dispute::{Dispute, Kind, Severity};
+use crate::engine::language::{registry, LangConfig};
 use std::collections::HashMap;
-use tree_sitter::{Node, Parser, Tree};
+use tree_sitter::{Language, Node, Parser, Tree};
+
+pub mod language;
 
 /// Structural difference engine for code snapshots.
 pub struct Engine {
-    language: tree_sitter::Language,
+    languages: Vec<LangConfig>,
 }
 
 impl Engine {
-    /// Create a new structural diff engine initialized with Rust grammar support.
+    /// Create a new structural diff engine with grammar support for every
+    /// language in the [`registry`].
     pub fn new() -> anyhow::Result<Self> {
-        let language = tree_sitter_rust::LANGUAGE.into();
-        Ok(Engine { language })
+        Ok(Engine {
+            languages: registry(),
+        })
+    }
+
+    /// The grammar configuration for `path`, if Oot can diff that language.
+    fn config_for(&self, path: &str) -> Option<&LangConfig> {
+        self.languages.iter().find(|c| c.supports(path))
     }
 
     /// Compare two snapshots and report Meaning disputes: functions that
     /// changed, were added, or were removed between base and head.
     pub fn diff_snapshots(&self, base: &Snapshot, head: &Snapshot) -> anyhow::Result<Vec<Dispute>> {
-        let mut parser = Parser::new();
-        parser.set_language(&self.language)?;
-
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -34,16 +41,18 @@ impl Engine {
         paths.dedup();
 
         for path in paths {
-            if !path.ends_with(".rs") {
+            let Some(config) = self.config_for(path) else {
                 continue;
-            }
+            };
             let base_src = base.files.get(path);
             let head_src = head.files.get(path);
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
-                    let base_fns = extract_functions(parse(&mut parser, b).as_ref(), b);
-                    let head_fns = extract_functions(parse(&mut parser, h).as_ref(), h);
+                    let base_fns =
+                        extract_functions(parse_source(&config.language, b).as_ref(), b, config);
+                    let head_fns =
+                        extract_functions(parse_source(&config.language, h).as_ref(), h, config);
                     for (name, (h_src, h_row)) in &head_fns {
                         match base_fns.get(name) {
                             Some((b_src, _)) if b_src != h_src => {
@@ -111,9 +120,6 @@ impl Engine {
         ours: &Snapshot,
         theirs: &Snapshot,
     ) -> anyhow::Result<Vec<Dispute>> {
-        let mut parser = Parser::new();
-        parser.set_language(&self.language)?;
-
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -127,9 +133,9 @@ impl Engine {
         paths.dedup();
 
         for path in paths {
-            if !path.ends_with(".rs") {
+            let Some(config) = self.config_for(path) else {
                 continue;
-            }
+            };
             let b_file = base.files.get(path);
             let o_file = ours.files.get(path);
             let t_file = theirs.files.get(path);
@@ -137,9 +143,21 @@ impl Engine {
             match (b_file, o_file, t_file) {
                 // File exists in all three
                 (Some(b_src), Some(o_src), Some(t_src)) => {
-                    let b_fns = extract_functions(parse(&mut parser, b_src).as_ref(), b_src);
-                    let o_fns = extract_functions(parse(&mut parser, o_src).as_ref(), o_src);
-                    let t_fns = extract_functions(parse(&mut parser, t_src).as_ref(), t_src);
+                    let b_fns = extract_functions(
+                        parse_source(&config.language, b_src).as_ref(),
+                        b_src,
+                        config,
+                    );
+                    let o_fns = extract_functions(
+                        parse_source(&config.language, o_src).as_ref(),
+                        o_src,
+                        config,
+                    );
+                    let t_fns = extract_functions(
+                        parse_source(&config.language, t_src).as_ref(),
+                        t_src,
+                        config,
+                    );
 
                     let mut all_fn_names: Vec<&String> = b_fns
                         .keys()
@@ -295,7 +313,9 @@ impl Engine {
     }
 }
 
-fn parse(parser: &mut Parser, source: &str) -> Option<Tree> {
+fn parse_source(language: &Language, source: &str) -> Option<Tree> {
+    let mut parser = Parser::new();
+    parser.set_language(language).ok()?;
     parser.parse(source, None)
 }
 
@@ -311,31 +331,65 @@ fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severi
     }
 }
 
-fn extract_functions(tree: Option<&Tree>, source: &str) -> HashMap<String, (String, usize)> {
+fn extract_functions(
+    tree: Option<&Tree>,
+    source: &str,
+    config: &LangConfig,
+) -> HashMap<String, (String, usize)> {
     let mut map = HashMap::new();
     let Some(tree) = tree else {
         return map;
     };
-    collect(tree.root_node(), source, &mut map);
+    collect(tree.root_node(), source, &mut map, config);
     map
 }
 
-fn collect(node: Node, source: &str, map: &mut HashMap<String, (String, usize)>) {
-    if node.kind() == "function_item" {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = name_node
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
-            let src = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-            let row = node.start_position().row + 1;
-            map.insert(name, (src, row));
+fn collect(
+    node: Node,
+    source: &str,
+    map: &mut HashMap<String, (String, usize)>,
+    config: &LangConfig,
+) {
+    if config.function_kinds.contains(&node.kind()) {
+        insert_named(node, "name", node, source, map);
+    }
+    for wrapped in config.wrapped_functions {
+        if node.kind() == wrapped.node_kind {
+            if let Some(body) = node.child_by_field_name(wrapped.body_field) {
+                if wrapped.body_kinds.contains(&body.kind()) {
+                    insert_named(node, wrapped.name_field, body, source, map);
+                }
+            }
         }
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect(child, source, map);
+        collect(child, source, map, config);
     }
+}
+
+/// Record a function in `map` using the identifier carried in `name_field` of
+/// `name_holder` and the body text from `body`.
+fn insert_named(
+    name_holder: Node,
+    name_field: &str,
+    body: Node,
+    source: &str,
+    map: &mut HashMap<String, (String, usize)>,
+) {
+    let Some(name_node) = name_holder.child_by_field_name(name_field) else {
+        return;
+    };
+    let name = name_node
+        .utf8_text(source.as_bytes())
+        .unwrap_or("")
+        .to_string();
+    if name.is_empty() {
+        return;
+    }
+    let src = body.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    let row = body.start_position().row + 1;
+    map.insert(name, (src, row));
 }
 
 #[cfg(test)]
@@ -411,5 +465,130 @@ mod tests {
             .unwrap();
         assert_eq!(clean.severity, Severity::Review);
         assert!(clean.detail.contains("incoming branch modified"));
+    }
+
+    #[test]
+    fn test_engine_python_function_detection() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "app.py".into(),
+            "def greet(name):\n    return f\"hi {name}\"\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "app.py".into(),
+            "def greet(name):\n    return f\"hello {name}\"\n\ndef bye(name):\n    return f\"bye {name}\"\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 2);
+
+        let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.contains("both sides changed `greet`")));
+        assert!(details.iter().any(|d| d.contains("added function `bye`")));
+    }
+
+    #[test]
+    fn test_engine_go_function_and_method_detection() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "server.go".into(),
+            "package main\n\nfunc greet(name string) string {\n\treturn \"hi \" + name\n}\n\ntype counter struct{ n int }\n\nfunc (c *counter) inc() {\n\tc.n++\n}\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "server.go".into(),
+            "package main\n\nfunc greet(name string) string {\n\treturn \"hello \" + name\n}\n\ntype counter struct{ n int }\n\nfunc (c *counter) inc() {\n\tc.n += 2\n}\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 2);
+
+        let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.contains("both sides changed `greet`")));
+        assert!(details.iter().any(|d| d.contains("both sides changed `inc`")));
+    }
+
+    #[test]
+    fn test_engine_js_arrows_and_declarations() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "function add(a, b) {\n  return a + b;\n}\nconst double = (x) => x * 2;\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "function add(a, b) {\n  return a + b + 1;\n}\nconst double = (x) => x * 3;\nconst triple = (x) => x * 3;\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 3);
+
+        let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
+        assert!(details.iter().any(|d| d.contains("both sides changed `add`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("both sides changed `double`")));
+        assert!(details
+            .iter()
+            .any(|d| d.contains("added function `triple`")));
+    }
+
+    #[test]
+    fn test_engine_js_assignment_arrow() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "let double;\ndouble = (x) => x * 2;\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "let double;\ndouble = (x) => x * 3;\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].detail, "both sides changed `double`");
+    }
+
+    #[test]
+    fn test_engine_3way_mixed_languages() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("lib.rs".into(), "pub fn f() -> i32 { 1 }\n".into());
+        base.files
+            .insert("app.py".into(), "def f():\n    return 1\n".into());
+
+        let mut ours = Snapshot::default();
+        ours.files
+            .insert("lib.rs".into(), "pub fn f() -> i32 { 2 }\n".into());
+        ours.files
+            .insert("app.py".into(), "def f():\n    return 2\n".into());
+
+        let mut theirs = Snapshot::default();
+        theirs.files
+            .insert("lib.rs".into(), "pub fn f() -> i32 { 3 }\n".into());
+        theirs.files
+            .insert("app.py".into(), "def f():\n    return 3\n".into());
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert_eq!(disputes.len(), 2);
+        assert!(disputes.iter().all(|d| d.severity == Severity::High));
     }
 }
