@@ -649,6 +649,28 @@ mod tests {
     }
 
     #[test]
+    fn test_engine_rust_impl_method_collision_disambiguated() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "src/lib.rs".into(),
+            "struct A;\nstruct B;\n\nimpl A { fn hit(&self) {} }\nimpl B { fn hit(&self) {} }\n"
+                .into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "src/lib.rs".into(),
+            "struct A;\nstruct B;\n\nimpl A { fn hit(&self) { let _ = 1; } }\nimpl B { fn hit(&self) {} }\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].detail, "both sides changed `(A).hit`");
+    }
+
+    #[test]
     fn test_engine_3way_mixed_languages() {
         let eng = Engine::new().unwrap();
 

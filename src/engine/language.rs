@@ -23,6 +23,9 @@ pub enum Qualifier {
     None,
     /// Prefix with the receiver type, e.g. Go methods become `(*T).name`.
     Receiver,
+    /// Prefix with the enclosing impl block, e.g. Rust methods become
+    /// `(A).name` or `(Trait for A).name`.
+    EnclosingImpl,
 }
 
 /// A directly named function or method node kind.
@@ -94,6 +97,24 @@ impl LangConfig {
                 let ty_text = ty.utf8_text(source.as_bytes()).ok()?;
                 Some(format!("({}).{}", ty_text, name))
             }
+            Qualifier::EnclosingImpl => {
+                let mut parent = node.parent();
+                while let Some(anc) = parent {
+                    if anc.kind() == "impl_item" {
+                        let ty = anc.child_by_field_name("type")?;
+                        let ty_text = ty.utf8_text(source.as_bytes()).ok()?;
+                        let scope = match anc.child_by_field_name("trait") {
+                            Some(t) => {
+                                format!("{} for {}", t.utf8_text(source.as_bytes()).ok()?, ty_text)
+                            }
+                            None => ty_text.to_string(),
+                        };
+                        return Some(format!("({}).{}", scope, name));
+                    }
+                    parent = anc.parent();
+                }
+                Some(name)
+            }
         }
     }
 }
@@ -107,7 +128,7 @@ pub fn registry() -> Vec<LangConfig> {
             language: tree_sitter_rust::LANGUAGE.into(),
             function_kinds: &[FunctionKind {
                 node_kind: "function_item",
-                qualifier: Qualifier::None,
+                qualifier: Qualifier::EnclosingImpl,
             }],
             wrapped_functions: &[],
         },
