@@ -1,0 +1,14 @@
+{
+  "change": "feature/auth-refactor",
+  "source": "jj",
+  "base": "main@a3f7c1d",
+  "head": "feature@b8e2f4a",
+  "disputes": [
+    { "id": "D001", "location": "src/lib.rs:1", "kind": "meaning", "severity": "review", "detail": "both sides changed `login`" },
+    { "id": "V001", "location": "secrets/.env", "kind": "visibility", "severity": "high", "detail": "private path secrets/.env touched by @kriday/@agent-7" }
+  ],
+  "scope": "auth flow, token refresh",
+  "authors": ["@kriday", "@agent-7"],
+  "verdict": "embargoed",
+  "embargo": "patch held for maintainers until 2026-09-01"
+}

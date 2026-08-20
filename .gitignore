@@ -1,0 +1,6 @@
+/target
+**/*.rs.bk
+*.cargo/config
+*.env
+!fixtures/repo/head/secrets/.env
+*.DS_Store
