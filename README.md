@@ -63,22 +63,29 @@ If a dispute crosses policy, Oot blocks the change or cloaks the private parts. 
 
 ## Status
 
-Working seed — the engine runs, the docket renders, and git ingestion is in-memory. Jujutsu and hosted intent are next.
+Working seed — the engine runs, the docket renders, and git + Jujutsu ingestion are in-memory. Current focus: using Oot to govern Oot's own changes.
 
 - [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs
-- [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revset resolution, first-class conflict detection) — hosted model API pending
+- [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revset resolution, first-class conflict detection)
 - [x] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
-- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript) — hosted intent check pending
+- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript)
 - [x] Docket format with visibility and embargo state (JSON/TOML + render)
 - [x] In-memory execution path (no materialized tree required for git)
 - [x] Git adapter with 3-way adjudication
-- [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted) — hosted model API pending
+- [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted)
 
 **Known limitation:** functions that share a bare name within one file (e.g., a `render` method on two classes, or same-named Go methods on two types) are tracked by first occurrence only; the docket flags them as ambiguous rather than tracking each definition separately.
 
-## Open source and the model
+## License
 
-The adjudication runtime, the docket format, and the adapters are MIT licensed. The hosted model that scores intent and runs embargo distribution will be a paid service. A court that hides its deliberations is not a court, so the gate stays open.
+The adjudication runtime, the docket format, and the adapters are MIT licensed. A court that hides its deliberations is not a court, so the gate stays open.
+
+## Someday
+
+Deliberately unbuilt. These need users to be worth their cost, and there are none yet.
+
+- **Hosted intent scoring** — a model that checks what a change claims to mean against what it actually does. The structural engine catches *that* code changed; this would catch *what it means*. Needs a server, a model, and someone paying for both.
+- **Embargo distribution** — the courier half of embargo: quietly shipping held patches to maintainers before the public diff drops. Needs keyed private channels and maintainer auth. The detection half already ships.
 
 ## Try it
 

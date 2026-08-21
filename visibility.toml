@@ -1,0 +1,11 @@
+# Oot governing Oot.
+#
+# Path fragments (substring match) that must never appear in a change's
+# head snapshot. Touched paths raise High-severity visibility disputes,
+# which cloak the change and exit nonzero.
+private_paths = [".env", "secrets/", ".pem"]
+
+# No embargo schedule for this repo yet; add `embargo_until = "YYYY-MM-DD"`
+# to hold all changes until that date.
+
+private_branches = []

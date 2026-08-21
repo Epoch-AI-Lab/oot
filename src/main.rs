@@ -69,7 +69,7 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Adjudicate {
@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(path) = docket {
                 let d = docket::load(std::path::Path::new(&path))?;
                 print!("{}", d.render());
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
 
             let meaning_policy = match policy {
@@ -155,7 +155,7 @@ fn main() -> anyhow::Result<()> {
                 if let Some(out_path) = output {
                     docket::save(&doc, std::path::Path::new(&out_path))?;
                 }
-                return Ok(());
+                return Ok(exit_code_for(doc.verdict));
             }
 
             // Materialized Directory Snapshot Adjudication
@@ -229,9 +229,23 @@ fn main() -> anyhow::Result<()> {
             if let Some(out_path) = output {
                 docket::save(&docket, std::path::Path::new(&out_path))?;
             }
+
+            Ok(exit_code_for(docket.verdict))
         }
     }
-    Ok(())
+}
+
+/// Exit-code contract for `oot adjudicate`:
+/// - `0`: verdict is `Adjudicated` — ship-ready.
+/// - `1`: any other verdict (`Blocked`, `Cloaked`, `Embargoed`) — all mean
+///   "do not ship yet", so CI and merge gates can treat any nonzero as a stop.
+/// - `2`: usage error (reserved by the CLI parser paths).
+fn exit_code_for(verdict: Verdict) -> std::process::ExitCode {
+    if verdict == Verdict::Adjudicated {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }
 
 /// Recursively read files in a directory into a HashMap of relative paths to contents.
