@@ -3,7 +3,7 @@
 //! Adjudicates changes across snapshots against meaning and visibility policies.
 
 use clap::{Parser, Subcommand};
-use oot::adapter::{GitAdapter, GitAdjudicateOptions};
+use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
 use oot::dispute::{Docket, Kind, Severity, Verdict};
 use oot::docket;
@@ -42,7 +42,7 @@ enum Commands {
         /// Git head reference (e.g. `feature/auth` or commit SHA).
         #[arg(long)]
         head_ref: Option<String>,
-        /// Explicit merge-base commit SHA/ref override for 3-way Git adjudication.
+        /// Explicit merge-base (git) or common-ancestor (jj) commit override for 3-way adjudication.
         #[arg(long)]
         merge_base: Option<String>,
         /// Path to the Git repository root (defaults to discovering from current directory).
@@ -104,27 +104,51 @@ fn main() -> anyhow::Result<()> {
             };
             let eng = Engine::new()?;
 
-            // Git 3-way In-Memory Adjudication
+            // VCS 3-way In-Memory Adjudication (git or jj)
             if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
-                let git_adapter = match repo {
-                    Some(r) => GitAdapter::new(r)?,
-                    None => GitAdapter::discover()?,
-                };
+                let wants_jj = matches!(source.as_deref(), Some("jj") | Some("jujutsu"));
 
-                let options = GitAdjudicateOptions {
-                    custom_merge_base: merge_base,
-                    change_name: change,
-                    intent,
-                };
+                let doc = if wants_jj {
+                    let jj_adapter = match repo {
+                        Some(r) => JjAdapter::new(r)?,
+                        None => JjAdapter::discover()?,
+                    };
 
-                let doc = git_adapter.adjudicate_3way(
-                    &b_ref,
-                    &h_ref,
-                    &eng,
-                    &meaning_policy,
-                    &visibility_policy,
-                    &options,
-                )?;
+                    let options = JjAdjudicateOptions {
+                        custom_ancestor: merge_base,
+                        change_name: change,
+                        intent,
+                    };
+
+                    jj_adapter.adjudicate_3way(
+                        &b_ref,
+                        &h_ref,
+                        &eng,
+                        &meaning_policy,
+                        &visibility_policy,
+                        &options,
+                    )?
+                } else {
+                    let git_adapter = match repo {
+                        Some(r) => GitAdapter::new(r)?,
+                        None => GitAdapter::discover()?,
+                    };
+
+                    let options = GitAdjudicateOptions {
+                        custom_merge_base: merge_base,
+                        change_name: change,
+                        intent,
+                    };
+
+                    git_adapter.adjudicate_3way(
+                        &b_ref,
+                        &h_ref,
+                        &eng,
+                        &meaning_policy,
+                        &visibility_policy,
+                        &options,
+                    )?
+                };
 
                 print!("{}", doc.render());
 
