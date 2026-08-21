@@ -63,14 +63,14 @@ If a dispute crosses policy, Oot blocks the change or cloaks the private parts. 
 
 ## Status
 
-We are early. The current code is a seed: a Rust structural-diff engine, a dispute type, a policy loader, and a docket format. None of it yet speaks the Change model end to end. The original five minute pitch was a semantic merge-conflict checker. We are building the governance platform instead, so the build order leads with visibility:
+Working seed — the engine runs, the docket renders, and git ingestion is in-memory. Jujutsu and hosted intent are next.
 
-- [ ] Change ingestion from git and Jujutsu snapshots
-- [ ] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
-- [ ] Meaning disputes from the structural engine plus a hosted intent check
-- [ ] Docket format with visibility and embargo state
-- [ ] In-memory execution path (no materialized tree)
-- [ ] git and Jujutsu adapters, plus a hosted model API for intent
+- [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs — Jujutsu snapshots pending
+- [x] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
+- [x] Meaning disputes from the structural engine (tree-sitter Rust) — hosted intent check pending
+- [x] Docket format with visibility and embargo state (JSON/TOML + render)
+- [x] In-memory execution path (no materialized tree required for git)
+- [x] Git adapter with 3-way adjudication — Jujutsu adapter and hosted model API pending
 
 ## Open source and the model
 
@@ -78,13 +78,14 @@ The adjudication runtime, the docket format, and the adapters are MIT licensed. 
 
 ## Try it
 
-The runtime is not buildable to this shape yet. When it is:
-
 ```bash
 git clone https://github.com/Epoch-AI-Lab/oot.git
 cd oot
 cargo build --release
-./target/release/oot adjudicate --change feature/auth-refactor
+# materialized dirs
+./target/release/oot adjudicate --change feature/auth-refactor --base fixtures/repo/base --head fixtures/repo/head --visibility fixtures/visibility.toml
+# or 3-way git (in-memory, no checkout)
+./target/release/oot adjudicate --change feature/auth-refactor --base-ref main --head-ref feature/auth --repo .
 ```
 
 ## Contribute
