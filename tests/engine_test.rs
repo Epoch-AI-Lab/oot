@@ -233,7 +233,7 @@ fn test_engine_file_added_and_removed() {
 
 #[test]
 fn test_engine_rename_is_not_remove_add() {
-    let mut engine = Engine::new().expect("Failed to initialize engine");
+    let engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -263,7 +263,7 @@ fn test_engine_rename_is_not_remove_add() {
 
 #[test]
 fn test_engine_3way_rename_is_not_conflict() {
-    let mut engine = Engine::new().expect("Failed to initialize engine");
+    let engine = Engine::new().expect("Failed to initialize engine");
 
     let base_src = "fn handle(req: i32) -> i32 { req + 1 }";
     let ours_src = base_src; // target untouched
@@ -288,9 +288,9 @@ fn test_engine_3way_rename_is_not_conflict() {
 
 #[test]
 fn test_engine_added_file_summary_lists_functions() {
-    let mut engine = Engine::new().expect("Failed to initialize engine");
+    let engine = Engine::new().expect("Failed to initialize engine");
 
-    let mut base = Snapshot::default();
+    let base = Snapshot::default();
     let mut head = Snapshot::default();
     head.files.insert(
         "src/newstuff.rs".to_string(),

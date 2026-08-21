@@ -436,6 +436,10 @@ impl Engine {
     }
 }
 
+/// Tracked functions keyed by name: source text, 1-based row, and a rename
+/// signature (the body with its own name blanked out).
+type FunctionMap = HashMap<String, (String, usize, String)>;
+
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
     parser.set_language(language).ok()?;
     parser.parse(source, None)
@@ -480,7 +484,7 @@ fn extract_functions(
     tree: Option<&Tree>,
     source: &str,
     config: &LangConfig,
-) -> (HashMap<String, (String, usize, String)>, Vec<String>) {
+) -> (FunctionMap, Vec<String>) {
     let mut map = HashMap::new();
     let mut duplicates = Vec::new();
     if let Some(tree) = tree {
@@ -492,7 +496,7 @@ fn extract_functions(
 fn collect(
     node: Node,
     source: &str,
-    map: &mut HashMap<String, (String, usize, String)>,
+    map: &mut FunctionMap,
     duplicates: &mut Vec<String>,
     config: &LangConfig,
 ) {
@@ -545,7 +549,7 @@ fn insert(
     body: Node,
     name_node: Option<Node>,
     source: &str,
-    map: &mut HashMap<String, (String, usize, String)>,
+    map: &mut FunctionMap,
     duplicates: &mut Vec<String>,
 ) {
     if key.is_empty() {
