@@ -43,8 +43,9 @@ jobs:
       - name: Install Jujutsu
         run: |
           curl -sL -o /tmp/jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.44.0/jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz
-          tar -xzf /tmp/jj.tar.gz -C /tmp
-          sudo mv /tmp/jj /usr/local/bin/jj
+          mkdir -p /tmp/jj-install
+          tar -xzf /tmp/jj.tar.gz -C /tmp/jj-install
+          sudo mv /tmp/jj-install/jj /usr/local/bin/jj
           jj --version
       - name: Configure jj identity
         run: |
