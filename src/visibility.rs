@@ -186,14 +186,12 @@ mod tests {
 
         let mut base = Snapshot::default();
         // Private file already exists, unchanged by this change.
-        base.files
-            .insert("secrets/key.pem".into(), "same".into());
+        base.files.insert("secrets/key.pem".into(), "same".into());
         base.files.insert("src/lib.rs".into(), "fn a() {}".into());
 
         let mut head = Snapshot::default();
         head.files.insert("secrets/key.pem".into(), "same".into());
-        head.files
-            .insert("src/lib.rs".into(), "fn b() {}".into());
+        head.files.insert("src/lib.rs".into(), "fn b() {}".into());
 
         let change = Change {
             name: "feature/public".into(),
@@ -215,7 +213,8 @@ mod tests {
 
         // Now modify the private file: it becomes touched and must flag.
         let mut head2 = change.head.clone();
-        head2.files
+        head2
+            .files
             .insert("secrets/key.pem".into(), "rotated".into());
 
         let change2 = Change {
