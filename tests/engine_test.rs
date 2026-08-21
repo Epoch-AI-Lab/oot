@@ -220,8 +220,8 @@ fn test_engine_file_added_and_removed() {
     assert_eq!(disputes.len(), 2);
     let added = disputes
         .iter()
-        .find(|d| d.detail == "file added")
-        .expect("File added dispute");
+        .find(|d| d.detail == "file added (1 function: new_util)")
+        .expect("File added dispute with content summary");
     assert_eq!(added.location, "src/new_module.rs:0");
 
     let removed = disputes
@@ -229,6 +229,81 @@ fn test_engine_file_added_and_removed() {
         .find(|d| d.detail == "file removed")
         .expect("File removed dispute");
     assert_eq!(removed.location, "src/old_module.rs:0");
+}
+
+#[test]
+fn test_engine_rename_is_not_remove_add() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/auth.rs".to_string(),
+        "fn verify_user(user: &str) -> bool { user.len() > 3 }".to_string(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/auth.rs".to_string(),
+        "fn check_user(user: &str) -> bool { user.len() > 3 }".to_string(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(
+        disputes.len(),
+        1,
+        "identical body under a new name is one rename, got {:?}",
+        disputes
+    );
+    assert_eq!(
+        disputes[0].detail,
+        "renamed function `verify_user` to `check_user`"
+    );
+}
+
+#[test]
+fn test_engine_3way_rename_is_not_conflict() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let base_src = "fn handle(req: i32) -> i32 { req + 1 }";
+    let ours_src = base_src; // target untouched
+    let theirs_src = "fn process(req: i32) -> i32 { req + 1 }"; // incoming renamed it
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files.insert("src/lib.rs".to_string(), s.to_string());
+        x
+    };
+
+    let disputes = engine
+        .diff_3way(&snap(base_src), &snap(ours_src), &snap(theirs_src))
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(
+        disputes[0].detail,
+        "incoming branch renamed function `handle` to `process`"
+    );
+}
+
+#[test]
+fn test_engine_added_file_summary_lists_functions() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/newstuff.rs".to_string(),
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n".to_string(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(
+        disputes[0].detail,
+        "file added (4 functions: alpha, beta, delta, …)"
+    );
 }
 
 #[test]

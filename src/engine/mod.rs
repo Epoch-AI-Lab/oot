@@ -76,12 +76,13 @@ impl Engine {
                         ));
                     }
 
+                    let mut added: Vec<(&String, usize)> = Vec::new();
                     let mut names: Vec<&String> = head_fns.keys().collect();
                     names.sort();
                     for name in names {
-                        let (h_src, h_row) = &head_fns[name];
+                        let (h_src, h_row, _) = &head_fns[name];
                         match base_fns.get(name) {
-                            Some((b_src, _)) if b_src != h_src => {
+                            Some((b_src, _, _)) if b_src != h_src => {
                                 disputes.push(meaning(
                                     &mut n,
                                     path,
@@ -91,13 +92,7 @@ impl Engine {
                                 ));
                             }
                             None => {
-                                disputes.push(meaning(
-                                    &mut n,
-                                    path,
-                                    *h_row,
-                                    format!("added function `{}`", name),
-                                    Severity::Review,
-                                ));
+                                added.push((name, *h_row));
                             }
                             _ => {}
                         }
@@ -107,7 +102,42 @@ impl Engine {
                         .filter(|name| !head_fns.contains_key(*name))
                         .collect();
                     removed.sort();
-                    for name in removed {
+
+                    // Pair removals with additions of identical source text:
+                    // that is a rename, not two separate changes.
+                    let mut consumed = vec![false; added.len()];
+                    let mut leftover_removed: Vec<&String> = Vec::new();
+                    for old in &removed {
+                        let old_sig = &base_fns[*old].2;
+                        let found = added
+                            .iter()
+                            .enumerate()
+                            .find(|(i, (new, _))| !consumed[*i] && &head_fns[*new].2 == old_sig);
+                        if let Some((i, (new, _))) = found {
+                            consumed[i] = true;
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                head_fns[*new].1,
+                                format!("renamed function `{}` to `{}`", old, new),
+                                Severity::Review,
+                            ));
+                        } else {
+                            leftover_removed.push(old);
+                        }
+                    }
+                    for (i, (new, row)) in added.iter().enumerate() {
+                        if !consumed[i] {
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                *row,
+                                format!("added function `{}`", new),
+                                Severity::Review,
+                            ));
+                        }
+                    }
+                    for name in leftover_removed {
                         disputes.push(meaning(
                             &mut n,
                             path,
@@ -126,12 +156,17 @@ impl Engine {
                         Severity::Review,
                     ));
                 }
-                (None, Some(_)) => {
+                (None, Some(h)) => {
+                    let summary = file_function_summary(
+                        parse_source(&mut parser, &config.language, h).as_ref(),
+                        h,
+                        config,
+                    );
                     disputes.push(meaning(
                         &mut n,
                         path,
                         0,
-                        "file added".to_string(),
+                        format!("file added ({})", summary),
                         Severity::Review,
                     ));
                 }
@@ -213,17 +248,20 @@ impl Engine {
                     all_fn_names.sort();
                     all_fn_names.dedup();
 
+                    let mut pending_added: Vec<(String, usize)> = Vec::new();
+                    let mut pending_removed: Vec<String> = Vec::new();
+
                     for name in all_fn_names {
                         let b_fn = b_fns.get(name);
                         let o_fn = o_fns.get(name);
                         let t_fn = t_fns.get(name);
 
-                        let b_body = b_fn.map(|(s, _)| s.as_str());
-                        let o_body = o_fn.map(|(s, _)| s.as_str());
-                        let t_body = t_fn.map(|(s, _)| s.as_str());
+                        let b_body = b_fn.map(|(s, _, _)| s.as_str());
+                        let o_body = o_fn.map(|(s, _, _)| s.as_str());
+                        let t_body = t_fn.map(|(s, _, _)| s.as_str());
                         let row = t_fn
-                            .map(|(_, r)| *r)
-                            .or_else(|| o_fn.map(|(_, r)| *r))
+                            .map(|(_, r, _)| *r)
+                            .or_else(|| o_fn.map(|(_, r, _)| *r))
                             .unwrap_or(0);
 
                         // If both matches base, unchanged
@@ -235,22 +273,10 @@ impl Engine {
                         if o_body == b_body && t_body != b_body {
                             match (b_body, t_body) {
                                 (None, Some(_)) => {
-                                    disputes.push(meaning(
-                                        &mut n,
-                                        path,
-                                        row,
-                                        format!("incoming branch added function `{}`", name),
-                                        Severity::Low,
-                                    ));
+                                    pending_added.push((name.clone(), row));
                                 }
                                 (Some(_), None) => {
-                                    disputes.push(meaning(
-                                        &mut n,
-                                        path,
-                                        row,
-                                        format!("incoming branch removed function `{}`", name),
-                                        Severity::Review,
-                                    ));
+                                    pending_removed.push(name.clone());
                                 }
                                 (Some(_), Some(_)) => {
                                     disputes.push(meaning(
@@ -316,6 +342,52 @@ impl Engine {
                             }
                         }
                     }
+
+                    // Pair incoming removals with incoming additions of
+                    // identical source text: a rename, not two changes.
+                    pending_added.sort_by(|a, b| a.0.cmp(&b.0));
+                    pending_removed.sort();
+                    let mut consumed = vec![false; pending_added.len()];
+                    let mut leftover_removed: Vec<String> = Vec::new();
+                    for old in &pending_removed {
+                        let old_sig = &b_fns[old].2;
+                        let found = pending_added
+                            .iter()
+                            .enumerate()
+                            .find(|(i, (new, _))| !consumed[*i] && &t_fns[new].2 == old_sig);
+                        if let Some((i, (new, row))) = found {
+                            consumed[i] = true;
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                *row,
+                                format!("incoming branch renamed function `{}` to `{}`", old, new),
+                                Severity::Review,
+                            ));
+                        } else {
+                            leftover_removed.push(old.clone());
+                        }
+                    }
+                    for (i, (new, row)) in pending_added.iter().enumerate() {
+                        if !consumed[i] {
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                *row,
+                                format!("incoming branch added function `{}`", new),
+                                Severity::Low,
+                            ));
+                        }
+                    }
+                    for name in leftover_removed {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            format!("incoming branch removed function `{}`", name),
+                            Severity::Review,
+                        ));
+                    }
                 }
                 // File deleted in target, modified in incoming
                 (Some(_), None, Some(_)) => {
@@ -338,12 +410,17 @@ impl Engine {
                     ));
                 }
                 // File added only in incoming
-                (None, None, Some(_)) => {
+                (None, None, Some(t)) => {
+                    let summary = file_function_summary(
+                        parse_source(&mut parser, &config.language, t).as_ref(),
+                        t,
+                        config,
+                    );
                     disputes.push(meaning(
                         &mut n,
                         path,
                         0,
-                        "incoming branch added file".to_string(),
+                        format!("incoming branch added file ({})", summary),
                         Severity::Low,
                     ));
                 }
@@ -376,13 +453,34 @@ fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severi
     }
 }
 
-/// Extract tracked functions as `name -> (source text, 1-based row)`, plus the
+/// Describe what a newly added file contains: how many tracked functions and
+/// up to three names, so a docket reader knows what arrived without opening
+/// the file.
+fn file_function_summary(tree: Option<&Tree>, source: &str, config: &LangConfig) -> String {
+    let (fns, _) = extract_functions(tree, source, config);
+    let mut names: Vec<&String> = fns.keys().collect();
+    names.sort();
+    if names.is_empty() {
+        return "no functions detected".to_string();
+    }
+    let count = names.len();
+    let preview: Vec<String> = names.iter().take(3).map(|s| s.to_string()).collect();
+    let noun = if count == 1 { "function" } else { "functions" };
+    if count > 3 {
+        format!("{} {}: {}, …", count, noun, preview.join(", "))
+    } else {
+        format!("{} {}: {}", count, noun, preview.join(", "))
+    }
+}
+
+/// Extract tracked functions as `name -> (source text, 1-based row, rename
+/// signature with the name blanked out)`, plus the
 /// list of names defined more than once (only the first occurrence is kept).
 fn extract_functions(
     tree: Option<&Tree>,
     source: &str,
     config: &LangConfig,
-) -> (HashMap<String, (String, usize)>, Vec<String>) {
+) -> (HashMap<String, (String, usize, String)>, Vec<String>) {
     let mut map = HashMap::new();
     let mut duplicates = Vec::new();
     if let Some(tree) = tree {
@@ -394,7 +492,7 @@ fn extract_functions(
 fn collect(
     node: Node,
     source: &str,
-    map: &mut HashMap<String, (String, usize)>,
+    map: &mut HashMap<String, (String, usize, String)>,
     duplicates: &mut Vec<String>,
     config: &LangConfig,
 ) {
@@ -403,7 +501,8 @@ fn collect(
         if node.kind() == kind.node_kind {
             matched = true;
             if let Some(key) = config.function_key(kind, node, source) {
-                insert(key, node, source, map, duplicates);
+                let name_node = node.child_by_field_name("name");
+                insert(key, node, name_node, source, map, duplicates);
             }
         }
     }
@@ -425,7 +524,7 @@ fn collect(
                 .utf8_text(source.as_bytes())
                 .unwrap_or("")
                 .to_string();
-            insert(key, body, source, map, duplicates);
+            insert(key, body, None, source, map, duplicates);
         }
     }
     // Do not recurse into nodes that yielded a function: nested definitions
@@ -444,8 +543,9 @@ fn collect(
 fn insert(
     key: String,
     body: Node,
+    name_node: Option<Node>,
     source: &str,
-    map: &mut HashMap<String, (String, usize)>,
+    map: &mut HashMap<String, (String, usize, String)>,
     duplicates: &mut Vec<String>,
 ) {
     if key.is_empty() {
@@ -456,7 +556,24 @@ fn insert(
         std::collections::hash_map::Entry::Vacant(slot) => {
             let src = body.utf8_text(source.as_bytes()).unwrap_or("").to_string();
             let row = body.start_position().row + 1;
-            slot.insert((src, row));
+            // Signature: the body with its own name blanked, so two functions
+            // that differ only by what they are called compare equal and pair
+            // as a rename.
+            let signature = match name_node {
+                Some(n)
+                    if n.start_byte() >= body.start_byte() && n.end_byte() <= body.end_byte() =>
+                {
+                    let rel_start = n.start_byte() - body.start_byte();
+                    let rel_end = n.end_byte() - body.start_byte();
+                    let mut sig = String::with_capacity(src.len());
+                    sig.push_str(&src[..rel_start]);
+                    sig.push('\u{0}');
+                    sig.push_str(&src[rel_end..]);
+                    sig
+                }
+                _ => src.clone(),
+            };
+            slot.insert((src, row, signature));
         }
     }
 }
@@ -482,7 +599,9 @@ mod tests {
         );
 
         let disputes = eng.diff_snapshots(&base, &head).unwrap();
-        assert_eq!(disputes.len(), 3);
+        // `hello` changed on both sides. `old_fn` -> `new_fn` have identical
+        // (empty) bodies apart from the name, so they pair as a rename.
+        assert_eq!(disputes.len(), 2);
 
         let details: Vec<&str> = disputes.iter().map(|d| d.detail.as_str()).collect();
         assert!(details
@@ -490,10 +609,7 @@ mod tests {
             .any(|d| d.contains("both sides changed `hello`")));
         assert!(details
             .iter()
-            .any(|d| d.contains("added function `new_fn`")));
-        assert!(details
-            .iter()
-            .any(|d| d.contains("removed function `old_fn`")));
+            .any(|d| d.contains("renamed function `old_fn` to `new_fn`")));
     }
 
     #[test]
