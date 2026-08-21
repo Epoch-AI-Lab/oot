@@ -6,6 +6,12 @@
 //! its callable on the `value` field of a `variable_declarator` and its name
 //! on the declarator itself. That relationship is captured by
 //! [`LangConfig::wrapped_functions`].
+//!
+//! Function map keys are always bare names. Receiver- or impl-qualified keys
+//! (`(*T).name`, `(A).name`) were tried and rejected: they make keys unstable
+//! under refactoring, so moving a function between impl blocks fabricates
+//! High-severity 3-way conflicts (and false Blocked verdicts). Same-named
+//! functions are reported as ambiguous instead — see `Engine::diff_snapshots`.
 
 use tree_sitter::{Language, Node};
 
@@ -16,25 +22,11 @@ const CALLABLE_KINDS: &[&str] = &[
     "generator_function",
 ];
 
-/// How to disambiguate a function's map key when bare names can collide.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Qualifier {
-    /// Key is the bare function name.
-    None,
-    /// Prefix with the receiver type, e.g. Go methods become `(*T).name`.
-    Receiver,
-    /// Prefix with the enclosing impl block, e.g. Rust methods become
-    /// `(A).name` or `(Trait for A).name`.
-    EnclosingImpl,
-}
-
 /// A directly named function or method node kind.
 #[derive(Debug, Clone, Copy)]
 pub struct FunctionKind {
     /// The node kind, e.g. `"function_item"` or `"method_declaration"`.
     pub node_kind: &'static str,
-    /// How to qualify the key when names could collide.
-    pub qualifier: Qualifier,
 }
 
 /// A wrapper node that carries a callable in one field and the function's
@@ -80,42 +72,13 @@ impl LangConfig {
             .is_some_and(|(_, ext)| self.extensions.contains(&ext.to_ascii_lowercase().as_str()))
     }
 
-    /// The map key for a directly named function node, qualified per
-    /// `kind.qualifier` so same-named functions stay distinct.
-    pub fn function_key(&self, kind: &FunctionKind, node: Node, source: &str) -> Option<String> {
+    /// The map key for a directly named function node: its `name` field text.
+    pub fn function_key(&self, _kind: &FunctionKind, node: Node, source: &str) -> Option<String> {
         let name_node = node.child_by_field_name("name")?;
-        let name = name_node.utf8_text(source.as_bytes()).ok()?.to_string();
-        match kind.qualifier {
-            Qualifier::None => Some(name),
-            Qualifier::Receiver => {
-                let receiver = node.child_by_field_name("receiver")?;
-                let mut cursor = receiver.walk();
-                let decl = receiver
-                    .children(&mut cursor)
-                    .find(|c| c.kind() == "parameter_declaration")?;
-                let ty = decl.child_by_field_name("type")?;
-                let ty_text = ty.utf8_text(source.as_bytes()).ok()?;
-                Some(format!("({}).{}", ty_text, name))
-            }
-            Qualifier::EnclosingImpl => {
-                let mut parent = node.parent();
-                while let Some(anc) = parent {
-                    if anc.kind() == "impl_item" {
-                        let ty = anc.child_by_field_name("type")?;
-                        let ty_text = ty.utf8_text(source.as_bytes()).ok()?;
-                        let scope = match anc.child_by_field_name("trait") {
-                            Some(t) => {
-                                format!("{} for {}", t.utf8_text(source.as_bytes()).ok()?, ty_text)
-                            }
-                            None => ty_text.to_string(),
-                        };
-                        return Some(format!("({}).{}", scope, name));
-                    }
-                    parent = anc.parent();
-                }
-                Some(name)
-            }
-        }
+        name_node
+            .utf8_text(source.as_bytes())
+            .ok()
+            .map(str::to_string)
     }
 }
 
@@ -128,7 +91,6 @@ pub fn registry() -> Vec<LangConfig> {
             language: tree_sitter_rust::LANGUAGE.into(),
             function_kinds: &[FunctionKind {
                 node_kind: "function_item",
-                qualifier: Qualifier::EnclosingImpl,
             }],
             wrapped_functions: &[],
         },
@@ -138,7 +100,6 @@ pub fn registry() -> Vec<LangConfig> {
             language: tree_sitter_python::LANGUAGE.into(),
             function_kinds: &[FunctionKind {
                 node_kind: "function_definition",
-                qualifier: Qualifier::None,
             }],
             wrapped_functions: &[],
         },
@@ -149,11 +110,9 @@ pub fn registry() -> Vec<LangConfig> {
             function_kinds: &[
                 FunctionKind {
                     node_kind: "function_declaration",
-                    qualifier: Qualifier::None,
                 },
                 FunctionKind {
                     node_kind: "method_declaration",
-                    qualifier: Qualifier::Receiver,
                 },
             ],
             wrapped_functions: &[],
@@ -165,15 +124,12 @@ pub fn registry() -> Vec<LangConfig> {
             function_kinds: &[
                 FunctionKind {
                     node_kind: "function_declaration",
-                    qualifier: Qualifier::None,
                 },
                 FunctionKind {
                     node_kind: "generator_function_declaration",
-                    qualifier: Qualifier::None,
                 },
                 FunctionKind {
                     node_kind: "method_definition",
-                    qualifier: Qualifier::None,
                 },
             ],
             wrapped_functions: &[

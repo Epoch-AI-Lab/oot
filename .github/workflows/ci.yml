@@ -39,6 +39,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Pinned so jj CLI output stays stable for the adapter tests.
+      - name: Install Jujutsu
+        run: |
+          curl -sL -o /tmp/jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.44.0/jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz
+          mkdir -p /tmp/jj-install
+          tar -xzf /tmp/jj.tar.gz -C /tmp/jj-install
+          sudo mv /tmp/jj-install/jj /usr/local/bin/jj
+          jj --version
+      - name: Configure jj identity
+        run: |
+          jj config set --user user.name "Oot CI"
+          jj config set --user user.email "oot-ci@example.com"
       - name: Run Tests
         run: cargo test --all-targets --all-features --verbose
 
@@ -50,3 +62,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Release Binary
         run: cargo build --release --verbose
+
+  oot:
+    name: Oot Adjudication (dogfood)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so git merge-base between the PR branch and main resolves.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Oot
+        run: cargo build --release
+      - name: Adjudicate PR against main
+        run: |
+          ./target/release/oot adjudicate \
+            --change "${{ github.head_ref }}" \
+            --base-ref origin/main \
+            --head-ref HEAD \
+            --repo . \
+            --visibility visibility.toml

@@ -3,7 +3,7 @@
 //! Adjudicates changes across snapshots against meaning and visibility policies.
 
 use clap::{Parser, Subcommand};
-use oot::adapter::{GitAdapter, GitAdjudicateOptions};
+use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
 use oot::dispute::{Docket, Kind, Severity, Verdict};
 use oot::docket;
@@ -42,7 +42,7 @@ enum Commands {
         /// Git head reference (e.g. `feature/auth` or commit SHA).
         #[arg(long)]
         head_ref: Option<String>,
-        /// Explicit merge-base commit SHA/ref override for 3-way Git adjudication.
+        /// Explicit merge-base (git) or common-ancestor (jj) commit override for 3-way adjudication.
         #[arg(long)]
         merge_base: Option<String>,
         /// Path to the Git repository root (defaults to discovering from current directory).
@@ -69,7 +69,7 @@ enum Commands {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<std::process::ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Commands::Adjudicate {
@@ -91,7 +91,7 @@ fn main() -> anyhow::Result<()> {
             if let Some(path) = docket {
                 let d = docket::load(std::path::Path::new(&path))?;
                 print!("{}", d.render());
-                return Ok(());
+                return Ok(std::process::ExitCode::SUCCESS);
             }
 
             let meaning_policy = match policy {
@@ -104,34 +104,58 @@ fn main() -> anyhow::Result<()> {
             };
             let eng = Engine::new()?;
 
-            // Git 3-way In-Memory Adjudication
+            // VCS 3-way In-Memory Adjudication (git or jj)
             if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
-                let git_adapter = match repo {
-                    Some(r) => GitAdapter::new(r)?,
-                    None => GitAdapter::discover()?,
-                };
+                let wants_jj = matches!(source.as_deref(), Some("jj") | Some("jujutsu"));
 
-                let options = GitAdjudicateOptions {
-                    custom_merge_base: merge_base,
-                    change_name: change,
-                    intent,
-                };
+                let doc = if wants_jj {
+                    let jj_adapter = match repo {
+                        Some(r) => JjAdapter::new(r)?,
+                        None => JjAdapter::discover()?,
+                    };
 
-                let doc = git_adapter.adjudicate_3way(
-                    &b_ref,
-                    &h_ref,
-                    &eng,
-                    &meaning_policy,
-                    &visibility_policy,
-                    &options,
-                )?;
+                    let options = JjAdjudicateOptions {
+                        custom_ancestor: merge_base,
+                        change_name: change,
+                        intent,
+                    };
+
+                    jj_adapter.adjudicate_3way(
+                        &b_ref,
+                        &h_ref,
+                        &eng,
+                        &meaning_policy,
+                        &visibility_policy,
+                        &options,
+                    )?
+                } else {
+                    let git_adapter = match repo {
+                        Some(r) => GitAdapter::new(r)?,
+                        None => GitAdapter::discover()?,
+                    };
+
+                    let options = GitAdjudicateOptions {
+                        custom_merge_base: merge_base,
+                        change_name: change,
+                        intent,
+                    };
+
+                    git_adapter.adjudicate_3way(
+                        &b_ref,
+                        &h_ref,
+                        &eng,
+                        &meaning_policy,
+                        &visibility_policy,
+                        &options,
+                    )?
+                };
 
                 print!("{}", doc.render());
 
                 if let Some(out_path) = output {
                     docket::save(&doc, std::path::Path::new(&out_path))?;
                 }
-                return Ok(());
+                return Ok(exit_code_for(doc.verdict));
             }
 
             // Materialized Directory Snapshot Adjudication
@@ -205,9 +229,23 @@ fn main() -> anyhow::Result<()> {
             if let Some(out_path) = output {
                 docket::save(&docket, std::path::Path::new(&out_path))?;
             }
+
+            Ok(exit_code_for(docket.verdict))
         }
     }
-    Ok(())
+}
+
+/// Exit-code contract for `oot adjudicate`:
+/// - `0`: verdict is `Adjudicated` — ship-ready.
+/// - `1`: any other verdict (`Blocked`, `Cloaked`, `Embargoed`) — all mean
+///   "do not ship yet", so CI and merge gates can treat any nonzero as a stop.
+/// - `2`: usage error (reserved by the CLI parser paths).
+fn exit_code_for(verdict: Verdict) -> std::process::ExitCode {
+    if verdict == Verdict::Adjudicated {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
 }
 
 /// Recursively read files in a directory into a HashMap of relative paths to contents.

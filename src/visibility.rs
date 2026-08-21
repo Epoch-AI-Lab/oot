@@ -44,14 +44,25 @@ impl VisibilityPolicy {
     /// Evaluate visibility rules against a change.
     ///
     /// Emits a visibility dispute for:
-    /// - Every private path present in the head snapshot.
+    /// - Every private path *touched* by the change: present in the head
+    ///   snapshot but absent from base, or with different content. Files that
+    ///   already existed unchanged are not touched, even if they match a
+    ///   private-path fragment.
     /// - Every private branch referenced by name or refs.
     pub fn check(&self, change: &Change) -> Vec<Dispute> {
         let mut out = Vec::new();
         let mut n = 1;
 
-        // Check private paths
-        for path in change.head.files.keys() {
+        // Check private paths among files the change actually touches
+        for (path, head_content) in &change.head.files {
+            let touched = change
+                .base
+                .files
+                .get(path)
+                .is_none_or(|base_content| base_content != head_content);
+            if !touched {
+                continue;
+            }
             let private = self
                 .private_paths
                 .iter()
@@ -167,5 +178,52 @@ mod tests {
 
         let disputes = default_policy.check(&change);
         assert!(disputes.is_empty());
+    }
+
+    #[test]
+    fn test_visibility_policy_only_flags_touched_private_paths() {
+        let policy = VisibilityPolicy::default();
+
+        let mut base = Snapshot::default();
+        // Private file already exists, unchanged by this change.
+        base.files.insert("secrets/key.pem".into(), "same".into());
+        base.files.insert("src/lib.rs".into(), "fn a() {}".into());
+
+        let mut head = Snapshot::default();
+        head.files.insert("secrets/key.pem".into(), "same".into());
+        head.files.insert("src/lib.rs".into(), "fn b() {}".into());
+
+        let change = Change {
+            name: "feature/public".into(),
+            source: Source::Git,
+            base_ref: "main".into(),
+            head_ref: "feature/public".into(),
+            base,
+            head,
+            authors: vec!["@alice".into()],
+            intent: None,
+        };
+
+        let disputes = policy.check(&change);
+        assert!(
+            disputes.is_empty(),
+            "unchanged private files must not be flagged, got {:?}",
+            disputes
+        );
+
+        // Now modify the private file: it becomes touched and must flag.
+        let mut head2 = change.head.clone();
+        head2
+            .files
+            .insert("secrets/key.pem".into(), "rotated".into());
+
+        let change2 = Change {
+            head: head2,
+            ..change
+        };
+
+        let disputes = policy.check(&change2);
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].location, "secrets/key.pem");
     }
 }
