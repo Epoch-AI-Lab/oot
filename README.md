@@ -68,11 +68,13 @@ Working seed — the engine runs, the docket renders, and git ingestion is in-me
 - [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs
 - [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revset resolution, first-class conflict detection) — hosted model API pending
 - [x] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
-- [x] Meaning disputes from the structural engine (tree-sitter Rust) — hosted intent check pending
+- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript) — hosted intent check pending
 - [x] Docket format with visibility and embargo state (JSON/TOML + render)
 - [x] In-memory execution path (no materialized tree required for git)
 - [x] Git adapter with 3-way adjudication
 - [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted) — hosted model API pending
+
+**Known limitation:** functions that share a bare name within one file (e.g., a `render` method on two classes, or same-named Go methods on two types) are tracked by first occurrence only; the docket flags them as ambiguous rather than tracking each definition separately.
 
 ## Open source and the model
 
