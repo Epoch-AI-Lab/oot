@@ -65,12 +65,14 @@ If a dispute crosses policy, Oot blocks the change or cloaks the private parts. 
 
 Working seed — the engine runs, the docket renders, and git ingestion is in-memory. Jujutsu and hosted intent are next.
 
-- [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs — Jujutsu snapshots pending
+- [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs
+- [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revset resolution, first-class conflict detection) — hosted model API pending
 - [x] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
 - [x] Meaning disputes from the structural engine (tree-sitter Rust) — hosted intent check pending
 - [x] Docket format with visibility and embargo state (JSON/TOML + render)
 - [x] In-memory execution path (no materialized tree required for git)
-- [x] Git adapter with 3-way adjudication — Jujutsu adapter and hosted model API pending
+- [x] Git adapter with 3-way adjudication
+- [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted) — hosted model API pending
 
 ## Open source and the model
 
@@ -86,6 +88,8 @@ cargo build --release
 ./target/release/oot adjudicate --change feature/auth-refactor --base fixtures/repo/base --head fixtures/repo/head --visibility fixtures/visibility.toml
 # or 3-way git (in-memory, no checkout)
 ./target/release/oot adjudicate --change feature/auth-refactor --base-ref main --head-ref feature/auth --repo .
+# or 3-way jujutsu (revsets welcome)
+./target/release/oot adjudicate --source jj --change greet --base-ref 'bookmarks(exact:main)' --head-ref '@-'
 ```
 
 ## Contribute

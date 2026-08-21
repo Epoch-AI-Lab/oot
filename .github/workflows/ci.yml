@@ -39,6 +39,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Pinned so jj CLI output stays stable for the adapter tests.
+      - name: Install Jujutsu
+        run: |
+          curl -sL -o /tmp/jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.44.0/jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz
+          tar -xzf /tmp/jj.tar.gz -C /tmp
+          sudo mv /tmp/jj /usr/local/bin/jj
+          jj --version
+      - name: Configure jj identity
+        run: |
+          jj config set --user user.name "Oot CI"
+          jj config set --user user.email "oot-ci@example.com"
       - name: Run Tests
         run: cargo test --all-targets --all-features --verbose
 
