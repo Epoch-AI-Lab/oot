@@ -27,7 +27,8 @@ fn test_cli_adjudicate_fixtures_repo() {
         .output()
         .expect("Failed to execute oot CLI");
 
-    assert!(output.status.success());
+    // CLOAKED verdict must exit nonzero (do-not-ship).
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("OOT DOCKET"));
@@ -83,7 +84,8 @@ fn test_cli_adjudicate_embargoed_clean() {
         .output()
         .expect("Failed to execute oot CLI");
 
-    assert!(output.status.success());
+    // EMBARGOED verdict must exit nonzero (held = do-not-ship).
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("OOT DOCKET"));
@@ -164,7 +166,8 @@ fn test_cli_custom_meaning_policy_and_temp_dirs() {
         .output()
         .expect("Failed to execute oot CLI");
 
-    assert!(output.status.success());
+    // BLOCKED verdict must exit nonzero.
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("OOT DOCKET"));
@@ -173,6 +176,83 @@ fn test_cli_custom_meaning_policy_and_temp_dirs() {
     assert!(stdout.contains("verdict:    ▶ BLOCKED . 1 requires review"));
 
     let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_exit_code_zero_for_adjudicated() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_clean_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    // Identical snapshots: nothing changed, no disputes, clean verdict.
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok() {}").unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "chore/noop",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "Adjudicated verdict must exit 0"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OOT DOCKET"));
+    assert!(stdout.contains("ADJUDICATED"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_repo_visibility_policy_flags_env() {
+    let bin = get_bin_path();
+
+    // The repo's own visibility.toml must flag any .env path as private,
+    // producing a CLOAKED verdict and a nonzero exit even for an otherwise
+    // empty diff.
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "test/policy-check",
+            "--source",
+            "git",
+            "--base",
+            "fixtures/repo/base",
+            "--head",
+            "fixtures/repo/head",
+            "--visibility",
+            "visibility.toml",
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("CLOAKED"));
+    assert!(stdout.contains(".env"));
+
+    let _ = ();
 }
 
 #[test]
