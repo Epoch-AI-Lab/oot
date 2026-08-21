@@ -148,7 +148,7 @@ fn test_git_adapter_3way_semantic_conflict() {
     let _main_sha = repo.commit("main change");
 
     let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
-    let mut engine = Engine::new().expect("valid engine");
+    let engine = Engine::new().expect("valid engine");
     let meaning_policy = MeaningPolicy::default();
     let visibility_policy = VisibilityPolicy::default();
 
@@ -169,7 +169,7 @@ fn test_git_adapter_3way_semantic_conflict() {
         .adjudicate_3way(
             "main",
             "feature/auth",
-            &mut engine,
+            &engine,
             &meaning_policy,
             &visibility_policy,
             &options,
@@ -209,7 +209,7 @@ fn test_git_adapter_3way_unilateral_clean() {
     repo.checkout("main");
 
     let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
-    let mut engine = Engine::new().expect("valid engine");
+    let engine = Engine::new().expect("valid engine");
     let meaning_policy = MeaningPolicy::default();
     let visibility_policy = VisibilityPolicy::default();
 
@@ -217,7 +217,7 @@ fn test_git_adapter_3way_unilateral_clean() {
         .adjudicate_3way(
             "main",
             "feature/new-fn",
-            &mut engine,
+            &engine,
             &meaning_policy,
             &visibility_policy,
             &GitAdjudicateOptions::default(),
@@ -244,7 +244,7 @@ fn test_git_adapter_visibility_violation_cloaked() {
     repo.commit("add secrets");
 
     let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
-    let mut engine = Engine::new().expect("valid engine");
+    let engine = Engine::new().expect("valid engine");
     let meaning_policy = MeaningPolicy::default();
     let visibility_policy = VisibilityPolicy::default(); // defaults to secrets/ and .env private
 
@@ -252,7 +252,7 @@ fn test_git_adapter_visibility_violation_cloaked() {
         .adjudicate_3way(
             "main",
             "feature/secrets",
-            &mut engine,
+            &engine,
             &meaning_policy,
             &visibility_policy,
             &GitAdjudicateOptions::default(),

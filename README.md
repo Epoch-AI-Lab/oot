@@ -74,6 +74,8 @@ Working seed — the engine runs, the docket renders, and git ingestion is in-me
 - [x] Git adapter with 3-way adjudication
 - [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted) — hosted model API pending
 
+**Known limitation:** functions that share a bare name within one file (e.g., a `render` method on two classes, or same-named Go methods on two types) are tracked by first occurrence only; the docket flags them as ambiguous rather than tracking each definition separately.
+
 ## Open source and the model
 
 The adjudication runtime, the docket format, and the adapters are MIT licensed. The hosted model that scores intent and runs embargo distribution will be a paid service. A court that hides its deliberations is not a court, so the gate stays open.

@@ -102,7 +102,7 @@ fn main() -> anyhow::Result<()> {
                 Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
                 None => VisibilityPolicy::default(),
             };
-            let mut eng = Engine::new()?;
+            let eng = Engine::new()?;
 
             // VCS 3-way In-Memory Adjudication (git or jj)
             if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
@@ -123,7 +123,7 @@ fn main() -> anyhow::Result<()> {
                     jj_adapter.adjudicate_3way(
                         &b_ref,
                         &h_ref,
-                        &mut eng,
+                        &eng,
                         &meaning_policy,
                         &visibility_policy,
                         &options,
@@ -143,7 +143,7 @@ fn main() -> anyhow::Result<()> {
                     git_adapter.adjudicate_3way(
                         &b_ref,
                         &h_ref,
-                        &mut eng,
+                        &eng,
                         &meaning_policy,
                         &visibility_policy,
                         &options,

@@ -77,3 +77,14 @@ Findings from three adversarial passes and how the plan changed:
 5. **Crate claims verified against crates.io/docs.rs (live):** tree-sitter-go has 0.23.0–0.23.4 releases; tree-sitter-javascript has 0.23.0–0.23.1; both export `LANGUAGE: LanguageFn`; pinned docs.rs/tree-sitter/0.23.2 shows LANGUAGE_VERSION=14 / MIN_COMPATIBLE_LANGUAGE_VERSION=13. Pinning `tree-sitter-go = "0.23"`, `tree-sitter-javascript = "0.23"` alongside the existing runtime 0.23 is safe.
 
 Status: GREEN (issues found were fixed by cutting items 1–2 from scope rather than reworking them).
+
+## Post-Review Round (interrogate, 4 reviewers)
+
+A second adversarial pass on the implemented branch found four consensus issues, all fixed in the follow-up commit:
+
+1. **Arrow/anonymous JS functions invisible** — the "variable-assigned via parent lookup" scoped in this doc's §Recommendation was dropped during implementation without being recorded as a cut. Fixed: `arrow_function` added to kinds; anonymous matches inherit the enclosing `variable_declarator`'s name.
+2. **`from_path` dotless regression** — `rsplit('.').next()` matched extension-less files named literally `go`/`js`/`rs` (the old `.ends_with(".rs")` required a dot). Fixed with `rsplit_once('.')` + lowercase normalization.
+3. **Silent unreachable guards** — `get_mut(&lang) else { continue }` could have masked future registration drift. Dissolved entirely by restructuring.
+4. **Bare-name collision = silent data loss, not noise** — last-wins insert made diffs direction-dependent (editing the first same-named method produced zero disputes). Fixed: first occurrence wins and an explicit Review-severity ambiguity dispute is emitted.
+
+Also applied from reviewer pushback: Engine stores `tree_sitter::Language` (validated in `new()`) instead of live `Parser`s, restoring `&self` on both diff methods and reverting the `&mut` ripple through adapters/main/tests; dispute numbering now sorts function names in `diff_snapshots` (matching `diff_3way`) so saved dockets are deterministic; `collect` no longer recurses into matched functions (kills nested double-reporting); README documents the ambiguity limitation. Note for the record: one reviewer claimed `Language` is `Copy` — it is not; it borrows.

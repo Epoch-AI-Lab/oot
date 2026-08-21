@@ -5,6 +5,7 @@
 
 use crate::change::Snapshot;
 use crate::dispute::{Dispute, Kind, Severity};
+use anyhow::Context;
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser, Tree};
 
@@ -19,8 +20,8 @@ enum Lang {
 impl Lang {
     /// Detect the language of a file from its extension.
     fn from_path(path: &str) -> Option<Self> {
-        let ext = path.rsplit('.').next()?;
-        match ext {
+        let ext = path.rsplit_once('.')?.1.to_ascii_lowercase();
+        match ext.as_str() {
             "rs" => Some(Lang::Rust),
             "go" => Some(Lang::Go),
             "js" | "mjs" | "cjs" => Some(Lang::JavaScript),
@@ -36,8 +37,8 @@ impl Lang {
         }
     }
 
-    /// Node kinds that declare a function in this language. Every kind must
-    /// expose a `name` field.
+    /// Node kinds that declare a function in this language. Kinds without a
+    /// `name` field fall back to the enclosing variable binding's name.
     fn function_kinds(self) -> &'static [&'static str] {
         match self {
             Lang::Rust => &["function_item"],
@@ -48,6 +49,7 @@ impl Lang {
                 "generator_function_declaration",
                 "generator_function",
                 "method_definition",
+                "arrow_function",
             ],
         }
     }
@@ -55,31 +57,31 @@ impl Lang {
 
 /// Structural difference engine for code snapshots.
 pub struct Engine {
-    parsers: HashMap<Lang, Parser>,
+    languages: HashMap<Lang, tree_sitter::Language>,
 }
 
 impl Engine {
-    /// Create a new structural diff engine with one parser per supported language.
+    /// Create a new structural diff engine with one validated grammar per
+    /// supported language.
     ///
     /// Fails loudly if any grammar's ABI is incompatible with the runtime — this
     /// doubles as a version-drift tripwire for CI.
     pub fn new() -> anyhow::Result<Self> {
-        let mut parsers = HashMap::new();
+        let mut languages = HashMap::new();
         for lang in [Lang::Rust, Lang::Go, Lang::JavaScript] {
-            let mut parser = Parser::new();
-            parser.set_language(&lang.language())?;
-            parsers.insert(lang, parser);
+            let language = lang.language();
+            let mut probe = Parser::new();
+            probe
+                .set_language(&language)
+                .with_context(|| format!("loading grammar for {lang:?}"))?;
+            languages.insert(lang, language);
         }
-        Ok(Engine { parsers })
+        Ok(Engine { languages })
     }
 
     /// Compare two snapshots and report Meaning disputes: functions that
     /// changed, were added, or were removed between base and head.
-    pub fn diff_snapshots(
-        &mut self,
-        base: &Snapshot,
-        head: &Snapshot,
-    ) -> anyhow::Result<Vec<Dispute>> {
+    pub fn diff_snapshots(&self, base: &Snapshot, head: &Snapshot) -> anyhow::Result<Vec<Dispute>> {
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -91,17 +93,36 @@ impl Engine {
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
+            let language = &self.languages[&lang];
             let base_src = base.files.get(path);
             let head_src = head.files.get(path);
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
-                    let Some(parser) = self.parsers.get_mut(&lang) else {
-                        continue;
-                    };
-                    let base_fns = extract_functions(parse(parser, b).as_ref(), b, lang);
-                    let head_fns = extract_functions(parse(parser, h).as_ref(), h, lang);
-                    for (name, (h_src, h_row)) in &head_fns {
+                    let (base_fns, mut dupes) =
+                        extract_functions(parse_source(language, b)?.as_ref(), b, lang);
+                    let (head_fns, head_dupes) =
+                        extract_functions(parse_source(language, h)?.as_ref(), h, lang);
+                    dupes.extend(head_dupes);
+                    dupes.sort();
+                    dupes.dedup();
+
+                    for name in &dupes {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            format!(
+                                "function `{name}` is defined multiple times in this file; tracked only by first occurrence"
+                            ),
+                            Severity::Review,
+                        ));
+                    }
+
+                    let mut names: Vec<&String> = head_fns.keys().collect();
+                    names.sort();
+                    for name in names {
+                        let (h_src, h_row) = &head_fns[name];
                         match base_fns.get(name) {
                             Some((b_src, _)) if b_src != h_src => {
                                 disputes.push(meaning(
@@ -124,16 +145,19 @@ impl Engine {
                             _ => {}
                         }
                     }
-                    for name in base_fns.keys() {
-                        if !head_fns.contains_key(name) {
-                            disputes.push(meaning(
-                                &mut n,
-                                path,
-                                0,
-                                format!("removed function `{}`", name),
-                                Severity::Review,
-                            ));
-                        }
+                    let mut removed: Vec<&String> = base_fns
+                        .keys()
+                        .filter(|name| !head_fns.contains_key(*name))
+                        .collect();
+                    removed.sort();
+                    for name in removed {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            format!("removed function `{}`", name),
+                            Severity::Review,
+                        ));
                     }
                 }
                 (Some(_), None) => {
@@ -163,7 +187,7 @@ impl Engine {
     /// Perform a 3-way semantic diff between a common merge-base ancestor,
     /// the target (ours) branch, and the incoming (theirs/head) branch.
     pub fn diff_3way(
-        &mut self,
+        &self,
         base: &Snapshot,
         ours: &Snapshot,
         theirs: &Snapshot,
@@ -184,6 +208,7 @@ impl Engine {
             let Some(lang) = Lang::from_path(path) else {
                 continue;
             };
+            let language = &self.languages[&lang];
             let b_file = base.files.get(path);
             let o_file = ours.files.get(path);
             let t_file = theirs.files.get(path);
@@ -191,12 +216,28 @@ impl Engine {
             match (b_file, o_file, t_file) {
                 // File exists in all three
                 (Some(b_src), Some(o_src), Some(t_src)) => {
-                    let Some(parser) = self.parsers.get_mut(&lang) else {
-                        continue;
-                    };
-                    let b_fns = extract_functions(parse(parser, b_src).as_ref(), b_src, lang);
-                    let o_fns = extract_functions(parse(parser, o_src).as_ref(), o_src, lang);
-                    let t_fns = extract_functions(parse(parser, t_src).as_ref(), t_src, lang);
+                    let (b_fns, mut dupes) =
+                        extract_functions(parse_source(language, b_src)?.as_ref(), b_src, lang);
+                    let (o_fns, o_dupes) =
+                        extract_functions(parse_source(language, o_src)?.as_ref(), o_src, lang);
+                    let (t_fns, t_dupes) =
+                        extract_functions(parse_source(language, t_src)?.as_ref(), t_src, lang);
+                    dupes.extend(o_dupes);
+                    dupes.extend(t_dupes);
+                    dupes.sort();
+                    dupes.dedup();
+
+                    for name in &dupes {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            format!(
+                                "function `{name}` is defined multiple times in this file; tracked only by first occurrence"
+                            ),
+                            Severity::Review,
+                        ));
+                    }
 
                     let mut all_fn_names: Vec<&String> = b_fns
                         .keys()
@@ -352,8 +393,73 @@ impl Engine {
     }
 }
 
-fn parse(parser: &mut Parser, source: &str) -> Option<Tree> {
-    parser.parse(source, None)
+fn parse_source(language: &tree_sitter::Language, source: &str) -> anyhow::Result<Option<Tree>> {
+    let mut parser = Parser::new();
+    parser.set_language(language)?;
+    Ok(parser.parse(source, None))
+}
+
+/// Extract tracked functions as `name -> (source text, 1-based row)`, plus the
+/// list of names defined more than once (only the first occurrence is kept).
+fn extract_functions(
+    tree: Option<&Tree>,
+    source: &str,
+    lang: Lang,
+) -> (HashMap<String, (String, usize)>, Vec<String>) {
+    let mut map = HashMap::new();
+    let mut duplicates = Vec::new();
+    if let Some(tree) = tree {
+        collect(tree.root_node(), source, lang, &mut map, &mut duplicates);
+    }
+    (map, duplicates)
+}
+
+fn collect(
+    node: Node,
+    source: &str,
+    lang: Lang,
+    map: &mut HashMap<String, (String, usize)>,
+    duplicates: &mut Vec<String>,
+) {
+    if lang.function_kinds().contains(&node.kind()) {
+        let name = node
+            .child_by_field_name("name")
+            .and_then(|n| n.utf8_text(source.as_bytes()).ok())
+            .map(str::to_string)
+            .or_else(|| inherited_name(node, source));
+        if let Some(name) = name.filter(|n| !n.is_empty()) {
+            match map.entry(name.clone()) {
+                std::collections::hash_map::Entry::Occupied(_) => {
+                    duplicates.push(name);
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    let src = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+                    let row = node.start_position().row + 1;
+                    slot.insert((src, row));
+                }
+            }
+        }
+        // Do not recurse into matched functions: nested definitions are covered
+        // by the enclosing function's source span.
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect(child, source, lang, map, duplicates);
+    }
+}
+
+/// Name for anonymous functions bound to a variable: `const f = () => {}`.
+fn inherited_name(node: Node, source: &str) -> Option<String> {
+    let parent = node.parent()?;
+    if parent.kind() != "variable_declarator" {
+        return None;
+    }
+    parent
+        .child_by_field_name("name")?
+        .utf8_text(source.as_bytes())
+        .ok()
+        .map(str::to_string)
 }
 
 fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severity) -> Dispute {
@@ -365,37 +471,6 @@ fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severi
         kind: Kind::Meaning,
         severity,
         detail,
-    }
-}
-
-fn extract_functions(
-    tree: Option<&Tree>,
-    source: &str,
-    lang: Lang,
-) -> HashMap<String, (String, usize)> {
-    let mut map = HashMap::new();
-    let Some(tree) = tree else {
-        return map;
-    };
-    collect(tree.root_node(), source, lang, &mut map);
-    map
-}
-
-fn collect(node: Node, source: &str, lang: Lang, map: &mut HashMap<String, (String, usize)>) {
-    if lang.function_kinds().contains(&node.kind()) {
-        if let Some(name_node) = node.child_by_field_name("name") {
-            let name = name_node
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
-            let src = node.utf8_text(source.as_bytes()).unwrap_or("").to_string();
-            let row = node.start_position().row + 1;
-            map.insert(name, (src, row));
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect(child, source, lang, map);
     }
 }
 
@@ -420,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_engine_diff_functions() {
-        let mut eng = Engine::new().unwrap();
+        let eng = Engine::new().unwrap();
 
         let mut base = Snapshot::default();
         base.files.insert(
@@ -451,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_engine_diff_3way_conflict_and_clean() {
-        let mut eng = Engine::new().unwrap();
+        let eng = Engine::new().unwrap();
 
         let mut base = Snapshot::default();
         base.files.insert(
