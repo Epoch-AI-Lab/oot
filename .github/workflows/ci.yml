@@ -61,3 +61,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build Release Binary
         run: cargo build --release --verbose
+
+  oot:
+    name: Oot Adjudication (dogfood)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so git merge-base between the PR branch and main resolves.
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build Oot
+        run: cargo build --release
+      - name: Adjudicate PR against main
+        run: |
+          ./target/release/oot adjudicate \
+            --change "${{ github.head_ref }}" \
+            --base-ref origin/main \
+            --head-ref HEAD \
+            --repo . \
+            --visibility visibility.toml
