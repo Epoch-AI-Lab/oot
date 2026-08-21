@@ -4,7 +4,7 @@ use oot::engine::Engine;
 
 #[test]
 fn test_engine_function_modification_detection() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -41,7 +41,7 @@ fn authenticate(user: &str, pass: &str) -> bool {
 
 #[test]
 fn test_engine_function_addition_and_deletion_detection() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -93,7 +93,7 @@ fn subtract(a: i32, b: i32) -> i32 {
 
 #[test]
 fn test_engine_identical_unchanged_files() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let source = r#"
 pub fn calculate_hash(data: &[u8]) -> u64 {
@@ -127,8 +127,8 @@ pub fn verify_signature() -> bool {
 }
 
 #[test]
-fn test_engine_non_rust_file_filtering() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+fn test_engine_unsupported_extension_filtering() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -168,13 +168,13 @@ fn test_engine_non_rust_file_filtering() {
 
     assert!(
         disputes.is_empty(),
-        "Non-Rust files should be filtered out from AST diffing"
+        "Files with unsupported extensions should be filtered out from AST diffing"
     );
 }
 
 #[test]
 fn test_engine_syntax_error_handling() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -201,7 +201,7 @@ fn test_engine_syntax_error_handling() {
 
 #[test]
 fn test_engine_file_added_and_removed() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -233,7 +233,7 @@ fn test_engine_file_added_and_removed() {
 
 #[test]
 fn test_engine_multiple_files_and_functions() {
-    let engine = Engine::new().expect("Failed to initialize engine");
+    let mut engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
     base.files.insert(
@@ -259,4 +259,144 @@ fn test_engine_multiple_files_and_functions() {
         .iter()
         .any(|d| d.detail == "both sides changed `fa1`"));
     assert!(disputes.iter().any(|d| d.detail == "added function `fa3`"));
+}
+
+#[test]
+fn test_engine_go_function_and_method_detection() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "store/store.go".to_string(),
+        r#"
+package store
+
+func Greet(name string) string {
+	return "hello " + name
+}
+
+func (s *Store) Name() string {
+	return s.title
+}
+"#
+        .to_string(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "store/store.go".to_string(),
+        r#"
+package store
+
+func Greet(name string) string {
+	return "hey " + name
+}
+
+func (s *Store) Name() string {
+	return s.title
+}
+"#
+        .to_string(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes[0].detail, "both sides changed `Greet`");
+}
+
+#[test]
+fn test_engine_go_3way_method_conflict() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let base_src = r#"
+package store
+
+func (s *Store) Total() int {
+	return s.count * s.price
+}
+"#;
+    let ours_src = r#"
+package store
+
+func (s *Store) Total() int {
+	return s.count * s.price / s.divisor
+}
+"#;
+    let theirs_src = r#"
+package store
+
+func (s *Store) Total() int {
+	return s.count * s.price + s.bonus
+}
+"#;
+
+    let mut base = Snapshot::default();
+    base.files
+        .insert("total.go".to_string(), base_src.to_string());
+    let mut ours = Snapshot::default();
+    ours.files
+        .insert("total.go".to_string(), ours_src.to_string());
+    let mut theirs = Snapshot::default();
+    theirs
+        .files
+        .insert("total.go".to_string(), theirs_src.to_string());
+
+    let disputes = engine
+        .diff_3way(&base, &ours, &theirs)
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes[0].severity, Severity::High);
+    assert!(disputes[0].detail.contains("3-way conflict"));
+    assert!(disputes[0].detail.contains("`Total`"));
+}
+
+#[test]
+fn test_engine_javascript_function_detection() {
+    let mut engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/api.js".to_string(),
+        r#"
+export function fetchUser(id) {
+  return { id };
+}
+
+class Client {
+  connect() {
+    return true;
+  }
+}
+"#
+        .to_string(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/api.js".to_string(),
+        r#"
+export function fetchUser(id) {
+  return { id, includeProfile: true };
+}
+
+class Client {
+  connect(timeoutMs) {
+    return timeoutMs > 0;
+  }
+}
+"#
+        .to_string(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `fetchUser`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `connect`"));
 }

@@ -68,7 +68,7 @@ Working seed — the engine runs, the docket renders, and git ingestion is in-me
 - [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs
 - [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revset resolution, first-class conflict detection) — hosted model API pending
 - [x] Visibility policy: private paths, private branches, embargo schedules (the governance spine)
-- [x] Meaning disputes from the structural engine (tree-sitter Rust) — hosted intent check pending
+- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript) — hosted intent check pending
 - [x] Docket format with visibility and embargo state (JSON/TOML + render)
 - [x] In-memory execution path (no materialized tree required for git)
 - [x] Git adapter with 3-way adjudication

@@ -164,13 +164,13 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
         return;
     }
     let (_repo, adapter) = setup_base_and_head(false);
-    let eng = Engine::new().unwrap();
+    let mut eng = Engine::new().unwrap();
 
     let docket = adapter
         .adjudicate_3way(
             "bookmarks(exact:main)",
             "@-",
-            &eng,
+            &mut eng,
             &MeaningPolicy::default(),
             &VisibilityPolicy::default(),
             &JjAdjudicateOptions {

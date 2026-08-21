@@ -177,7 +177,7 @@ impl GitAdapter {
         &self,
         base_ref: &str,
         head_ref: &str,
-        engine: &Engine,
+        engine: &mut Engine,
         meaning_policy: &MeaningPolicy,
         visibility_policy: &VisibilityPolicy,
         options: &GitAdjudicateOptions,

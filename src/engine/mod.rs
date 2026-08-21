@@ -8,24 +8,78 @@ use crate::dispute::{Dispute, Kind, Severity};
 use std::collections::HashMap;
 use tree_sitter::{Node, Parser, Tree};
 
+/// Languages the structural engine can parse.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum Lang {
+    Rust,
+    Go,
+    JavaScript,
+}
+
+impl Lang {
+    /// Detect the language of a file from its extension.
+    fn from_path(path: &str) -> Option<Self> {
+        let ext = path.rsplit('.').next()?;
+        match ext {
+            "rs" => Some(Lang::Rust),
+            "go" => Some(Lang::Go),
+            "js" | "mjs" | "cjs" => Some(Lang::JavaScript),
+            _ => None,
+        }
+    }
+
+    fn language(self) -> tree_sitter::Language {
+        match self {
+            Lang::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Lang::Go => tree_sitter_go::LANGUAGE.into(),
+            Lang::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
+        }
+    }
+
+    /// Node kinds that declare a function in this language. Every kind must
+    /// expose a `name` field.
+    fn function_kinds(self) -> &'static [&'static str] {
+        match self {
+            Lang::Rust => &["function_item"],
+            Lang::Go => &["function_declaration", "method_declaration"],
+            Lang::JavaScript => &[
+                "function_declaration",
+                "function_expression",
+                "generator_function_declaration",
+                "generator_function",
+                "method_definition",
+            ],
+        }
+    }
+}
+
 /// Structural difference engine for code snapshots.
 pub struct Engine {
-    language: tree_sitter::Language,
+    parsers: HashMap<Lang, Parser>,
 }
 
 impl Engine {
-    /// Create a new structural diff engine initialized with Rust grammar support.
+    /// Create a new structural diff engine with one parser per supported language.
+    ///
+    /// Fails loudly if any grammar's ABI is incompatible with the runtime — this
+    /// doubles as a version-drift tripwire for CI.
     pub fn new() -> anyhow::Result<Self> {
-        let language = tree_sitter_rust::LANGUAGE.into();
-        Ok(Engine { language })
+        let mut parsers = HashMap::new();
+        for lang in [Lang::Rust, Lang::Go, Lang::JavaScript] {
+            let mut parser = Parser::new();
+            parser.set_language(&lang.language())?;
+            parsers.insert(lang, parser);
+        }
+        Ok(Engine { parsers })
     }
 
     /// Compare two snapshots and report Meaning disputes: functions that
     /// changed, were added, or were removed between base and head.
-    pub fn diff_snapshots(&self, base: &Snapshot, head: &Snapshot) -> anyhow::Result<Vec<Dispute>> {
-        let mut parser = Parser::new();
-        parser.set_language(&self.language)?;
-
+    pub fn diff_snapshots(
+        &mut self,
+        base: &Snapshot,
+        head: &Snapshot,
+    ) -> anyhow::Result<Vec<Dispute>> {
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -34,16 +88,19 @@ impl Engine {
         paths.dedup();
 
         for path in paths {
-            if !path.ends_with(".rs") {
+            let Some(lang) = Lang::from_path(path) else {
                 continue;
-            }
+            };
             let base_src = base.files.get(path);
             let head_src = head.files.get(path);
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
-                    let base_fns = extract_functions(parse(&mut parser, b).as_ref(), b);
-                    let head_fns = extract_functions(parse(&mut parser, h).as_ref(), h);
+                    let Some(parser) = self.parsers.get_mut(&lang) else {
+                        continue;
+                    };
+                    let base_fns = extract_functions(parse(parser, b).as_ref(), b, lang);
+                    let head_fns = extract_functions(parse(parser, h).as_ref(), h, lang);
                     for (name, (h_src, h_row)) in &head_fns {
                         match base_fns.get(name) {
                             Some((b_src, _)) if b_src != h_src => {
@@ -106,14 +163,11 @@ impl Engine {
     /// Perform a 3-way semantic diff between a common merge-base ancestor,
     /// the target (ours) branch, and the incoming (theirs/head) branch.
     pub fn diff_3way(
-        &self,
+        &mut self,
         base: &Snapshot,
         ours: &Snapshot,
         theirs: &Snapshot,
     ) -> anyhow::Result<Vec<Dispute>> {
-        let mut parser = Parser::new();
-        parser.set_language(&self.language)?;
-
         let mut disputes = Vec::new();
         let mut n = 1;
 
@@ -127,9 +181,9 @@ impl Engine {
         paths.dedup();
 
         for path in paths {
-            if !path.ends_with(".rs") {
+            let Some(lang) = Lang::from_path(path) else {
                 continue;
-            }
+            };
             let b_file = base.files.get(path);
             let o_file = ours.files.get(path);
             let t_file = theirs.files.get(path);
@@ -137,9 +191,12 @@ impl Engine {
             match (b_file, o_file, t_file) {
                 // File exists in all three
                 (Some(b_src), Some(o_src), Some(t_src)) => {
-                    let b_fns = extract_functions(parse(&mut parser, b_src).as_ref(), b_src);
-                    let o_fns = extract_functions(parse(&mut parser, o_src).as_ref(), o_src);
-                    let t_fns = extract_functions(parse(&mut parser, t_src).as_ref(), t_src);
+                    let Some(parser) = self.parsers.get_mut(&lang) else {
+                        continue;
+                    };
+                    let b_fns = extract_functions(parse(parser, b_src).as_ref(), b_src, lang);
+                    let o_fns = extract_functions(parse(parser, o_src).as_ref(), o_src, lang);
+                    let t_fns = extract_functions(parse(parser, t_src).as_ref(), t_src, lang);
 
                     let mut all_fn_names: Vec<&String> = b_fns
                         .keys()
@@ -311,17 +368,21 @@ fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severi
     }
 }
 
-fn extract_functions(tree: Option<&Tree>, source: &str) -> HashMap<String, (String, usize)> {
+fn extract_functions(
+    tree: Option<&Tree>,
+    source: &str,
+    lang: Lang,
+) -> HashMap<String, (String, usize)> {
     let mut map = HashMap::new();
     let Some(tree) = tree else {
         return map;
     };
-    collect(tree.root_node(), source, &mut map);
+    collect(tree.root_node(), source, lang, &mut map);
     map
 }
 
-fn collect(node: Node, source: &str, map: &mut HashMap<String, (String, usize)>) {
-    if node.kind() == "function_item" {
+fn collect(node: Node, source: &str, lang: Lang, map: &mut HashMap<String, (String, usize)>) {
+    if lang.function_kinds().contains(&node.kind()) {
         if let Some(name_node) = node.child_by_field_name("name") {
             let name = name_node
                 .utf8_text(source.as_bytes())
@@ -334,7 +395,7 @@ fn collect(node: Node, source: &str, map: &mut HashMap<String, (String, usize)>)
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect(child, source, map);
+        collect(child, source, lang, map);
     }
 }
 
@@ -343,8 +404,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_all_grammars_abi_compatible() {
+        // Tripwire: if a grammar crate is bumped past the runtime's supported
+        // ABI range, set_language fails here instead of at some user's build.
+        for lang in [Lang::Rust, Lang::Go, Lang::JavaScript] {
+            let mut parser = Parser::new();
+            parser.set_language(&lang.language()).unwrap_or_else(|e| {
+                panic!(
+                    "grammar for {:?} is ABI-incompatible with runtime: {}",
+                    lang, e
+                )
+            });
+        }
+    }
+
+    #[test]
     fn test_engine_diff_functions() {
-        let eng = Engine::new().unwrap();
+        let mut eng = Engine::new().unwrap();
 
         let mut base = Snapshot::default();
         base.files.insert(
@@ -375,7 +451,7 @@ mod tests {
 
     #[test]
     fn test_engine_diff_3way_conflict_and_clean() {
-        let eng = Engine::new().unwrap();
+        let mut eng = Engine::new().unwrap();
 
         let mut base = Snapshot::default();
         base.files.insert(
