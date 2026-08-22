@@ -62,6 +62,10 @@ fn build_source_repo(path: &PathBuf) {
             "-m",
             "auth flow\n\nDetailed body.\n",
         ])
+        .env("GIT_AUTHOR_NAME", "Kriday")
+        .env("GIT_AUTHOR_EMAIL", "k@oot.dev")
+        .env("GIT_COMMITTER_NAME", "Kriday")
+        .env("GIT_COMMITTER_EMAIL", "k@oot.dev")
         .env("GIT_AUTHOR_DATE", "1700000000 +0530")
         .env("GIT_COMMITTER_DATE", "1700000001 -0800")
         .output()
