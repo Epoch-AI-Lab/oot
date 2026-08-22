@@ -81,6 +81,16 @@ enum Commands {
         #[arg(long)]
         repo: Option<String>,
     },
+    /// Capture the working copy as a new change in the store — no git
+    /// history involved. This is Oot's own write path.
+    Record {
+        /// Change message.
+        #[arg(long, short)]
+        message: String,
+        /// Branch to record onto (defaults to the store's only branch, or `main`).
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Export the store's history as a plain git repository ready for push.
     Export {
         /// Directory to create the exported repository in.
@@ -290,6 +300,66 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
+        Commands::Record { message, branch } => {
+            let root = std::env::current_dir()?;
+            let store = Store::open(&root)?;
+
+            // Branch: explicit flag wins; otherwise the store's only branch;
+            // otherwise a fresh store starts on main.
+            let branch = match branch {
+                Some(b) => b,
+                None => match store.refs()?.as_slice() {
+                    [] => "main".to_string(),
+                    [(name, _)] => name.clone(),
+                    _ => anyhow::bail!(
+                        "store has multiple branches; pass --branch <name> ({})",
+                        store
+                            .refs()?
+                            .into_iter()
+                            .map(|(n, _)| n)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                },
+            };
+
+            let (author, committer) = resolve_identity(&root)?;
+
+            let files = collect_worktree(&root)?;
+            let tree = store.write_tree_from_files(&files)?;
+
+            let head_id = store.head_id(&branch)?;
+            if let Some(ref head) = head_id {
+                let parent_tree = store.get_change(head)?.tree;
+                if parent_tree == tree {
+                    anyhow::bail!("nothing to record: working copy matches {branch}'s head");
+                }
+            }
+            let parents: Vec<String> = head_id.iter().cloned().collect();
+
+            let kind = if head_id.is_some() {
+                "child of head"
+            } else {
+                "root"
+            };
+            let record = oot::store::ChangeRecord {
+                parents,
+                tree,
+                author,
+                committer,
+                message: ensure_trailing_newline(&message),
+                source_sha: None,
+            };
+            let id = store.put_record(&record)?;
+            store.index_push(&id)?;
+            store.set_ref(&branch, &id)?;
+
+            println!(
+                "recorded {id} on {branch} as {kind}: {} file(s)",
+                files.len()
+            );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
         Commands::Export { out, visibility } => {
             let policy = match &visibility {
                 Some(p) => Some(VisibilityPolicy::load(std::path::Path::new(p))?),
@@ -363,6 +433,215 @@ fn run_git(args: &[&str], cwd: &std::path::Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Author/committer identities for recorded changes. Git's env vars win
+/// (same precedence git itself uses), then git config — so CI and scripted
+/// use work without any global config. Fail loudly rather than fabricating.
+fn resolve_identity(
+    root: &std::path::Path,
+) -> anyhow::Result<(oot::store::Identity, oot::store::Identity)> {
+    let time = oot::store::now_epoch() as i64;
+    let offset = local_offset()?;
+    let author_name = env_or_config("GIT_AUTHOR_NAME", root, "user.name")?;
+    let author_email = env_or_config("GIT_AUTHOR_EMAIL", root, "user.email")?;
+    let committer_name = env_or_config("GIT_COMMITTER_NAME", root, "user.name")?;
+    let committer_email = env_or_config("GIT_COMMITTER_EMAIL", root, "user.email")?;
+    let mk = |name: String, email: String| oot::store::Identity {
+        name,
+        email,
+        time,
+        offset: offset.clone(),
+    };
+    Ok((
+        mk(author_name, author_email),
+        mk(committer_name, committer_email),
+    ))
+}
+
+fn env_or_config(
+    env_key: &str,
+    root: &std::path::Path,
+    config_key: &str,
+) -> anyhow::Result<String> {
+    if let Ok(value) = std::env::var(env_key) {
+        if !value.is_empty() {
+            return Ok(value);
+        }
+    }
+    git_config(root, config_key).ok_or_else(|| {
+        anyhow::anyhow!("no identity found: set {env_key} or `git config --global {config_key}`")
+    })
+}
+
+fn git_config(root: &std::path::Path, key: &str) -> Option<String> {
+    let out = Command::new("git")
+        .args(["config", "--get", key])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+/// The machine's local timezone offset in git's raw form (e.g. `+0530`).
+fn local_offset() -> anyhow::Result<String> {
+    let out = Command::new("date")
+        .arg("+%z")
+        .output()
+        .context("failed to run date %z")?;
+    let offset = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let valid = offset.len() == 5
+        && (offset.starts_with('+') || offset.starts_with('-'))
+        && offset[1..].chars().all(|c| c.is_ascii_digit());
+    if !valid {
+        anyhow::bail!("unexpected timezone offset from date: '{offset}'");
+    }
+    Ok(offset)
+}
+
+/// Recursively collect working-copy files into [`WorkFile`]s. `.oot` and
+/// `.git` are never captured; symlinks are never followed; when the project
+/// sits at a git worktree root, `.gitignore` rules are honored best-effort.
+fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::WorkFile>> {
+    fn walk(
+        dir: &std::path::Path,
+        rel: &str,
+        out: &mut Vec<oot::store::WorkFile>,
+    ) -> anyhow::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            let p = entry.path();
+            // Never follow symlinks: a loop would recurse forever and an
+            // escaping link would ingest content from outside the snapshot.
+            if entry.file_type()?.is_symlink() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            let child_rel = if rel.is_empty() {
+                name.clone()
+            } else {
+                format!("{rel}/{name}")
+            };
+            if p.is_dir() {
+                if name == ".oot" || name == ".git" || name == ".jj" {
+                    continue;
+                }
+                walk(&p, &child_rel, out)?;
+            } else {
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::metadata(&p).map(|m| m.permissions().mode() & 0o111 != 0)?
+                };
+                out.push(oot::store::WorkFile {
+                    path: child_rel,
+                    contents: std::fs::read(&p)?,
+                    executable,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = Vec::new();
+    walk(root, "", &mut files)?;
+
+    // Ignore rules: inside a git worktree whose root matches ours, git
+    // decides (full semantics). Pure-Oot projects fall back to a minimal
+    // matcher over the root .gitignore — enough for names, directories,
+    // and * globs; negations are not supported.
+    let toplevel = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+    let same_git_root = toplevel
+        .map(|top| {
+            std::fs::canonicalize(root)
+                .map(|r| r.to_string_lossy() == top)
+                .unwrap_or(false)
+        })
+        .unwrap_or(false);
+    if same_git_root {
+        files.retain(|f| !is_git_ignored(root, &f.path));
+    } else {
+        let rules = std::fs::read_to_string(root.join(".gitignore"))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+            .collect::<Vec<_>>();
+        files.retain(|f| !simple_ignored(&f.path, &rules));
+    }
+    Ok(files)
+}
+
+/// Best-effort .gitignore subset for projects without git: exact names,
+/// `dir/` prefixes, and `*` wildcards, matched per git's basename rule.
+fn simple_ignored(rel: &str, rules: &[String]) -> bool {
+    let base = rel.rsplit('/').next().unwrap_or(rel);
+    rules.iter().any(|rule| {
+        let anchored = rule.contains('/');
+        let rule = rule.trim_end_matches('/');
+        if anchored && !rule.is_empty() {
+            wildcard_match(rule, rel)
+                || rel
+                    .strip_prefix(rule)
+                    .is_some_and(|rest| rest.starts_with('/'))
+        } else if rule.contains('*') {
+            wildcard_match(rule, base)
+        } else {
+            base == rule || rel.split('/').any(|part| part == rule)
+        }
+    })
+}
+
+/// Glob matching with `*` only (no `?`, no character classes).
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    match pattern.split_once('*') {
+        None => pattern == text,
+        Some((head, tail)) => text
+            .strip_prefix(head)
+            .is_some_and(|rest| rest.len() >= tail.len() && rest.ends_with(tail)),
+    }
+}
+
+fn is_git_ignored(root: &std::path::Path, path: &str) -> bool {
+    use std::io::Write;
+    let child = Command::new("git")
+        .args(["check-ignore", "-q", "--stdin"])
+        .current_dir(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn();
+    // One process per path is slow but simple; batching can come later.
+    match child {
+        Ok(mut c) => {
+            if let Some(stdin) = c.stdin.as_mut() {
+                let _ = writeln!(stdin, "{path}");
+            }
+            drop(c.stdin.take());
+            c.wait().map(|s| s.success()).unwrap_or(false)
+        }
+        Err(_) => false,
+    }
+}
+
+fn ensure_trailing_newline(message: &str) -> String {
+    if message.ends_with('\n') {
+        message.to_string()
+    } else {
+        format!("{message}\n")
+    }
+}
+
 /// Exit-code contract for `oot adjudicate`:
 /// - `0`: verdict is `Adjudicated` — ship-ready.
 /// - `1`: any other verdict (`Blocked`, `Cloaked`, `Embargoed`) — all mean
@@ -405,4 +684,39 @@ fn load_dir(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_simple_ignored_matches_git_basics() {
+        let rules: Vec<String> = ["junk.log", "target/", "*.tmp", "secrets/keys"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Basename rule at any depth.
+        assert!(simple_ignored("junk.log", &rules));
+        assert!(simple_ignored("deep/nested/junk.log", &rules));
+        // Directory prefix rule.
+        assert!(simple_ignored("target/debug/foo.rs", &rules));
+        // Glob rule on basename.
+        assert!(simple_ignored("cache/session.tmp", &rules));
+        // Anchored slash rule.
+        assert!(simple_ignored("secrets/keys", &rules));
+        // Clean paths stay.
+        assert!(!simple_ignored("src/main.rs", &rules));
+        assert!(!simple_ignored("notjunk.log", &rules));
+    }
+
+    #[test]
+    fn test_wildcard_match() {
+        assert!(wildcard_match("*.log", "a.log"));
+        assert!(wildcard_match("*", "anything"));
+        assert!(wildcard_match("foo*", "foobar"));
+        assert!(wildcard_match("*bar", "foobar"));
+        assert!(!wildcard_match("*.log", "a.txt"));
+        assert!(!wildcard_match("foo*", "barfoo"));
+    }
 }

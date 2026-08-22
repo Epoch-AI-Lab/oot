@@ -92,10 +92,21 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
    Verified on this repo: faithful export byte-exact; filtered export strips
    `fixtures/repo/head/secrets/.env` and logs both touching commits.
    Mirror pushes use an explicit empty policy to stay byte-faithful.
-3. `oot record` — capture working-copy deltas as new changes without git
-   (first true "Oot as source of control" write path).
+3. ~~`oot record`~~ DONE 2026-08-22: `oot record -m <msg> [--branch <name>]`
+   snapshots the working copy into the store odb (blobs + recursive mktree,
+   exec bits kept), creates a native change (`source_sha: null`) as child of
+   the branch head, refuses no-op records. Identity from GIT_AUTHOR_* /
+   GIT_COMMITTER_* envs then git config. Ignore rules: git check-ignore in
+   git worktrees; minimal root-.gitignore matcher (names, dirs, `*`) for
+   pure-Oot projects. Export already handles native changes via the
+   reconstruction path — pinned end-to-end by `tests/record_test.rs`,
+   including mixed imported+native history.
 
 ## Deliberate cuts (v1)
+
+- `record` ignores nested .gitignore files outside the root, negation
+  (`!pattern`) rules, and `?`/`[]` glob classes. Git worktrees get full
+  semantics via git itself; only pure-Oot projects see the subset.
 
 - Tags and annotated tags are not imported/exported.
 - Signed commits downstream of a rebuilt change lose their signatures

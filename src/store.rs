@@ -68,6 +68,15 @@ pub struct ChangeRecord {
     pub source_sha: Option<String>,
 }
 
+/// One file captured from a working copy, ready to become a tree entry.
+#[derive(Debug, Clone)]
+pub struct WorkFile {
+    /// Path relative to the project root, `/`-separated.
+    pub path: String,
+    pub contents: Vec<u8>,
+    pub executable: bool,
+}
+
 /// An open handle on a project's `.oot/` directory.
 #[derive(Debug, Clone)]
 pub struct Store {
@@ -226,21 +235,48 @@ impl Store {
             source_sha: Some(raw.sha.clone()),
         };
 
-        let json = serde_json::to_vec(&record)?;
-        let mut child = Command::new("git")
-            .args(["hash-object", "--stdin"])
+        self.put_record(&record)
+    }
+
+    /// Persist a [`ChangeRecord`] under its content address. Idempotent:
+    /// identical records return the existing id. Records carrying a
+    /// `source_sha` are registered in the original-commit map so re-imports
+    /// dedupe and exports can verify round-tripping.
+    pub fn put_record(&self, record: &ChangeRecord) -> Result<String> {
+        let json = serde_json::to_vec(record)?;
+        let id = self.hash_object(&json, "blob", false)?;
+
+        std::fs::write(
+            self.root.join(CHANGES_DIR).join(format!("{id}.json")),
+            &json,
+        )?;
+        if let Some(orig) = &record.source_sha {
+            std::fs::write(self.root.join(MAP_DIR).join(orig), &id)?;
+        }
+        Ok(id)
+    }
+
+    /// `git hash-object` against the store's odb. Record ids are hashed
+    /// without writing (records live as JSON files, not odb objects); blobs
+    /// are written so trees can reference them.
+    fn hash_object(&self, bytes: &[u8], kind: &str, write: bool) -> Result<String> {
+        let mut cmd = Command::new("git");
+        cmd.args(["hash-object", "-t", kind]);
+        if write {
+            cmd.arg("-w");
+        }
+        cmd.arg("--stdin")
             .env("GIT_DIR", self.git_dir())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .context("failed to run git hash-object")?;
+            .stderr(std::process::Stdio::piped());
+        let mut child = cmd.spawn().context("failed to run git hash-object")?;
         use std::io::Write;
         child
             .stdin
             .take()
             .context("hash-object has no stdin")?
-            .write_all(&json)?;
+            .write_all(bytes)?;
         let hash = child.wait_with_output()?;
         if !hash.status.success() {
             bail!(
@@ -248,14 +284,97 @@ impl Store {
                 String::from_utf8_lossy(&hash.stderr).trim()
             );
         }
-        let id = String::from_utf8(hash.stdout)?.trim().to_string();
+        Ok(String::from_utf8(hash.stdout)?.trim().to_string())
+    }
 
-        std::fs::write(
-            self.root.join(CHANGES_DIR).join(format!("{id}.json")),
-            &json,
-        )?;
-        std::fs::write(&map_file, &id)?;
-        Ok(id)
+    /// The head change id of `branch`, if the branch has any.
+    pub fn head_id(&self, branch: &str) -> Result<Option<String>> {
+        let safe = branch.replace('/', "__");
+        let f = self.root.join(REFS_DIR).join(safe);
+        if !f.exists() {
+            return Ok(None);
+        }
+        Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
+    }
+
+    /// Store file contents as blobs in the odb and assemble them into a
+    /// nested tree, returning the root tree sha. Paths use `/` separators;
+    /// empty directories cannot be represented and are skipped naturally.
+    pub fn write_tree_from_files(&self, files: &[WorkFile]) -> Result<String> {
+        let hashed: Vec<(String, String, bool)> = files
+            .iter()
+            .map(|f| Ok((f.path.clone(), self.write_blob(&f.contents)?, f.executable)))
+            .collect::<Result<_>>()?;
+        self.assemble_tree("", &hashed)
+    }
+
+    /// Recursively build the tree for all paths under directory `dir`
+    /// ("" = root). Grouping by first path component keeps each level local.
+    fn assemble_tree(&self, dir: &str, files: &[(String, String, bool)]) -> Result<String> {
+        // (sort key, mktree row)
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut subdirs: HashMap<String, Vec<(String, String, bool)>> = HashMap::new();
+
+        for (path, sha, exec) in files {
+            match path.split_once('/') {
+                None => {
+                    let mode = if *exec { "100755" } else { "100644" };
+                    rows.push((path.clone(), format!("{mode} blob {sha}\t{path}")));
+                }
+                Some((head, rest)) => {
+                    subdirs.entry(head.to_string()).or_default().push((
+                        rest.to_string(),
+                        sha.clone(),
+                        *exec,
+                    ));
+                }
+            }
+        }
+
+        for (name, children) in subdirs {
+            let child_prefix = if dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir}/{name}")
+            };
+            let sha = self.assemble_tree(&child_prefix, &children)?;
+            // Git sorts tree entries as if directory names ended with '/'.
+            rows.push((format!("{name}/"), format!("040000 tree {sha}\t{name}")));
+        }
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+        let input = rows
+            .into_iter()
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut child = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to run git mktree")?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .context("mktree has no stdin")?
+            .write_all(input.as_bytes())?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!(
+                "git mktree failed for dir '{dir}': {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    }
+
+    fn write_blob(&self, bytes: &[u8]) -> Result<String> {
+        self.hash_object(bytes, "blob", true)
     }
 
     /// Load a change record by id.
@@ -901,7 +1020,8 @@ pub fn parse_offset(iso: &str) -> Result<String> {
     }
 }
 
-fn now_epoch() -> u64 {
+/// Seconds since the Unix epoch; used for record timestamps and log entries.
+pub fn now_epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
