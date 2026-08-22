@@ -297,7 +297,7 @@ court; the declared direction is that it becomes the source control itself."
 
 ## Night-run status
 
-- [ ] PR-O1 fix/rename-rename-dispute
+- [x] PR-O1 fix/rename-rename-dispute
 - [ ] PR-O2 docs/positioning
 - [ ] PR-O3 feat/store-court
 - [ ] PR-O4 feat/oot-update
