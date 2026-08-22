@@ -7,11 +7,14 @@
 //! on the declarator itself. That relationship is captured by
 //! [`LangConfig::wrapped_functions`].
 //!
-//! Function map keys are always bare names. Receiver- or impl-qualified keys
-//! (`(*T).name`, `(A).name`) were tried and rejected: they make keys unstable
-//! under refactoring, so moving a function between impl blocks fabricates
-//! High-severity 3-way conflicts (and false Blocked verdicts). Same-named
-//! functions are reported as ambiguous instead — see `Engine::diff_snapshots`.
+//! Function map keys are always bare names, but every same-key definition
+//! is kept and diffing aligns each group by content (exact source match
+//! first, then positional pairing of leftovers — see `align_defs`).
+//! Receiver- or impl-qualified keys (`(*T).name`, `(A).name`) were tried and
+//! rejected: they make keys unstable under refactoring, so moving a function
+//! between impl blocks fabricates High-severity 3-way conflicts (and false
+//! Blocked verdicts). Content-first alignment keeps identity stable under
+//! those moves while still tracking each definition separately.
 
 use tree_sitter::{Language, Node};
 

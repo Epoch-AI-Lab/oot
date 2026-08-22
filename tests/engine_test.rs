@@ -605,7 +605,7 @@ fn test_engine_dotless_filename_is_not_source() {
 }
 
 #[test]
-fn test_engine_duplicate_function_names_flagged() {
+fn test_engine_duplicate_function_names_tracked_separately() {
     let engine = Engine::new().expect("Failed to initialize engine");
 
     let mut base = Snapshot::default();
@@ -646,12 +646,8 @@ func (b B) Name() string {
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
 
-    // Regression: last-wins overwrite used to hide A's change entirely.
-    assert!(
-        disputes
-            .iter()
-            .any(|d| d.detail.contains("`Name`") && d.detail.contains("multiple times")),
-        "duplicate name must surface an ambiguity dispute, got {:?}",
-        disputes
-    );
+    // Regression: last-wins overwrite used to hide A's change entirely;
+    // first-occurrence tracking then reduced it to an ambiguity note.
+    assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+    assert_eq!(disputes[0].detail, "both sides changed `Name`");
 }
