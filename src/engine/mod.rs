@@ -362,14 +362,50 @@ impl Engine {
                         disputes.push(meaning(&mut n, path, row, detail, Severity::High));
                     }
 
-                    // Detection runs now; its results start driving
-                    // emission/suppression with the divergence work itself.
-                    let _pending_divergent_renames = find_divergent_renames(
+                    // A base def both branches renamed to different names is
+                    // the swallowed rename/rename dispute: one High per such
+                    // def, located at theirs' new copy (fallback ours, then 0).
+                    let divergent_renames = find_divergent_renames(
                         &removed_ours,
                         &added_ours,
                         &removed_theirs,
                         &added_theirs,
                     );
+                    let mut claimed_theirs: Vec<(&str, usize)> = Vec::new();
+                    for d in &divergent_renames {
+                        let row = if d.theirs_row > 0 {
+                            d.theirs_row
+                        } else if d.ours_row > 0 {
+                            d.ours_row
+                        } else {
+                            0
+                        };
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            row,
+                            format!(
+                                "3-way conflict: both branches renamed function `{}` differently \
+                                 (`{}` -> `{}` in target, `{}` -> `{}` in incoming)",
+                                d.base_name,
+                                d.base_name,
+                                d.ours_new_name,
+                                d.base_name,
+                                d.theirs_new_name
+                            ),
+                            Severity::High,
+                        ));
+                        claimed_theirs.push((&d.theirs_new_name, d.theirs_row));
+                    }
+                    // Defs already reported as the incoming half of a
+                    // divergent rename must not resurface as Low additions.
+                    if !claimed_theirs.is_empty() {
+                        pending_added.retain(|(name, def)| {
+                            !claimed_theirs
+                                .iter()
+                                .any(|(cn, row)| *cn == name.as_str() && *row == def.row)
+                        });
+                    }
 
                     // Pair incoming removals with incoming additions of
                     // identical blanked-name source text: a rename, not two
@@ -1228,5 +1264,103 @@ mod tests {
         let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
         assert_eq!(disputes.len(), 2);
         assert!(disputes.iter().all(|d| d.severity == Severity::High));
+    }
+
+    fn rm(name: &str, idx: usize, sig: &str) -> (String, usize, FnDef) {
+        (
+            name.to_string(),
+            idx,
+            FnDef {
+                src: String::new(),
+                row: 1,
+                signature: sig.to_string(),
+            },
+        )
+    }
+
+    fn ad(name: &str, row: usize, sig: &str) -> (String, FnDef) {
+        (
+            name.to_string(),
+            FnDef {
+                src: String::new(),
+                row,
+                signature: sig.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_rename_score_is_exact_only() {
+        assert!(rename_score("fn () {}", "fn () {}").is_some());
+        assert!(rename_score("fn () {}", "fn (x) {}").is_none());
+    }
+
+    #[test]
+    fn test_pair_side_consumes_each_added_once() {
+        let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigA")];
+        let added = vec![ad("x", 3, "sigA")];
+        let pairs = pair_side_renames(&removed, &added);
+        assert_eq!(pairs.len(), 1, "one added def cannot serve two removals");
+        assert_eq!(pairs[0].old_idx, 0);
+        assert_eq!(pairs[0].new_name, "x");
+    }
+
+    #[test]
+    fn test_pair_side_matches_duplicates_one_to_one() {
+        let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigB")];
+        let added = vec![ad("y", 5, "sigB"), ad("x", 3, "sigA")];
+        let pairs = pair_side_renames(&removed, &added);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|p| p.old_idx == 0 && p.new_name == "x"));
+        assert!(pairs.iter().any(|p| p.old_idx == 1 && p.new_name == "y"));
+    }
+
+    #[test]
+    fn test_pair_side_rejects_equal_names() {
+        // Same name on both sides is no rename; it is handled by the
+        // regular changed/gone alignment.
+        let removed = vec![rm("f", 0, "sigA")];
+        let added = vec![ad("f", 3, "sigA")];
+        assert!(pair_side_renames(&removed, &added).is_empty());
+    }
+
+    #[test]
+    fn test_find_divergent_requires_both_sides_and_different_names() {
+        let removed_ours = vec![rm("f", 0, "sigA")];
+        let added_ours = vec![ad("g", 2, "sigA")];
+        let removed_theirs = vec![rm("f", 0, "sigA")];
+
+        // Convergent rename: both sides landed on `g`, stays silent.
+        let added_theirs_convergent = vec![ad("g", 4, "sigA")];
+        assert!(find_divergent_renames(
+            &removed_ours,
+            &added_ours,
+            &removed_theirs,
+            &added_theirs_convergent,
+        )
+        .is_empty());
+
+        // Theirs deleted without renaming: no join.
+        assert!(
+            find_divergent_renames(&removed_ours, &added_ours, &removed_theirs, &[],).is_empty()
+        );
+
+        // Divergent: ours f -> g, theirs f -> k.
+        let added_theirs_divergent = vec![ad("k", 7, "sigA")];
+        assert_eq!(
+            find_divergent_renames(
+                &removed_ours,
+                &added_ours,
+                &removed_theirs,
+                &added_theirs_divergent,
+            ),
+            vec![DivergentRename {
+                base_name: "f".into(),
+                ours_new_name: "g".into(),
+                ours_row: 2,
+                theirs_new_name: "k".into(),
+                theirs_row: 7,
+            }]
+        );
     }
 }
