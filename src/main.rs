@@ -5,7 +5,7 @@
 use clap::{Parser, Subcommand};
 use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
-use oot::dispute::{Docket, Kind, Severity, Verdict};
+use oot::dispute::{Dispute, Docket, Kind, Severity, Verdict};
 use oot::docket;
 use oot::engine::Engine;
 use oot::policy::MeaningPolicy;
@@ -202,6 +202,21 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let mut disputes = eng.diff_snapshots(&change.base, &change.head)?;
             disputes.extend(vis_disputes);
 
+            let mut touched_paths: Vec<String> = change
+                .base
+                .files
+                .keys()
+                .chain(change.head.files.keys())
+                .filter(|p| change.base.files.get(*p) != change.head.files.get(*p))
+                .cloned()
+                .collect();
+            touched_paths.sort();
+            touched_paths.dedup();
+
+            if touched_paths.is_empty() {
+                disputes.push(Dispute::empty_change());
+            }
+
             let verdict = if cloaked {
                 Verdict::Cloaked
             } else if visibility_policy.embargo_until.is_some() {
@@ -210,7 +225,13 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 meaning_policy.evaluate(&disputes)
             };
 
-            let scope = change.intent.clone().unwrap_or_else(|| "auto".into());
+            let intent = change.intent.clone().unwrap_or_else(|| {
+                if touched_paths.is_empty() {
+                    "no files changed".into()
+                } else {
+                    touched_paths.join(", ")
+                }
+            });
 
             let docket = Docket {
                 change: change.name.clone(),
@@ -218,7 +239,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 base: change.base_ref.clone(),
                 head: change.head_ref.clone(),
                 disputes,
-                scope,
+                intent,
                 authors: change.authors.clone(),
                 verdict,
                 embargo: visibility_policy.embargo_note(),
@@ -260,7 +281,10 @@ fn load_dir(
         if p.is_dir() {
             load_dir(root, &p, files)?;
         } else {
-            let content = std::fs::read_to_string(&p)?;
+            // Read as bytes and convert lossily so binary files (images,
+            // lockfiles, etc.) are tracked as changed without failing the run.
+            let bytes = std::fs::read(&p)?;
+            let content = String::from_utf8_lossy(&bytes).into_owned();
             let rel = p
                 .strip_prefix(root)
                 .unwrap_or(&p)

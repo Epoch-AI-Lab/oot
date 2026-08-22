@@ -1,7 +1,7 @@
 //! Native Git adapter for extracting in-memory snapshots and adjudicating 3-way merges.
 
 use crate::change::{Change, Snapshot, Source};
-use crate::dispute::{Docket, Severity, Verdict};
+use crate::dispute::{Dispute, Docket, Severity, Verdict};
 use crate::engine::Engine;
 use crate::policy::MeaningPolicy;
 use crate::visibility::VisibilityPolicy;
@@ -222,14 +222,6 @@ impl GitAdapter {
             .any(|d| d.kind == crate::dispute::Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
-        let verdict = if cloaked {
-            Verdict::Cloaked
-        } else if visibility_policy.embargo_until.is_some() {
-            Verdict::Embargoed
-        } else {
-            meaning_policy.evaluate(&disputes)
-        };
-
         let mut touched_paths: Vec<String> = base_snapshot
             .files
             .keys()
@@ -240,11 +232,25 @@ impl GitAdapter {
         touched_paths.sort();
         touched_paths.dedup();
 
-        let scope = if touched_paths.is_empty() {
-            "no files changed".to_string()
+        if touched_paths.is_empty() {
+            disputes.push(Dispute::empty_change());
+        }
+
+        let verdict = if cloaked {
+            Verdict::Cloaked
+        } else if visibility_policy.embargo_until.is_some() {
+            Verdict::Embargoed
         } else {
-            touched_paths.join(", ")
+            meaning_policy.evaluate(&disputes)
         };
+
+        let intent = options.intent.clone().unwrap_or_else(|| {
+            if touched_paths.is_empty() {
+                "no files changed".to_string()
+            } else {
+                touched_paths.join(", ")
+            }
+        });
 
         let docket = Docket {
             change: change.name,
@@ -252,7 +258,7 @@ impl GitAdapter {
             base: change.base_ref,
             head: change.head_ref,
             disputes,
-            scope,
+            intent,
             authors,
             verdict,
             embargo: visibility_policy.embargo_note(),

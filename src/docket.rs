@@ -80,7 +80,7 @@ mod tests {
             base: "main".into(),
             head: "feature/test-docket".into(),
             disputes: vec![],
-            scope: "testing save and load".into(),
+            intent: "testing save and load".into(),
             authors: vec!["@tester".into()],
             verdict: Verdict::Adjudicated,
             embargo: None,
@@ -91,7 +91,7 @@ mod tests {
 
         assert_eq!(loaded.change, original.change);
         assert_eq!(loaded.source, original.source);
-        assert_eq!(loaded.scope, original.scope);
+        assert_eq!(loaded.intent, original.intent);
         assert_eq!(loaded.verdict, original.verdict);
 
         let _ = std::fs::remove_file(path);
@@ -105,7 +105,7 @@ mod tests {
             base: "main".into(),
             head: "feature/toml-test".into(),
             disputes: vec![],
-            scope: "toml format".into(),
+            intent: "toml format".into(),
             authors: vec!["@coder".into()],
             verdict: Verdict::Embargoed,
             embargo: Some("patch held for maintainers until 2026-12-31".into()),

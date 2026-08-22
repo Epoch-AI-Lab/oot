@@ -31,7 +31,7 @@ fn sample_docket() -> Docket {
                 detail: "private path secrets/.env touched by @alice/@bob".into(),
             },
         ],
-        scope: "Authentication and session management".into(),
+        intent: "Authentication and session management".into(),
         authors: vec!["@alice".into(), "@bob".into()],
         verdict: Verdict::Embargoed,
         embargo: Some("patch held for maintainers until 2026-09-01".into()),
@@ -53,7 +53,7 @@ fn test_dispute_classification_and_counts() {
         base: "main".into(),
         head: "docs".into(),
         disputes: vec![],
-        scope: "doc updates".into(),
+        intent: "doc updates".into(),
         authors: vec!["@writer".into()],
         verdict: Verdict::Adjudicated,
         embargo: None,
@@ -77,7 +77,7 @@ fn test_docket_json_serialization_roundtrip() {
     assert_eq!(deserialized.base, original.base);
     assert_eq!(deserialized.head, original.head);
     assert_eq!(deserialized.disputes.len(), original.disputes.len());
-    assert_eq!(deserialized.scope, original.scope);
+    assert_eq!(deserialized.intent, original.intent);
     assert_eq!(deserialized.authors, original.authors);
     assert_eq!(deserialized.verdict, original.verdict);
     assert_eq!(deserialized.embargo, original.embargo);
@@ -95,7 +95,7 @@ fn test_docket_toml_serialization_roundtrip() {
     assert_eq!(deserialized.base, original.base);
     assert_eq!(deserialized.head, original.head);
     assert_eq!(deserialized.disputes.len(), original.disputes.len());
-    assert_eq!(deserialized.scope, original.scope);
+    assert_eq!(deserialized.intent, original.intent);
     assert_eq!(deserialized.authors, original.authors);
     assert_eq!(deserialized.verdict, original.verdict);
     assert_eq!(deserialized.embargo, original.embargo);

@@ -2,7 +2,7 @@
 //!
 //! A [`Dispute`] represents a point of disagreement (either structural meaning
 //! or visibility violation). A [`Docket`] is the complete, rendered adjudication
-//! record containing disputes, verdict, scope, and embargo metadata.
+//! record containing disputes, verdict, intent, and embargo metadata.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,22 @@ pub struct Dispute {
     pub detail: String,
 }
 
+impl Dispute {
+    /// Low-severity notice that a change contains no file differences.
+    ///
+    /// Does not affect blocking or review thresholds; it only makes the
+    /// empty change visible on the docket instead of passing silently.
+    pub fn empty_change() -> Dispute {
+        Dispute {
+            id: "D000".into(),
+            location: "-".into(),
+            kind: Kind::Meaning,
+            severity: Severity::Low,
+            detail: "no file differences between base and head".into(),
+        }
+    }
+}
+
 /// The final adjudication verdict for a change.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -81,8 +97,9 @@ pub struct Docket {
     pub head: String,
     /// Collection of detected disputes.
     pub disputes: Vec<Dispute>,
-    /// Stated scope or intent of the change.
-    pub scope: String,
+    /// Stated intent of the change, or a summary of touched paths when none was given.
+    #[serde(alias = "scope")]
+    pub intent: String,
     /// Change author handles or agent identifiers.
     pub authors: Vec<String>,
     /// Resulting adjudication verdict.
@@ -144,7 +161,7 @@ impl Docket {
             ));
         }
         out.push('\n');
-        out.push_str(&format!("  scope:      {}\n", self.scope));
+        out.push_str(&format!("  intent:     {}\n", self.intent));
         out.push_str(&format!("  authors:    {}\n", self.authors.join(", ")));
         out.push('\n');
         if self.disputes.is_empty() {
@@ -233,7 +250,7 @@ mod tests {
                     detail: "private path .env touched".into(),
                 },
             ],
-            scope: "auth refactor".into(),
+            intent: "auth refactor".into(),
             authors: vec!["@alice".into(), "@bob".into()],
             verdict: Verdict::Adjudicated,
             embargo: Some("patch held for maintainers until 2026-12-31".into()),
