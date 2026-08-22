@@ -150,10 +150,11 @@ fn test_jj_extract_snapshot() {
     let (_repo, adapter) = setup_base_and_head(false);
 
     let snap = adapter.extract_snapshot("@-").expect("snapshot extracts");
-    let content = snap
-        .files
-        .get("src/lib.rs")
-        .expect("src/lib.rs present in head snapshot");
+    let content = String::from_utf8_lossy(
+        snap.files
+            .get("src/lib.rs")
+            .expect("src/lib.rs present in head snapshot"),
+    );
     assert!(content.contains("hello world"));
     assert!(!content.contains("<<<<<<<"), "clean commit has no markers");
 }

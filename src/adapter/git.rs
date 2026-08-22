@@ -158,8 +158,7 @@ impl GitAdapter {
                         .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
 
                     if blob_output.status.success() {
-                        let content = String::from_utf8_lossy(&blob_output.stdout).into_owned();
-                        files.insert(path.to_string(), content);
+                        files.insert(path.to_string(), blob_output.stdout);
                     }
                 }
             }

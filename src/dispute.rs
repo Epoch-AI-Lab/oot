@@ -80,8 +80,8 @@ impl Dispute {
 /// Returns `(disputes, intent, verdict)`.
 pub fn finalize_adjudication(
     mut disputes: Vec<Dispute>,
-    base: &std::collections::HashMap<String, String>,
-    head: &std::collections::HashMap<String, String>,
+    base: &std::collections::HashMap<String, Vec<u8>>,
+    head: &std::collections::HashMap<String, Vec<u8>>,
     user_intent: Option<String>,
     cloaked: bool,
     embargo_active: bool,

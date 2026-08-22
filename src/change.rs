@@ -43,12 +43,14 @@ impl std::str::FromStr for Source {
 
 /// A snapshot is a mapping of relative file paths to their contents.
 ///
+/// Contents are stored as raw bytes so binary files compare exactly;
+/// text conversion happens only when the structural engine parses a file.
 /// Oot never assumes these files exist on a physical filesystem;
 /// they can be ingested from git, Jujutsu, or an agent's memory isolate.
 #[derive(Debug, Clone, Default)]
 pub struct Snapshot {
-    /// Map of file path (relative to repo root) to UTF-8 file content.
-    pub files: HashMap<String, String>,
+    /// Map of file path (relative to repo root) to raw file content.
+    pub files: HashMap<String, Vec<u8>>,
 }
 
 /// A Change is the core unit Oot adjudicates: a content-addressed delta
@@ -95,7 +97,7 @@ mod tests {
     fn test_change_and_snapshot_creation() {
         let mut snap = Snapshot::default();
         snap.files
-            .insert("src/lib.rs".into(), "pub fn test() {}".into());
+            .insert("src/lib.rs".into(), "pub fn test() {}".as_bytes().to_vec());
 
         let change = Change {
             name: "test-change".into(),

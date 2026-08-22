@@ -248,11 +248,11 @@ fn exit_code_for(verdict: Verdict) -> std::process::ExitCode {
     }
 }
 
-/// Recursively read files in a directory into a HashMap of relative paths to contents.
+/// Recursively read files in a directory into a HashMap of relative paths to raw contents.
 fn load_dir(
     root: &std::path::Path,
     dir: &std::path::Path,
-    files: &mut std::collections::HashMap<String, String>,
+    files: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -260,16 +260,15 @@ fn load_dir(
         if p.is_dir() {
             load_dir(root, &p, files)?;
         } else {
-            // Read as bytes and convert lossily so binary files (images,
-            // lockfiles, etc.) are tracked as changed without failing the run.
+            // Store raw bytes so binary files (images, lockfiles, etc.) are
+            // tracked with exact content; text conversion happens at parse time.
             let bytes = std::fs::read(&p)?;
-            let content = String::from_utf8_lossy(&bytes).into_owned();
             let rel = p
                 .strip_prefix(root)
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            files.insert(rel, content);
+            files.insert(rel, bytes);
         }
     }
     Ok(())

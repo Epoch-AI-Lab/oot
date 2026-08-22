@@ -14,7 +14,7 @@ fn authenticate(user: &str, pass: &str) -> bool {
     user == "admin" && pass == "secret"
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -25,7 +25,7 @@ fn authenticate(user: &str, pass: &str) -> bool {
     user == "admin" && pass == "secure_password_v2"
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -55,7 +55,7 @@ fn legacy_multiply(a: i32, b: i32) -> i32 {
     a * b
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -70,7 +70,7 @@ fn subtract(a: i32, b: i32) -> i32 {
     a - b
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -111,11 +111,11 @@ pub fn verify_signature() -> bool {
 
     let mut base = Snapshot::default();
     base.files
-        .insert("src/crypto.rs".to_string(), source.to_string());
+        .insert("src/crypto.rs".to_string(), source.as_bytes().to_vec());
 
     let mut head = Snapshot::default();
     head.files
-        .insert("src/crypto.rs".to_string(), source.to_string());
+        .insert("src/crypto.rs".to_string(), source.as_bytes().to_vec());
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
 
@@ -133,36 +133,36 @@ fn test_engine_unsupported_extension_filtering() {
     let mut base = Snapshot::default();
     base.files.insert(
         "README.md".to_string(),
-        "# Project\nInitial README".to_string(),
+        "# Project\nInitial README".as_bytes().to_vec(),
     );
     base.files.insert(
         "config.toml".to_string(),
-        "title = 'Old Config'".to_string(),
+        "title = 'Old Config'".as_bytes().to_vec(),
     );
     base.files.insert(
         "scripts/run.sh".to_string(),
-        "echo 'Running old script'".to_string(),
+        "echo 'Running old script'".as_bytes().to_vec(),
     );
     base.files.insert(
         "style.css".to_string(),
-        "body { color: black; }".to_string(),
+        "body { color: black; }".as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
     head.files.insert(
         "README.md".to_string(),
-        "# Project\nUpdated README with more docs".to_string(),
+        "# Project\nUpdated README with more docs".as_bytes().to_vec(),
     );
     head.files.insert(
         "config.toml".to_string(),
-        "title = 'New Config'".to_string(),
+        "title = 'New Config'".as_bytes().to_vec(),
     );
     head.files.insert(
         "scripts/run.sh".to_string(),
-        "echo 'Running new script'".to_string(),
+        "echo 'Running new script'".as_bytes().to_vec(),
     );
     head.files
-        .insert("style.css".to_string(), "body { color: blue; }".to_string());
+        .insert("style.css".to_string(), "body { color: blue; }".as_bytes().to_vec());
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
 
@@ -179,14 +179,14 @@ fn test_engine_syntax_error_handling() {
     let mut base = Snapshot::default();
     base.files.insert(
         "src/broken.rs".to_string(),
-        "fn valid_base() -> i32 { 42 }".to_string(),
+        "fn valid_base() -> i32 { 42 }".as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
     // Incomplete / invalid Rust syntax
     head.files.insert(
         "src/broken.rs".to_string(),
-        "fn broken_syntax( { !!! %%% invalid rust code @@@ }}}".to_string(),
+        "fn broken_syntax( { !!! %%% invalid rust code @@@ }}}".as_bytes().to_vec(),
     );
 
     // Engine should handle syntax errors gracefully without panicking
@@ -206,13 +206,13 @@ fn test_engine_file_added_and_removed() {
     let mut base = Snapshot::default();
     base.files.insert(
         "src/old_module.rs".to_string(),
-        "fn old_util() {}".to_string(),
+        "fn old_util() {}".as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
     head.files.insert(
         "src/new_module.rs".to_string(),
-        "fn new_util() {}".to_string(),
+        "fn new_util() {}".as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -238,13 +238,13 @@ fn test_engine_rename_is_not_remove_add() {
     let mut base = Snapshot::default();
     base.files.insert(
         "src/auth.rs".to_string(),
-        "fn verify_user(user: &str) -> bool { user.len() > 3 }".to_string(),
+        "fn verify_user(user: &str) -> bool { user.len() > 3 }".as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
     head.files.insert(
         "src/auth.rs".to_string(),
-        "fn check_user(user: &str) -> bool { user.len() > 3 }".to_string(),
+        "fn check_user(user: &str) -> bool { user.len() > 3 }".as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -271,7 +271,7 @@ fn test_engine_3way_rename_is_not_conflict() {
 
     let snap = |s: &str| {
         let mut x = Snapshot::default();
-        x.files.insert("src/lib.rs".to_string(), s.to_string());
+        x.files.insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
         x
     };
 
@@ -294,7 +294,7 @@ fn test_engine_added_file_summary_lists_functions() {
     let mut head = Snapshot::default();
     head.files.insert(
         "src/newstuff.rs".to_string(),
-        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n".to_string(),
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\n".as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -313,18 +313,18 @@ fn test_engine_multiple_files_and_functions() {
     let mut base = Snapshot::default();
     base.files.insert(
         "src/a.rs".to_string(),
-        "fn fa1() {}\nfn fa2() {}\n".to_string(),
+        "fn fa1() {}\nfn fa2() {}\n".as_bytes().to_vec(),
     );
     base.files
-        .insert("src/b.rs".to_string(), "fn fb1() {}\n".to_string());
+        .insert("src/b.rs".to_string(), "fn fb1() {}\n".as_bytes().to_vec());
 
     let mut head = Snapshot::default();
     head.files.insert(
         "src/a.rs".to_string(),
-        "fn fa1() { println!(\"modified\"); }\nfn fa2() {}\nfn fa3() {}\n".to_string(),
+        "fn fa1() { println!(\"modified\"); }\nfn fa2() {}\nfn fa3() {}\n".as_bytes().to_vec(),
     );
     head.files
-        .insert("src/b.rs".to_string(), "fn fb1() {}\n".to_string());
+        .insert("src/b.rs".to_string(), "fn fb1() {}\n".as_bytes().to_vec());
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
 
@@ -354,7 +354,7 @@ func (s *Store) Name() string {
 	return s.title
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -371,7 +371,7 @@ func (s *Store) Name() string {
 	return s.title
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -408,14 +408,14 @@ func (s *Store) Total() int {
 
     let mut base = Snapshot::default();
     base.files
-        .insert("total.go".to_string(), base_src.to_string());
+        .insert("total.go".to_string(), base_src.as_bytes().to_vec());
     let mut ours = Snapshot::default();
     ours.files
-        .insert("total.go".to_string(), ours_src.to_string());
+        .insert("total.go".to_string(), ours_src.as_bytes().to_vec());
     let mut theirs = Snapshot::default();
     theirs
         .files
-        .insert("total.go".to_string(), theirs_src.to_string());
+        .insert("total.go".to_string(), theirs_src.as_bytes().to_vec());
 
     let disputes = engine
         .diff_3way(&base, &ours, &theirs)
@@ -445,7 +445,7 @@ class Client {
   }
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -462,7 +462,7 @@ class Client {
   }
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -488,7 +488,7 @@ const fetchUser = async (id) => {
   return { id };
 };
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -499,7 +499,7 @@ const fetchUser = async (id) => {
   return { id, cached: false };
 };
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -533,14 +533,14 @@ export const formatPrice = (cents) => {
 
     let mut base = Snapshot::default();
     base.files
-        .insert("src/price.mjs".to_string(), base_src.to_string());
+        .insert("src/price.mjs".to_string(), base_src.as_bytes().to_vec());
     let mut ours = Snapshot::default();
     ours.files
-        .insert("src/price.mjs".to_string(), ours_src.to_string());
+        .insert("src/price.mjs".to_string(), ours_src.as_bytes().to_vec());
     let mut theirs = Snapshot::default();
     theirs
         .files
-        .insert("src/price.mjs".to_string(), theirs_src.to_string());
+        .insert("src/price.mjs".to_string(), theirs_src.as_bytes().to_vec());
 
     // Covers both the 3-way path for JavaScript and .mjs extension routing.
     let disputes = engine
@@ -560,12 +560,12 @@ fn test_engine_dotless_filename_is_not_source() {
     // A file literally named `go` with no extension must not be parsed as Go.
     let mut base = Snapshot::default();
     base.files
-        .insert("tools/go".to_string(), "func NotReally() {}".to_string());
+        .insert("tools/go".to_string(), "func NotReally() {}".as_bytes().to_vec());
 
     let mut head = Snapshot::default();
     head.files.insert(
         "tools/go".to_string(),
-        "func DefinitelyChanged() {}".to_string(),
+        "func DefinitelyChanged() {}".as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
@@ -595,7 +595,7 @@ func (b B) Name() string {
 	return "B"
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let mut head = Snapshot::default();
@@ -612,7 +612,7 @@ func (b B) Name() string {
 	return "B"
 }
 "#
-        .to_string(),
+        .as_bytes().to_vec(),
     );
 
     let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");

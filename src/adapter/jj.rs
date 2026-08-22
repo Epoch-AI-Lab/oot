@@ -89,13 +89,37 @@ impl JjAdapter {
 
         if !output.status.success() {
             return Err(anyhow!(
-                "jj {:?} failed: {}",
-                args,
+                "jj {} failed: {}",
+                args.join(" "),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    /// Run a read-only jj command and return its raw stdout bytes.
+    ///
+    /// Used for file content so binary files keep exact bytes.
+    fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
+        let mut full: Vec<&str> = vec!["--ignore-working-copy", "--no-pager", "--quiet"];
+        full.extend_from_slice(args);
+
+        let output = Command::new("jj")
+            .args(&full)
+            .current_dir(&self.repo_root)
+            .output()
+            .with_context(|| format!("Failed to run jj {:?}", args))?;
+
+        if !output.status.success() {
+            return Err(anyhow!(
+                "jj {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+
+        Ok(output.stdout)
     }
 
     /// Resolve a revset to exactly one commit ID.
@@ -204,8 +228,9 @@ impl JjAdapter {
         let mut conflicted = Vec::new();
 
         for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let content = self.run(&["file", "show", "-r", rev, "--", path])?;
-            if content
+            let content = self.run_bytes(&["file", "show", "-r", rev, "--", path])?;
+            let text = String::from_utf8_lossy(&content);
+            if text
                 .lines()
                 .any(|l| l.starts_with("<<<<<<<") && l.contains("conflict"))
             {

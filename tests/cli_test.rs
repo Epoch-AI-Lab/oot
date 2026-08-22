@@ -363,6 +363,49 @@ fn test_cli_intent_wins_over_touched_paths() {
 }
 
 #[test]
+fn test_cli_distinct_binaries_are_not_collapsed() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_bincmp_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    // Two different invalid-UTF8 bytes both lossy-convert to U+FFFD, but raw
+    // byte comparison must still see them as different content.
+    std::fs::write(base_dir.join("blob.bin"), [0x80u8]).unwrap();
+    std::fs::write(head_dir.join("blob.bin"), [0x81u8]).unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "assets/touch-binary",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("no file differences"),
+        "changed binary must register as touched, got:\n{stdout}"
+    );
+    assert!(stdout.contains("intent:     blob.bin"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
 fn test_cli_repo_visibility_policy_flags_env() {
     let bin = get_bin_path();
 

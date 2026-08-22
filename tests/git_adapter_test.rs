@@ -116,7 +116,7 @@ fn test_git_adapter_snapshot_extraction() {
     assert!(snapshot.files.contains_key("README.md"));
     assert_eq!(
         snapshot.files.get("src/lib.rs").unwrap(),
-        "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n"
+        "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n".as_bytes()
     );
 }
 
