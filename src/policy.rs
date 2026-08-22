@@ -34,10 +34,12 @@ impl MeaningPolicy {
 
     /// Evaluate only meaning disputes against blocking thresholds.
     ///
-    /// Visibility disputes are judged elsewhere (e.g. via [`crate::visibility::VisibilityPolicy`]).
+    /// The empty-change notice (`EMPTY_CHANGE_ID`) never blocks: it is
+    /// informational and excluded here so a saved docket re-evaluated under
+    /// any policy behaves the same as at adjudication time.
     pub fn evaluate(&self, disputes: &[Dispute]) -> Verdict {
         for d in disputes {
-            if d.kind != Kind::Meaning {
+            if d.kind != Kind::Meaning || d.id == crate::dispute::EMPTY_CHANGE_ID {
                 continue;
             }
             let s = d.severity.as_str();

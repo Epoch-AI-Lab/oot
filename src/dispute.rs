@@ -54,15 +54,22 @@ pub struct Dispute {
     pub detail: String,
 }
 
+/// Sentinel id for the empty-change notice.
+///
+/// The notice is informational only; policy evaluation and meaning counts
+/// skip it by id so a persisted docket can never re-block on it.
+pub const EMPTY_CHANGE_ID: &str = "D000";
+
 impl Dispute {
     /// Low-severity notice that a change contains no file differences.
     ///
     /// Purely informational: [`finalize_adjudication`] evaluates the verdict
-    /// before appending this notice, so it never reaches blocking or review
-    /// thresholds regardless of the meaning policy.
+    /// before appending this notice, and [`MeaningPolicy::evaluate`] plus
+    /// [`Docket::meaning_count`] skip the sentinel, so it never reaches
+    /// blocking or review thresholds regardless of the meaning policy.
     pub fn empty_change() -> Dispute {
         Dispute {
-            id: "D000".into(),
+            id: EMPTY_CHANGE_ID.into(),
             location: "-".into(),
             kind: Kind::Meaning,
             severity: Severity::Low,
@@ -159,10 +166,13 @@ pub struct Docket {
 
 impl Docket {
     /// Return the number of meaning-related disputes.
+    ///
+    /// Excludes the empty-change notice, which is informational rather than
+    /// a detected dispute.
     pub fn meaning_count(&self) -> usize {
         self.disputes
             .iter()
-            .filter(|d| d.kind == Kind::Meaning)
+            .filter(|d| d.kind == Kind::Meaning && d.id != EMPTY_CHANGE_ID)
             .count()
     }
 

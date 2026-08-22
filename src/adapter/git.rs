@@ -157,9 +157,13 @@ impl GitAdapter {
                         .output()
                         .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
 
-                    if blob_output.status.success() {
-                        files.insert(path.to_string(), blob_output.stdout);
+                    if !blob_output.status.success() {
+                        return Err(anyhow!(
+                            "Failed to read blob {blob_sha} for {path}: {}",
+                            String::from_utf8_lossy(&blob_output.stderr).trim()
+                        ));
                     }
+                    files.insert(path.to_string(), blob_output.stdout);
                 }
             }
         }

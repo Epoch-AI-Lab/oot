@@ -257,6 +257,11 @@ fn load_dir(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
+        // Never follow symlinks: a loop would recurse forever and an
+        // escaping link would ingest content from outside the snapshot.
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
             load_dir(root, &p, files)?;
         } else {

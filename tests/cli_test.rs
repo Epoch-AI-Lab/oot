@@ -307,7 +307,10 @@ fn test_cli_empty_change_is_flagged_but_not_blocked() {
     assert_eq!(output.status.code(), Some(0));
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("ADJUDICATED"));
-    assert!(stdout.contains("no file differences between base and head"));
+    // The notice is informational: it renders as a dispute line but does not
+    // inflate the detected-disputes count and cannot block under any policy.
+    assert!(stdout.contains("meaning:    0 disputes detected"));
+    assert!(stdout.contains("dispute-01: no file differences between base and head"));
     assert!(stdout.contains("intent:     no files changed"));
 
     let _ = std::fs::remove_dir_all(&temp_root);
@@ -401,6 +404,49 @@ fn test_cli_distinct_binaries_are_not_collapsed() {
         "changed binary must register as touched, got:\n{stdout}"
     );
     assert!(stdout.contains("intent:     blob.bin"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_symlink_loop_is_skipped() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_link_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok() {}").unwrap();
+
+    // A symlink pointing at the snapshot root itself: following it would
+    // recurse forever. Symlinks must be skipped, not followed.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&base_dir, base_dir.join("loop")).unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "chore/link",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ADJUDICATED"));
+    assert!(stdout.contains("intent:     no files changed"));
 
     let _ = std::fs::remove_dir_all(&temp_root);
 }

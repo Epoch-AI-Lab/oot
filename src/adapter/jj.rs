@@ -78,24 +78,7 @@ impl JjAdapter {
 
     /// Run a read-only jj command and return its stdout.
     fn run(&self, args: &[&str]) -> Result<String> {
-        let mut full: Vec<&str> = vec!["--ignore-working-copy", "--no-pager", "--quiet"];
-        full.extend_from_slice(args);
-
-        let output = Command::new("jj")
-            .args(&full)
-            .current_dir(&self.repo_root)
-            .output()
-            .with_context(|| format!("Failed to run jj {:?}", args))?;
-
-        if !output.status.success() {
-            return Err(anyhow!(
-                "jj {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
-
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(String::from_utf8_lossy(&self.run_bytes(args)?).into_owned())
     }
 
     /// Run a read-only jj command and return its raw stdout bytes.
