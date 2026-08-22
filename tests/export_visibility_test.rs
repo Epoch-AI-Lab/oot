@@ -178,6 +178,71 @@ fn test_embargoed_export_refuses_and_writes_nothing() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// Cached export mappings from one policy regime must never leak into
+/// another: switching between filtered and unfiltered exports has to
+/// invalidate the cache, or exports silently mix rewritten and original
+/// objects into a franken-history.
+#[test]
+fn test_policy_change_invalidates_export_cache() {
+    let tmp = std::env::temp_dir().join(format!("oot-cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    build_fixture(&src);
+    let env_blob = add_secret_and_followup(&src);
+    let orig_head = git(&src, &["rev-parse", "main"]);
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    // 1. Unfiltered export reproduces the original head.
+    let out_plain = tmp.join("out-plain");
+    let (ok, msg) = oot(&["export", "--out", out_plain.to_str().unwrap()], &proj);
+    assert!(ok, "unfiltered export failed: {msg}");
+    assert_eq!(git(&out_plain, &["rev-parse", "main"]), orig_head);
+
+    // 2. Filtered export must NOT reuse those cached shas.
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nprivate_branches = []\n",
+    )
+    .unwrap();
+    let out_filt = tmp.join("out-filt");
+    let (ok, msg) = oot(&["export", "--out", out_filt.to_str().unwrap()], &proj);
+    assert!(ok, "filtered export failed: {msg}");
+    let filt_head = git(&out_filt, &["rev-parse", "main"]);
+    assert_ne!(filt_head, orig_head);
+
+    // 3. Re-exporting under the same policy is stable...
+    let out_filt2 = tmp.join("out-filt2");
+    let (ok, msg) = oot(&["export", "--out", out_filt2.to_str().unwrap()], &proj);
+    assert!(ok, "second filtered export failed: {msg}");
+    assert_eq!(git(&out_filt2, &["rev-parse", "main"]), filt_head);
+
+    // 4. ...and switching back to unfiltered restores original shas.
+    std::fs::remove_file(proj.join("visibility.toml")).unwrap();
+    let out_plain2 = tmp.join("out-plain2");
+    let (ok, msg) = oot(&["export", "--out", out_plain2.to_str().unwrap()], &proj);
+    assert!(ok, "re-unfiltered export failed: {msg}");
+    assert_eq!(git(&out_plain2, &["rev-parse", "main"]), orig_head);
+
+    // The secret blob must be reachable in the plain exports only.
+    for dir in [&out_plain, &out_plain2] {
+        let check = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["cat-file", "-e", &env_blob])
+            .output()
+            .unwrap();
+        assert!(check.status.success());
+    }
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn test_filtered_export_skips_empty_rebuilt_commits() {
     let tmp = std::env::temp_dir().join(format!("oot-empty-{}", std::process::id()));

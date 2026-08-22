@@ -369,6 +369,16 @@ impl Store {
 
         let filtering = policy.is_some_and(|p| !p.private_paths.is_empty());
 
+        // Export mappings are only valid for the policy they were produced
+        // under: a filtered export's shas mean nothing to an unfiltered one
+        // and vice versa. A changed policy wipes the cache before anything
+        // can silently mix decisions from two regimes.
+        let filter_key = match policy {
+            Some(p) if filtering => p.private_paths.join("\u{1f}"),
+            _ => String::new(),
+        };
+        self.reset_export_cache_if_policy_changed(&filter_key)?;
+
         // Taint pass: decide once, up front, which changes touch private paths.
         let mut withheld: HashMap<String, String> = HashMap::new();
         if filtering {
@@ -386,7 +396,6 @@ impl Store {
             }
         }
 
-        let index_file = self.root.join("export").join("rebuild-index.tmp");
         let mut sha_of: HashMap<String, String> = HashMap::new();
         let mut source_sha_of: HashMap<String, String> = HashMap::new();
         // Exported sha -> rebuilt tree sha (filtered mode only).
@@ -397,8 +406,7 @@ impl Store {
             let record = self.get_change(&id)?;
             if let Some(sha) = self.exported_sha(&id)? {
                 if filtering {
-                    let tree =
-                        self.strip_tree(out_repo, &record.tree, policy.unwrap(), &index_file)?;
+                    let tree = self.strip_tree(&record.tree, policy.unwrap(), "")?;
                     tree_of.insert(sha.clone(), tree);
                 }
                 sha_of.insert(id.clone(), sha.clone());
@@ -435,7 +443,7 @@ impl Store {
                     continue;
                 }
                 let pol = policy.unwrap();
-                let tree = self.strip_tree(out_repo, &record.tree, pol, &index_file)?;
+                let tree = self.strip_tree(&record.tree, pol, "")?;
                 let mut parent_shas: Vec<String> = Vec::new();
                 for p in &record.parents {
                     for anc in self.nearest_kept(p, &sha_of)? {
@@ -456,7 +464,7 @@ impl Store {
                     continue;
                 }
 
-                let mut cmd = self.commit_tree_cmd(out_repo, &tree, &record);
+                let mut cmd = self.commit_tree_cmd(&tree, &record);
                 for p in &parent_shas {
                     cmd.args(["-p", p]);
                 }
@@ -475,7 +483,7 @@ impl Store {
             if missing > 0 {
                 bail!("change {id} references unexported parents");
             }
-            let mut cmd = self.commit_tree_cmd(out_repo, &record.tree, &record);
+            let mut cmd = self.commit_tree_cmd(&record.tree, &record);
             for p in &record.parents {
                 cmd.args(["-p", &sha_of[p]]);
             }
@@ -484,6 +492,34 @@ impl Store {
             exported.push((id, sha));
         }
         Ok(exported)
+    }
+
+    /// Wipe cached export mappings when the visibility policy changed since
+    /// the last export. The audit log survives: it is append-only history,
+    /// not cache.
+    fn reset_export_cache_if_policy_changed(&self, filter_key: &str) -> Result<()> {
+        let export_dir = self.root.join("export");
+        std::fs::create_dir_all(&export_dir)?;
+        let marker = export_dir.join("policy-key");
+        let prev = std::fs::read_to_string(&marker).unwrap_or_default();
+        if prev == filter_key {
+            return Ok(());
+        }
+        for entry in std::fs::read_dir(&export_dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name == "policy-key" || name == EXPORT_LOG {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                std::fs::remove_dir_all(&path)?;
+            } else {
+                std::fs::remove_file(&path)?;
+            }
+        }
+        std::fs::write(&marker, filter_key)?;
+        Ok(())
     }
 
     /// Nearest exported ancestors of change `id`, walking up through any
@@ -571,76 +607,95 @@ impl Store {
     }
 
     /// Rebuild `tree` minus every path matching the policy's private
-    /// fragments. Pure plumbing against a temporary index; deterministic for
-    /// a given tree + policy. Derived objects land in the export's odb.
-    fn strip_tree(
-        &self,
-        out_repo: &Path,
-        tree: &str,
-        policy: &VisibilityPolicy,
-        index_file: &Path,
-    ) -> Result<String> {
-        let git_cmd = || {
-            let mut c = Command::new("git");
-            c.args(["--git-dir"]);
-            c.arg(out_repo.join(".git"));
-            c.env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                self.git_dir().join("objects"),
-            );
-            c.env("GIT_INDEX_FILE", index_file);
-            c
-        };
-        run(git_cmd().args(["read-tree", tree]))?;
-
-        let listed = git_cmd()
-            .args(["ls-files", "-z"])
+    /// fragments, recursively. Pure plumbing (`ls-tree` + `mktree`) against
+    /// the store's bare odb — no index or worktree involved. Deterministic:
+    /// identical inputs yield the original sha untouched.
+    fn strip_tree(&self, tree: &str, policy: &VisibilityPolicy, prefix: &str) -> Result<String> {
+        let listed = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["ls-tree", "-z", tree])
             .output()
-            .context("failed to list the rebuild index")?;
+            .context("failed to read a tree while stripping")?;
         if !listed.status.success() {
             bail!(
-                "git ls-files failed during strip: {}",
+                "git ls-tree failed for {tree}: {}",
                 String::from_utf8_lossy(&listed.stderr).trim()
             );
         }
-        let victims: Vec<String> = listed
-            .stdout
-            .split(|&b| b == 0)
-            .filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).to_string())
-            .filter(|p| policy.path_is_private(p))
-            .collect();
-        if !victims.is_empty() {
-            run(git_cmd()
-                .args(["update-index", "--force-remove", "--"])
-                .args(&victims))?;
+
+        let mut lines: Vec<String> = Vec::new();
+        let mut changed = false;
+        for entry in listed.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let record = String::from_utf8_lossy(entry);
+            let (meta, name) = record
+                .split_once('\t')
+                .ok_or_else(|| anyhow!("malformed ls-tree entry: {record}"))?;
+            let path = format!("{prefix}{name}");
+            let mut parts = meta.splitn(3, ' ');
+            let mode = parts.next().unwrap_or_default().to_string();
+            let kind = parts.next().unwrap_or_default().to_string();
+            let sha = parts.next().unwrap_or_default().to_string();
+
+            match kind.as_str() {
+                // Gitlinks (submodules) are commit refs we never rewrite.
+                "commit" => lines.push(record.to_string()),
+                "blob" => {
+                    if policy.path_is_private(&path) {
+                        changed = true;
+                        continue;
+                    }
+                    lines.push(record.to_string());
+                }
+                "tree" => {
+                    let sub = self.strip_tree(&sha, policy, &format!("{path}/"))?;
+                    if sub != sha {
+                        changed = true;
+                    }
+                    lines.push(format!("{mode} tree {sub}\t{name}"));
+                }
+                other => bail!("unexpected entry kind '{other}' in tree {tree}"),
+            }
         }
 
-        let written = git_cmd()
-            .args(["write-tree"])
-            .output()
-            .context("failed to write the stripped tree")?;
-        if !written.status.success() {
+        if !changed {
+            return Ok(tree.to_string());
+        }
+
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .arg("mktree")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("failed to run git mktree")?;
+        child
+            .stdin
+            .take()
+            .context("mktree has no stdin")?
+            .write_all(lines.join("\n").as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
             bail!(
-                "git write-tree failed during strip: {}",
-                String::from_utf8_lossy(&written.stderr).trim()
+                "git mktree failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
             );
         }
-        Ok(String::from_utf8(written.stdout)?.trim().to_string())
+        Ok(String::from_utf8(output.stdout)?.trim().to_string())
     }
 
     /// A `git commit-tree` invocation preset with this record's identity and
     /// timestamps; callers append `-p <sha>` per parent and pipe the message.
-    fn commit_tree_cmd(&self, out_repo: &Path, tree: &str, record: &ChangeRecord) -> Command {
+    /// Writes into the store's odb so cached shas resolve in every export.
+    fn commit_tree_cmd(&self, tree: &str, record: &ChangeRecord) -> Command {
         let mut cmd = Command::new("git");
         cmd.args(["--git-dir"])
-            .arg(out_repo.join(".git"))
+            .arg(self.git_dir())
             .arg("commit-tree")
             .arg(tree)
-            .env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                self.git_dir().join("objects"),
-            )
             .env("GIT_AUTHOR_NAME", &record.author.name)
             .env("GIT_AUTHOR_EMAIL", &record.author.email)
             .env("GIT_AUTHOR_DATE", record.author.date_env())

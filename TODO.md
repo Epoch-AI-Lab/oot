@@ -83,10 +83,15 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
 1. ~~Dogfood for real~~ DONE 2026-08-22.
 2. ~~Visibility-filtered export~~ DONE 2026-08-22: `oot export` auto-loads
    `./visibility.toml` (or `--visibility <path>`); changes touching private
-   paths are withheld, kept trees are rebuilt minus those paths via temp-index
-   plumbing, children remap to nearest kept ancestors, empty results skipped,
-   embargoed stores refuse export entirely. Every withholding decision lands
-   in `.oot/export-log.jsonl`. Pinned by `tests/export_visibility_test.rs`.
+   paths are withheld, kept trees are rebuilt minus those paths via recursive
+   ls-tree/mktree rewriting, children remap to nearest kept ancestors, empty
+   results skipped, embargoed stores refuse export entirely. Every decision
+   lands in `.oot/export-log.jsonl`. Export cache is policy-scoped: switching
+   policies wipes `.oot/export/` mappings. Pinned by
+   `tests/export_visibility_test.rs` (strip, embargo, empty-skip, cache).
+   Verified on this repo: faithful export byte-exact; filtered export strips
+   `fixtures/repo/head/secrets/.env` and logs both touching commits.
+   Mirror pushes use an explicit empty policy to stay byte-faithful.
 3. `oot record` — capture working-copy deltas as new changes without git
    (first true "Oot as source of control" write path).
 
