@@ -45,19 +45,19 @@ impl Engine {
             let Some(config) = self.config_for(path) else {
                 continue;
             };
-            let base_src = base.files.get(path);
-            let head_src = head.files.get(path);
+            let base_src = base.files.get(path).map(|v| as_text(v));
+            let head_src = head.files.get(path).map(|v| as_text(v));
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
                     let (base_fns, mut dupes) = extract_functions(
-                        parse_source(&mut parser, &config.language, b).as_ref(),
-                        b,
+                        parse_source(&mut parser, &config.language, &b).as_ref(),
+                        &b,
                         config,
                     );
                     let (head_fns, head_dupes) = extract_functions(
-                        parse_source(&mut parser, &config.language, h).as_ref(),
-                        h,
+                        parse_source(&mut parser, &config.language, &h).as_ref(),
+                        &h,
                         config,
                     );
                     dupes.extend(head_dupes);
@@ -158,8 +158,8 @@ impl Engine {
                 }
                 (None, Some(h)) => {
                     let summary = file_function_summary(
-                        parse_source(&mut parser, &config.language, h).as_ref(),
-                        h,
+                        parse_source(&mut parser, &config.language, &h).as_ref(),
+                        &h,
                         config,
                     );
                     disputes.push(meaning(
@@ -201,26 +201,26 @@ impl Engine {
             let Some(config) = self.config_for(path) else {
                 continue;
             };
-            let b_file = base.files.get(path);
-            let o_file = ours.files.get(path);
-            let t_file = theirs.files.get(path);
+            let b_file = base.files.get(path).map(|v| as_text(v));
+            let o_file = ours.files.get(path).map(|v| as_text(v));
+            let t_file = theirs.files.get(path).map(|v| as_text(v));
 
             match (b_file, o_file, t_file) {
                 // File exists in all three
                 (Some(b_src), Some(o_src), Some(t_src)) => {
                     let (b_fns, mut dupes) = extract_functions(
-                        parse_source(&mut parser, &config.language, b_src).as_ref(),
-                        b_src,
+                        parse_source(&mut parser, &config.language, &b_src).as_ref(),
+                        &b_src,
                         config,
                     );
                     let (o_fns, o_dupes) = extract_functions(
-                        parse_source(&mut parser, &config.language, o_src).as_ref(),
-                        o_src,
+                        parse_source(&mut parser, &config.language, &o_src).as_ref(),
+                        &o_src,
                         config,
                     );
                     let (t_fns, t_dupes) = extract_functions(
-                        parse_source(&mut parser, &config.language, t_src).as_ref(),
-                        t_src,
+                        parse_source(&mut parser, &config.language, &t_src).as_ref(),
+                        &t_src,
                         config,
                     );
                     dupes.extend(o_dupes);
@@ -412,8 +412,8 @@ impl Engine {
                 // File added only in incoming
                 (None, None, Some(t)) => {
                     let summary = file_function_summary(
-                        parse_source(&mut parser, &config.language, t).as_ref(),
-                        t,
+                        parse_source(&mut parser, &config.language, &t).as_ref(),
+                        &t,
                         config,
                     );
                     disputes.push(meaning(
@@ -443,6 +443,15 @@ type FunctionMap = HashMap<String, (String, usize, String)>;
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
     parser.set_language(language).ok()?;
     parser.parse(source, None)
+}
+
+/// Lossily convert raw snapshot bytes to text for parsing.
+///
+/// Only the structural engine touches this; change detection compares bytes,
+/// so two distinct binary files never compare equal even if their lossy
+/// text collapses.
+fn as_text(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
 }
 
 fn meaning(n: &mut i32, path: &str, row: usize, detail: String, severity: Severity) -> Dispute {

@@ -222,6 +222,236 @@ fn test_cli_exit_code_zero_for_adjudicated() {
 }
 
 #[test]
+fn test_cli_binary_file_does_not_crash() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_bin_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    // Non-UTF8 blob: pre-fix, this failed the whole run with a UTF-8 error.
+    std::fs::write(head_dir.join("blob.bin"), [0xFFu8, 0xFE, 0x00, 0xD8]).unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "assets/drop-binary",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "binary files must be tracked without failing the run"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("OOT DOCKET"));
+    assert!(stdout.contains("ADJUDICATED"));
+    assert!(stdout.contains("blob.bin"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_empty_change_is_flagged_but_not_blocked() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_empty_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+    let policy_path = temp_root.join("low_blocks.toml");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    // Identical snapshots: nothing changed.
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok() {}").unwrap();
+
+    // Even a policy that blocks on low severity must not block an empty
+    // change: the D000 notice never reaches MeaningPolicy evaluation.
+    std::fs::write(&policy_path, "block_on = [\"low\"]\nreview_on = [\"low\"]").unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "chore/noop",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--policy",
+            policy_path.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ADJUDICATED"));
+    // The notice is informational: it renders as a dispute line but does not
+    // inflate the detected-disputes count and cannot block under any policy.
+    assert!(stdout.contains("meaning:    0 disputes detected"));
+    assert!(stdout.contains("dispute-01: no file differences between base and head"));
+    assert!(stdout.contains("intent:     no files changed"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_intent_wins_over_touched_paths() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_intent_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok(\"now\") {}").unwrap();
+
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "adjudicate".to_string(),
+            "--change".into(),
+            "feat/intent".into(),
+            "--source".into(),
+            "git".into(),
+            "--base".into(),
+            base_dir.to_string_lossy().into_owned(),
+            "--head".into(),
+            head_dir.to_string_lossy().into_owned(),
+            "--authors".into(),
+            "@tester".into(),
+        ];
+        args.extend(extra.iter().map(|s| s.to_string()));
+        Command::new(&bin)
+            .args(&args)
+            .output()
+            .expect("Failed to execute oot CLI")
+    };
+
+    // User intent wins over the touched-path fallback.
+    let with_intent = run(&["--intent", "clarify ok"]);
+    assert_eq!(with_intent.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&with_intent.stdout);
+    assert!(stdout.contains("intent:     clarify ok"));
+
+    // Without --intent, the docket falls back to touched paths.
+    let without_intent = run(&[]);
+    assert_eq!(without_intent.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&without_intent.stdout);
+    assert!(stdout.contains("intent:     lib.rs"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_distinct_binaries_are_not_collapsed() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_bincmp_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    // Two different invalid-UTF8 bytes both lossy-convert to U+FFFD, but raw
+    // byte comparison must still see them as different content.
+    std::fs::write(base_dir.join("blob.bin"), [0x80u8]).unwrap();
+    std::fs::write(head_dir.join("blob.bin"), [0x81u8]).unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "assets/touch-binary",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("no file differences"),
+        "changed binary must register as touched, got:\n{stdout}"
+    );
+    assert!(stdout.contains("intent:     blob.bin"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_symlink_loop_is_skipped() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_link_{}", std::process::id()));
+    let base_dir = temp_root.join("base");
+    let head_dir = temp_root.join("head");
+
+    std::fs::create_dir_all(&base_dir).unwrap();
+    std::fs::create_dir_all(&head_dir).unwrap();
+
+    std::fs::write(base_dir.join("lib.rs"), "fn ok() {}").unwrap();
+    std::fs::write(head_dir.join("lib.rs"), "fn ok() {}").unwrap();
+
+    // A symlink pointing at the snapshot root itself: following it would
+    // recurse forever. Symlinks must be skipped, not followed.
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&base_dir, base_dir.join("loop")).unwrap();
+
+    let output = Command::new(&bin)
+        .args([
+            "adjudicate",
+            "--change",
+            "chore/link",
+            "--source",
+            "git",
+            "--base",
+            base_dir.to_str().unwrap(),
+            "--head",
+            head_dir.to_str().unwrap(),
+            "--authors",
+            "@tester",
+        ])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("ADJUDICATED"));
+    assert!(stdout.contains("intent:     no files changed"));
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
 fn test_cli_repo_visibility_policy_flags_env() {
     let bin = get_bin_path();
 

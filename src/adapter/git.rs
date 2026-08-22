@@ -1,7 +1,7 @@
 //! Native Git adapter for extracting in-memory snapshots and adjudicating 3-way merges.
 
 use crate::change::{Change, Snapshot, Source};
-use crate::dispute::{Docket, Severity, Verdict};
+use crate::dispute::{finalize_adjudication, Docket, Severity};
 use crate::engine::Engine;
 use crate::policy::MeaningPolicy;
 use crate::visibility::VisibilityPolicy;
@@ -157,10 +157,13 @@ impl GitAdapter {
                         .output()
                         .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
 
-                    if blob_output.status.success() {
-                        let content = String::from_utf8_lossy(&blob_output.stdout).into_owned();
-                        files.insert(path.to_string(), content);
+                    if !blob_output.status.success() {
+                        return Err(anyhow!(
+                            "Failed to read blob {blob_sha} for {path}: {}",
+                            String::from_utf8_lossy(&blob_output.stderr).trim()
+                        ));
                     }
+                    files.insert(path.to_string(), blob_output.stdout);
                 }
             }
         }
@@ -222,29 +225,15 @@ impl GitAdapter {
             .any(|d| d.kind == crate::dispute::Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
-        let verdict = if cloaked {
-            Verdict::Cloaked
-        } else if visibility_policy.embargo_until.is_some() {
-            Verdict::Embargoed
-        } else {
-            meaning_policy.evaluate(&disputes)
-        };
-
-        let mut touched_paths: Vec<String> = base_snapshot
-            .files
-            .keys()
-            .chain(head_snapshot.files.keys())
-            .filter(|p| base_snapshot.files.get(*p) != head_snapshot.files.get(*p))
-            .cloned()
-            .collect();
-        touched_paths.sort();
-        touched_paths.dedup();
-
-        let scope = if touched_paths.is_empty() {
-            "no files changed".to_string()
-        } else {
-            touched_paths.join(", ")
-        };
+        let (disputes, intent, verdict) = finalize_adjudication(
+            disputes,
+            &base_snapshot.files,
+            &head_snapshot.files,
+            options.intent.clone(),
+            cloaked,
+            visibility_policy.embargo_until.is_some(),
+            meaning_policy,
+        );
 
         let docket = Docket {
             change: change.name,
@@ -252,7 +241,7 @@ impl GitAdapter {
             base: change.base_ref,
             head: change.head_ref,
             disputes,
-            scope,
+            intent,
             authors,
             verdict,
             embargo: visibility_policy.embargo_note(),

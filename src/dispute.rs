@@ -2,7 +2,7 @@
 //!
 //! A [`Dispute`] represents a point of disagreement (either structural meaning
 //! or visibility violation). A [`Docket`] is the complete, rendered adjudication
-//! record containing disputes, verdict, scope, and embargo metadata.
+//! record containing disputes, verdict, intent, and embargo metadata.
 
 use serde::{Deserialize, Serialize};
 
@@ -54,6 +54,78 @@ pub struct Dispute {
     pub detail: String,
 }
 
+/// Sentinel id for the empty-change notice.
+///
+/// The notice is informational only; policy evaluation and meaning counts
+/// skip it by id so a persisted docket can never re-block on it.
+pub const EMPTY_CHANGE_ID: &str = "D000";
+
+impl Dispute {
+    /// Low-severity notice that a change contains no file differences.
+    ///
+    /// Purely informational: [`finalize_adjudication`] evaluates the verdict
+    /// before appending this notice, and [`MeaningPolicy::evaluate`] plus
+    /// [`Docket::meaning_count`] skip the sentinel, so it never reaches
+    /// blocking or review thresholds regardless of the meaning policy.
+    pub fn empty_change() -> Dispute {
+        Dispute {
+            id: EMPTY_CHANGE_ID.into(),
+            location: "-".into(),
+            kind: Kind::Meaning,
+            severity: Severity::Low,
+            detail: "no file differences between base and head".into(),
+        }
+    }
+}
+
+/// Shared adjudication tail used by every entry point (dir snapshots, git, jj).
+///
+/// Computes touched paths, evaluates the verdict, appends the empty-change
+/// notice, and resolves the docket intent. The verdict is evaluated *before*
+/// the notice is appended so the notice cannot influence thresholds.
+///
+/// Returns `(disputes, intent, verdict)`.
+pub fn finalize_adjudication(
+    mut disputes: Vec<Dispute>,
+    base: &std::collections::HashMap<String, Vec<u8>>,
+    head: &std::collections::HashMap<String, Vec<u8>>,
+    user_intent: Option<String>,
+    cloaked: bool,
+    embargo_active: bool,
+    meaning_policy: &crate::policy::MeaningPolicy,
+) -> (Vec<Dispute>, String, Verdict) {
+    let mut touched_paths: Vec<String> = base
+        .keys()
+        .chain(head.keys())
+        .filter(|p| base.get(*p) != head.get(*p))
+        .cloned()
+        .collect();
+    touched_paths.sort();
+    touched_paths.dedup();
+
+    let verdict = if cloaked {
+        Verdict::Cloaked
+    } else if embargo_active {
+        Verdict::Embargoed
+    } else {
+        meaning_policy.evaluate(&disputes)
+    };
+
+    if touched_paths.is_empty() {
+        disputes.push(Dispute::empty_change());
+    }
+
+    let intent = user_intent.unwrap_or_else(|| {
+        if touched_paths.is_empty() {
+            "no files changed".to_string()
+        } else {
+            touched_paths.join(", ")
+        }
+    });
+
+    (disputes, intent, verdict)
+}
+
 /// The final adjudication verdict for a change.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -81,8 +153,9 @@ pub struct Docket {
     pub head: String,
     /// Collection of detected disputes.
     pub disputes: Vec<Dispute>,
-    /// Stated scope or intent of the change.
-    pub scope: String,
+    /// Stated intent of the change, or a summary of touched paths when none was given.
+    #[serde(alias = "scope")]
+    pub intent: String,
     /// Change author handles or agent identifiers.
     pub authors: Vec<String>,
     /// Resulting adjudication verdict.
@@ -93,10 +166,13 @@ pub struct Docket {
 
 impl Docket {
     /// Return the number of meaning-related disputes.
+    ///
+    /// Excludes the empty-change notice, which is informational rather than
+    /// a detected dispute.
     pub fn meaning_count(&self) -> usize {
         self.disputes
             .iter()
-            .filter(|d| d.kind == Kind::Meaning)
+            .filter(|d| d.kind == Kind::Meaning && d.id != EMPTY_CHANGE_ID)
             .count()
     }
 
@@ -144,7 +220,7 @@ impl Docket {
             ));
         }
         out.push('\n');
-        out.push_str(&format!("  scope:      {}\n", self.scope));
+        out.push_str(&format!("  intent:     {}\n", self.intent));
         out.push_str(&format!("  authors:    {}\n", self.authors.join(", ")));
         out.push('\n');
         if self.disputes.is_empty() {
@@ -233,7 +309,7 @@ mod tests {
                     detail: "private path .env touched".into(),
                 },
             ],
-            scope: "auth refactor".into(),
+            intent: "auth refactor".into(),
             authors: vec!["@alice".into(), "@bob".into()],
             verdict: Verdict::Adjudicated,
             embargo: Some("patch held for maintainers until 2026-12-31".into()),

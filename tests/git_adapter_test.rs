@@ -43,6 +43,10 @@ impl TempGitRepo {
     }
 
     fn write_file(&self, rel_path: &str, content: &str) {
+        self.write_bytes(rel_path, content.as_bytes());
+    }
+
+    fn write_bytes(&self, rel_path: &str, content: &[u8]) {
         let full = self.path.join(rel_path);
         if let Some(parent) = full.parent() {
             fs::create_dir_all(parent).expect("failed to create parent dir");
@@ -106,17 +110,24 @@ fn test_git_adapter_snapshot_extraction() {
         "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n",
     );
     repo.write_file("README.md", "# Test Repo\n");
+    // Invalid UTF-8: pins byte-exact blob storage (lossy conversion would
+    // turn 0xFF into U+FFFD and this assertion would fail).
+    repo.write_bytes("assets/blob.bin", &[0xFF, 0x00, 0x81]);
     let c1 = repo.commit("initial commit");
 
     let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
     let snapshot = adapter.extract_snapshot(&c1).expect("extract snapshot");
 
-    assert_eq!(snapshot.files.len(), 2);
+    assert_eq!(snapshot.files.len(), 3);
     assert!(snapshot.files.contains_key("src/lib.rs"));
     assert!(snapshot.files.contains_key("README.md"));
     assert_eq!(
         snapshot.files.get("src/lib.rs").unwrap(),
-        "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n"
+        "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n".as_bytes()
+    );
+    assert_eq!(
+        snapshot.files.get("assets/blob.bin").unwrap(),
+        &[0xFF, 0x00, 0x81]
     );
 }
 

@@ -5,7 +5,7 @@
 use clap::{Parser, Subcommand};
 use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
-use oot::dispute::{Docket, Kind, Severity, Verdict};
+use oot::dispute::{finalize_adjudication, Docket, Kind, Severity, Verdict};
 use oot::docket;
 use oot::engine::Engine;
 use oot::policy::MeaningPolicy;
@@ -202,15 +202,15 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let mut disputes = eng.diff_snapshots(&change.base, &change.head)?;
             disputes.extend(vis_disputes);
 
-            let verdict = if cloaked {
-                Verdict::Cloaked
-            } else if visibility_policy.embargo_until.is_some() {
-                Verdict::Embargoed
-            } else {
-                meaning_policy.evaluate(&disputes)
-            };
-
-            let scope = change.intent.clone().unwrap_or_else(|| "auto".into());
+            let (disputes, intent, verdict) = finalize_adjudication(
+                disputes,
+                &change.base.files,
+                &change.head.files,
+                intent.clone(),
+                cloaked,
+                visibility_policy.embargo_until.is_some(),
+                &meaning_policy,
+            );
 
             let docket = Docket {
                 change: change.name.clone(),
@@ -218,7 +218,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 base: change.base_ref.clone(),
                 head: change.head_ref.clone(),
                 disputes,
-                scope,
+                intent,
                 authors: change.authors.clone(),
                 verdict,
                 embargo: visibility_policy.embargo_note(),
@@ -248,25 +248,32 @@ fn exit_code_for(verdict: Verdict) -> std::process::ExitCode {
     }
 }
 
-/// Recursively read files in a directory into a HashMap of relative paths to contents.
+/// Recursively read files in a directory into a HashMap of relative paths to raw contents.
 fn load_dir(
     root: &std::path::Path,
     dir: &std::path::Path,
-    files: &mut std::collections::HashMap<String, String>,
+    files: &mut std::collections::HashMap<String, Vec<u8>>,
 ) -> anyhow::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let p = entry.path();
+        // Never follow symlinks: a loop would recurse forever and an
+        // escaping link would ingest content from outside the snapshot.
+        if entry.file_type()?.is_symlink() {
+            continue;
+        }
         if p.is_dir() {
             load_dir(root, &p, files)?;
         } else {
-            let content = std::fs::read_to_string(&p)?;
+            // Store raw bytes so binary files (images, lockfiles, etc.) are
+            // tracked with exact content; text conversion happens at parse time.
+            let bytes = std::fs::read(&p)?;
             let rel = p
                 .strip_prefix(root)
                 .unwrap_or(&p)
                 .to_string_lossy()
                 .replace('\\', "/");
-            files.insert(rel, content);
+            files.insert(rel, bytes);
         }
     }
     Ok(())

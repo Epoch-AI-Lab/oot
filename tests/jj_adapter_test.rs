@@ -150,12 +150,35 @@ fn test_jj_extract_snapshot() {
     let (_repo, adapter) = setup_base_and_head(false);
 
     let snap = adapter.extract_snapshot("@-").expect("snapshot extracts");
-    let content = snap
-        .files
-        .get("src/lib.rs")
-        .expect("src/lib.rs present in head snapshot");
+    let content = String::from_utf8_lossy(
+        snap.files
+            .get("src/lib.rs")
+            .expect("src/lib.rs present in head snapshot"),
+    );
     assert!(content.contains("hello world"));
     assert!(!content.contains("<<<<<<<"), "clean commit has no markers");
+}
+
+#[test]
+fn test_jj_extract_snapshot_binary_exact_bytes() {
+    if !jj_available() {
+        return;
+    }
+    let repo = init_repo(false);
+    write_lib(&repo.path, "hello");
+    jj(&repo.path, &["commit", "-m", "base"]);
+
+    // Invalid UTF-8: pins byte-exact file storage through `jj file show`
+    // (lossy conversion would turn 0xFF into U+FFFD and fail this assert).
+    std::fs::write(repo.path.join("assets.bin"), [0xFFu8, 0x00, 0x81]).unwrap();
+    jj(&repo.path, &["commit", "-m", "add binary"]);
+
+    let adapter = JjAdapter::new(&repo.path).expect("adapter should discover jj repo");
+    let snap = adapter.extract_snapshot("@").expect("snapshot extracts");
+    assert_eq!(
+        snap.files.get("assets.bin").expect("binary present"),
+        &[0xFF, 0x00, 0x81]
+    );
 }
 
 #[test]

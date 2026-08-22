@@ -6,7 +6,7 @@
 //! caller's working copy.
 
 use crate::change::{Change, Snapshot, Source};
-use crate::dispute::{Dispute, Docket, Kind, Severity, Verdict};
+use crate::dispute::{finalize_adjudication, Dispute, Docket, Kind, Severity};
 use crate::engine::Engine;
 use crate::policy::MeaningPolicy;
 use crate::visibility::VisibilityPolicy;
@@ -78,6 +78,13 @@ impl JjAdapter {
 
     /// Run a read-only jj command and return its stdout.
     fn run(&self, args: &[&str]) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.run_bytes(args)?).into_owned())
+    }
+
+    /// Run a read-only jj command and return its raw stdout bytes.
+    ///
+    /// Used for file content so binary files keep exact bytes.
+    fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
         let mut full: Vec<&str> = vec!["--ignore-working-copy", "--no-pager", "--quiet"];
         full.extend_from_slice(args);
 
@@ -89,13 +96,13 @@ impl JjAdapter {
 
         if !output.status.success() {
             return Err(anyhow!(
-                "jj {:?} failed: {}",
-                args,
+                "jj {} failed: {}",
+                args.join(" "),
                 String::from_utf8_lossy(&output.stderr).trim()
             ));
         }
 
-        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        Ok(output.stdout)
     }
 
     /// Resolve a revset to exactly one commit ID.
@@ -204,8 +211,9 @@ impl JjAdapter {
         let mut conflicted = Vec::new();
 
         for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
-            let content = self.run(&["file", "show", "-r", rev, "--", path])?;
-            if content
+            let content = self.run_bytes(&["file", "show", "-r", rev, "--", path])?;
+            let text = String::from_utf8_lossy(&content);
+            if text
                 .lines()
                 .any(|l| l.starts_with("<<<<<<<") && l.contains("conflict"))
             {
@@ -294,29 +302,15 @@ impl JjAdapter {
             .any(|d| d.kind == Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
-        let verdict = if cloaked {
-            Verdict::Cloaked
-        } else if visibility_policy.embargo_until.is_some() {
-            Verdict::Embargoed
-        } else {
-            meaning_policy.evaluate(&disputes)
-        };
-
-        let mut touched_paths: Vec<String> = base_snapshot
-            .files
-            .keys()
-            .chain(head_snapshot.files.keys())
-            .filter(|p| base_snapshot.files.get(*p) != head_snapshot.files.get(*p))
-            .cloned()
-            .collect();
-        touched_paths.sort();
-        touched_paths.dedup();
-
-        let scope = if touched_paths.is_empty() {
-            "no files changed".to_string()
-        } else {
-            touched_paths.join(", ")
-        };
+        let (disputes, intent, verdict) = finalize_adjudication(
+            disputes,
+            &base_snapshot.files,
+            &head_snapshot.files,
+            options.intent.clone(),
+            cloaked,
+            visibility_policy.embargo_until.is_some(),
+            meaning_policy,
+        );
 
         let docket = Docket {
             change: change.name,
@@ -328,7 +322,7 @@ impl JjAdapter {
             base: change.base_ref,
             head: change.head_ref,
             disputes,
-            scope,
+            intent,
             authors,
             verdict,
             embargo: visibility_policy.embargo_note(),

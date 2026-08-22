@@ -4,3 +4,4 @@
 *.env
 !fixtures/repo/head/secrets/.env
 *.DS_Store
+.useit/
