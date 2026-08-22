@@ -366,10 +366,11 @@ impl Store {
             // whole ancestry below is byte-exact, so signatures and other
             // extra headers survive without reconstruction.
             if let Some(orig) = &record.source_sha {
-                let parents_exact = record
-                    .parents
-                    .iter()
-                    .all(|p| sha_of.get(p).is_some_and(|e| source_sha_of.get(p) == Some(e)));
+                let parents_exact = record.parents.iter().all(|p| {
+                    sha_of
+                        .get(p)
+                        .is_some_and(|e| source_sha_of.get(p) == Some(e))
+                });
                 if parents_exact && self.commit_object_exists(orig)? {
                     std::fs::write(self.export_map_path(&id), orig)?;
                     sha_of.insert(id.clone(), orig.clone());
