@@ -547,9 +547,13 @@ impl RawCommit {
 }
 
 /// Extract the raw timezone offset (e.g. `+0530`) from a git ISO-8601 date
-/// like `2026-08-22T10:00:00+05:30`. Historical offsets can be exotic; those
-/// fail loudly rather than silently rewriting dates.
+/// like `2026-08-22T10:00:00+05:30`. UTC may arrive as a bare `Z` suffix
+/// (runner clocks are UTC); historical offsets can be exotic; those fail
+/// loudly rather than silently rewriting dates.
 pub fn parse_offset(iso: &str) -> Result<String> {
+    if iso.ends_with(['Z', 'z']) {
+        return Ok("+0000".to_string());
+    }
     let tail = iso
         .rsplit(['+', '-'])
         .next()
@@ -588,6 +592,8 @@ mod tests {
         assert_eq!(parse_offset("2026-08-22T10:00:00+05:30").unwrap(), "+0530");
         assert_eq!(parse_offset("2026-08-22T10:00:00-08:00").unwrap(), "-0800");
         assert_eq!(parse_offset("1970-01-01T00:00:00+00:00").unwrap(), "+0000");
+        // UTC runners render zero offsets as a bare Z suffix.
+        assert_eq!(parse_offset("2026-08-22T10:00:00Z").unwrap(), "+0000");
         assert!(parse_offset("no offset here").is_err());
     }
 
