@@ -241,8 +241,40 @@ impl Engine {
                             continue;
                         }
 
-                        // Case 1: Unilateral change by incoming (theirs)
-                        if !ours_touched {
+                        // Neither side mutated a definition that existed in
+                        // base. Additions stand alone unless both branches
+                        // added conflicting same-named copies.
+                        if !o_list.is_empty()
+                            && !t_list.is_empty()
+                            && o_changed.is_empty()
+                            && o_gone.is_empty()
+                            && t_changed.is_empty()
+                            && t_gone.is_empty()
+                        {
+                            if same_defs(o_list, t_list) {
+                                continue;
+                            }
+                            let row = t_list
+                                .first()
+                                .or_else(|| o_list.first())
+                                .map(|d| d.row)
+                                .unwrap_or(0);
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                row,
+                                format!(
+                                    "3-way conflict: both branches modified function `{}` differently",
+                                    name
+                                ),
+                                Severity::High,
+                            ));
+                            continue;
+                        }
+
+                        // Case 1: Unilateral change by incoming (theirs);
+                        // ours at most added new definitions.
+                        if o_changed.is_empty() && o_gone.is_empty() {
                             for (_, ti) in &t_changed {
                                 disputes.push(meaning(
                                     &mut n,
@@ -261,7 +293,7 @@ impl Engine {
                             continue;
                         }
                         // Case 2: Unilateral change by target (ours) - no dispute for incoming merge
-                        if !theirs_touched {
+                        if t_changed.is_empty() && t_gone.is_empty() {
                             continue;
                         }
                         // Case 3: Both branches modified relative to base
@@ -292,7 +324,7 @@ impl Engine {
                             )
                         } else {
                             format!(
-                                "3-way conflict: both branches changed function `{}` differently",
+                                "3-way conflict: both branches modified function `{}` differently",
                                 name
                             )
                         };
@@ -875,6 +907,81 @@ mod tests {
             "refactor + unrelated edit must not produce High conflicts, got {:?}",
             disputes
         );
+    }
+
+    #[test]
+    fn test_engine_3way_overload_add_is_not_a_conflict() {
+        // Regression: ours adds a same-named overload while theirs edits the
+        // original. Git merges this cleanly, so it must stay Review-level.
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn f() -> i32 { 1 }\n"),
+                &snap("pub fn f() -> i32 { 1 }\npub fn f() -> i32 { 99 }\n"),
+                &snap("pub fn f() -> i32 { 3 }\n"),
+            )
+            .unwrap();
+
+        assert!(
+            !disputes.iter().any(|d| d.severity == Severity::High),
+            "additive overload must not fabricate a conflict, got {:?}",
+            disputes
+        );
+        assert!(disputes
+            .iter()
+            .any(|d| d.detail == "incoming branch modified function `f`"
+                && d.severity == Severity::Review));
+    }
+
+    #[test]
+    fn test_engine_3way_add_add_divergent_conflicts_with_old_contract_message() {
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn a() {}\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 1 }\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 2 }\n"),
+            )
+            .unwrap();
+
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].severity, Severity::High);
+        assert_eq!(
+            disputes[0].detail,
+            "3-way conflict: both branches modified function `f` differently"
+        );
+    }
+
+    #[test]
+    fn test_engine_3way_convergent_same_name_addition_is_clean() {
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn a() {}\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 7 }\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 7 }\n"),
+            )
+            .unwrap();
+
+        assert!(disputes.is_empty(), "got {:?}", disputes);
     }
 
     #[test]

@@ -32,3 +32,22 @@ are unstable under impl-block refactors
 `test_engine_go_same_name_methods_tracked_separately`, and
 `test_engine_rust_impl_method_collision_tracked_separately`.
 
+## Rename/rename divergence is swallowed
+
+Base has `f`; ours renames `f -> g`, theirs renames `f -> k`. Both sides
+deleted `f`, so it reads as convergent; `g` and `k` read as plain additions.
+Merged result silently holds both names. Pre-existing (the old code hit its
+convergent-clean branch the same way), but def-level tracking makes a fix
+reachable: detect that the removed base defs survive under different names
+per side, then emit High. Trigger: first real rename/rename dispute or the
+hosted intent-scoring work, whichever comes first.
+
+## Positional pairing can swap row attribution on count asymmetry
+
+When a new same-named def lands *above* a modified one
+(base 1x `f`, head 2x `f`), leftover pairing reports "changed" at the new
+def's row and "added" at the modified one's row. Counts and severity are
+right; only line numbers are swapped. Right fix: similarity-based leftover
+pairing (edit distance or tree-sitter diff hash) instead of document order.
+Trigger: when a docket consumer starts using dispute rows for navigation.
+
