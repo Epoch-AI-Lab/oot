@@ -5,6 +5,7 @@
 
 pub mod adapter;
 pub mod change;
+pub mod court;
 pub mod dispute;
 pub mod docket;
 pub mod engine;
