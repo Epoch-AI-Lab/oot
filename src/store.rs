@@ -297,6 +297,42 @@ impl Store {
         Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
     }
 
+    /// Every blob under `tree`: (path, blob sha, executable). Reads straight
+    /// from the store's odb; no checkout involved.
+    pub fn tree_files(&self, tree: &str) -> Result<HashMap<String, (String, bool)>> {
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["ls-tree", "-r", "-z", tree])
+            .output()
+            .context("failed to read the tree from the store's odb")?;
+        if !out.status.success() {
+            bail!(
+                "git ls-tree failed for {tree}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        let mut map = HashMap::new();
+        for entry in out.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let record = String::from_utf8_lossy(entry);
+            let (meta, path) = record
+                .split_once('\t')
+                .ok_or_else(|| anyhow!("malformed ls-tree entry: {record}"))?;
+            let mut parts = meta.split(' ');
+            let mode = parts.next().unwrap_or_default();
+            let _kind = parts.next().unwrap_or_default();
+            let sha = parts.next().unwrap_or_default();
+            map.insert(path.to_string(), (sha.to_string(), mode == "100755"));
+        }
+        Ok(map)
+    }
+
+    /// Content address of `bytes` as a blob, without storing it. Lets callers
+    /// compare working-copy content against trees without polluting the odb.
+    pub fn blob_sha(&self, bytes: &[u8]) -> Result<String> {
+        self.hash_object(bytes, "blob", false)
+    }
+
     /// Store file contents as blobs in the odb and assemble them into a
     /// nested tree, returning the root tree sha. Paths use `/` separators;
     /// empty directories cannot be represented and are skipped naturally.
@@ -1028,6 +1064,40 @@ pub fn now_epoch() -> u64 {
         .unwrap_or(0)
 }
 
+/// UTC calendar date of `epoch` shifted into the identity's timezone, as
+/// `YYYY-MM-DD`. Pure arithmetic; no date libraries in the tree.
+pub fn format_date(identity: &Identity) -> String {
+    let sign = if identity.offset.starts_with('-') {
+        -1
+    } else {
+        1
+    };
+    let digits: String = identity
+        .offset
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .collect();
+    let offset_secs: i64 = if digits.len() == 4 {
+        sign * (digits[..2].parse::<i64>().unwrap_or(0) * 3600
+            + digits[2..].parse::<i64>().unwrap_or(0) * 60)
+    } else {
+        0
+    };
+    let days = (identity.time + offset_secs).div_euclid(86400);
+    // Howard Hinnant's civil-from-days algorithm.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 fn run(cmd: &mut Command) -> Result<()> {
     let output = cmd
         .output()
@@ -1143,5 +1213,21 @@ mod tests {
             offset: "+0530".into(),
         };
         assert_eq!(id.date_env(), "1700000000 +0530");
+    }
+
+    #[test]
+    fn test_format_date_applies_offset() {
+        let mk = |time: i64, offset: &str| Identity {
+            name: "K".into(),
+            email: "k@oot.dev".into(),
+            time,
+            offset: offset.into(),
+        };
+        // Same instant: +0530 is already the next day vs UTC.
+        assert_eq!(format_date(&mk(1_700_000_000, "+0530")), "2023-11-15");
+        assert_eq!(format_date(&mk(1_700_000_000, "-0800")), "2023-11-14");
+        assert_eq!(format_date(&mk(1_700_000_000, "+0000")), "2023-11-14");
+        // Exotic historical offset still parses.
+        assert_eq!(format_date(&mk(1, "+0045")), "1970-01-01");
     }
 }

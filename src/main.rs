@@ -91,6 +91,19 @@ enum Commands {
         #[arg(long)]
         branch: Option<String>,
     },
+    /// Show what a `record` would capture: working-copy deltas vs the
+    /// branch head.
+    Status {
+        /// Branch to compare against (defaults to the store's only branch, or `main`).
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// List a branch's changes, newest first.
+    Log {
+        /// Branch whose history to show (defaults to the store's only branch, or `main`).
+        #[arg(long)]
+        branch: Option<String>,
+    },
     /// Export the store's history as a plain git repository ready for push.
     Export {
         /// Directory to create the exported repository in.
@@ -303,25 +316,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Commands::Record { message, branch } => {
             let root = std::env::current_dir()?;
             let store = Store::open(&root)?;
-
-            // Branch: explicit flag wins; otherwise the store's only branch;
-            // otherwise a fresh store starts on main.
-            let branch = match branch {
-                Some(b) => b,
-                None => match store.refs()?.as_slice() {
-                    [] => "main".to_string(),
-                    [(name, _)] => name.clone(),
-                    _ => anyhow::bail!(
-                        "store has multiple branches; pass --branch <name> ({})",
-                        store
-                            .refs()?
-                            .into_iter()
-                            .map(|(n, _)| n)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                },
-            };
+            let branch = resolve_branch(&store, branch)?;
 
             let (author, committer) = resolve_identity(&root)?;
 
@@ -358,6 +353,111 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 "recorded {id} on {branch} as {kind}: {} file(s)",
                 files.len()
             );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::Status { branch } => {
+            let root = std::env::current_dir()?;
+            let store = Store::open(&root)?;
+            let branch = resolve_branch(&store, branch)?;
+            let head_id = store.head_id(&branch)?;
+
+            let files = collect_worktree(&root)?;
+            let mut work: std::collections::HashMap<String, (String, bool)> =
+                std::collections::HashMap::new();
+            for f in &files {
+                work.insert(f.path.clone(), (store.blob_sha(&f.contents)?, f.executable));
+            }
+
+            let mut added = Vec::new();
+            let mut modified = Vec::new();
+            let mut deleted = Vec::new();
+            if let Some(head) = &head_id {
+                let head_tree = store.get_change(head)?.tree;
+                for (path, sha_mode) in store.tree_files(&head_tree)? {
+                    match work.remove(&path) {
+                        Some(current) if current != sha_mode => modified.push(path),
+                        Some(_) => {}
+                        None => deleted.push(path),
+                    }
+                }
+                added.extend(work.into_keys());
+            } else {
+                added.extend(files.iter().map(|f| f.path.clone()));
+            }
+            for v in [&mut added, &mut modified, &mut deleted] {
+                v.sort();
+            }
+
+            match (
+                &head_id,
+                added.is_empty() && modified.is_empty() && deleted.is_empty(),
+            ) {
+                (_, true) => match head_id.as_deref().map(|h| &h[..7]) {
+                    Some(id) => println!("branch {branch} @ {id}: up to date"),
+                    None => println!("branch {branch}: empty store, nothing recorded yet"),
+                },
+                (Some(id), false) => {
+                    println!(
+                        "branch {branch} @ {id} — {} change(s) to record:",
+                        added.len() + modified.len() + deleted.len()
+                    );
+                    print_deltas(&added, &modified, &deleted);
+                }
+                (None, false) => {
+                    println!(
+                        "branch {branch} has no changes yet — {} file(s) would be captured:",
+                        added.len()
+                    );
+                    print_deltas(&added, &modified, &deleted);
+                }
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::Log { branch } => {
+            let store = Store::open(".")?;
+            let branch = resolve_branch(&store, branch)?;
+            let head_id = store
+                .head_id(&branch)?
+                .ok_or_else(|| anyhow::anyhow!("branch '{branch}' has no changes"))?;
+
+            // Reachable set from the head...
+            let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut queue = vec![head_id];
+            while let Some(id) = queue.pop() {
+                if !reachable.insert(id.clone()) {
+                    continue;
+                }
+                queue.extend(store.get_change(&id)?.parents.iter().cloned());
+            }
+            // ...printed newest first (index order is chronological).
+            let mut stdout = std::io::stdout();
+            use std::io::Write;
+            for id in store.index()?.iter().rev() {
+                if !reachable.contains(id) {
+                    continue;
+                }
+                let record = store.get_change(id)?;
+                let kind = if record.source_sha.is_some() {
+                    "git"
+                } else {
+                    "oot"
+                };
+                // Piping into `head` closes stdout early; stop quietly
+                // instead of panicking on the broken pipe.
+                if writeln!(
+                    stdout,
+                    "{} {} {} {} [{}]",
+                    &id[..7],
+                    oot::store::format_date(&record.committer),
+                    record.author.name,
+                    record.message.lines().next().unwrap_or_default(),
+                    kind
+                )
+                .is_err()
+                {
+                    break;
+                }
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Export { out, visibility } => {
@@ -431,6 +531,36 @@ fn run_git(args: &[&str], cwd: &std::path::Path) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Branch selection shared by record/status/log: explicit flag wins;
+/// otherwise the store's only branch; otherwise a fresh store starts on main.
+fn resolve_branch(store: &Store, flag: Option<String>) -> anyhow::Result<String> {
+    match flag {
+        Some(b) => Ok(b),
+        None => match store.refs()?.as_slice() {
+            [] => Ok("main".to_string()),
+            [(name, _)] => Ok(name.clone()),
+            refs => anyhow::bail!(
+                "store has multiple branches; pass --branch <name> ({})",
+                refs.iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        },
+    }
+}
+
+fn print_deltas(added: &[String], modified: &[String], deleted: &[String]) {
+    for (tag, paths) in [("A", added), ("M", modified), ("D", deleted)] {
+        for path in paths {
+            println!("  {tag} {path}");
+        }
+    }
+    if !added.is_empty() || !modified.is_empty() || !deleted.is_empty() {
+        println!("record with: oot record -m \"...\"");
+    }
 }
 
 /// Author/committer identities for recorded changes. Git's env vars win

@@ -101,6 +101,11 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
    pure-Oot projects. Export already handles native changes via the
    reconstruction path — pinned end-to-end by `tests/record_test.rs`,
    including mixed imported+native history.
+4. ~~`oot log` / `oot status`~~ DONE 2026-08-22: status diffs the working
+   copy against the branch head's tree (content-addressed, no odb pollution);
+   log walks reachable changes newest-first with `[git]`/`[oot]` provenance
+   tags and offset-aware dates (pure arithmetic, no date deps). Both share
+   `resolve_branch` with record. Pinned by `tests/log_status_test.rs`.
 
 ## Deliberate cuts (v1)
 
