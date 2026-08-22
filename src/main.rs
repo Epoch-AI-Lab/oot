@@ -24,6 +24,8 @@ struct Cli {
 }
 
 /// Available CLI subcommands.
+// Built exactly once at startup; variant size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Commands {
     /// Adjudicate a Change and print its docket.
