@@ -223,6 +223,14 @@ impl Engine {
                     let mut pending_removed: Vec<(String, FnDef)> = Vec::new();
                     let empty: Vec<FnDef> = Vec::new();
 
+                    // Every disappearance/appearance relative to base, tagged
+                    // by side and stashed before any dispatch decision runs.
+                    // Stashing here changes no existing emissions.
+                    let mut removed_ours: Vec<(String, usize, FnDef)> = Vec::new();
+                    let mut added_ours: Vec<(String, FnDef)> = Vec::new();
+                    let mut removed_theirs: Vec<(String, usize, FnDef)> = Vec::new();
+                    let mut added_theirs: Vec<(String, FnDef)> = Vec::new();
+
                     for name in all_fn_names {
                         let b_list = b_fns.get(name).unwrap_or(&empty);
                         let o_list = o_fns.get(name).unwrap_or(&empty);
@@ -230,6 +238,19 @@ impl Engine {
 
                         let (o_changed, o_gone, o_fresh) = align_defs(b_list, o_list);
                         let (t_changed, t_gone, t_fresh) = align_defs(b_list, t_list);
+
+                        for bi in &o_gone {
+                            removed_ours.push((name.clone(), *bi, b_list[*bi].clone()));
+                        }
+                        for hi in &o_fresh {
+                            added_ours.push((name.clone(), o_list[*hi].clone()));
+                        }
+                        for bi in &t_gone {
+                            removed_theirs.push((name.clone(), *bi, b_list[*bi].clone()));
+                        }
+                        for ti in &t_fresh {
+                            added_theirs.push((name.clone(), t_list[*ti].clone()));
+                        }
 
                         let ours_touched =
                             !(o_changed.is_empty() && o_gone.is_empty() && o_fresh.is_empty());
@@ -340,6 +361,15 @@ impl Engine {
                         };
                         disputes.push(meaning(&mut n, path, row, detail, Severity::High));
                     }
+
+                    // Detection runs now; its results start driving
+                    // emission/suppression with the divergence work itself.
+                    let _pending_divergent_renames = find_divergent_renames(
+                        &removed_ours,
+                        &added_ours,
+                        &removed_theirs,
+                        &added_theirs,
+                    );
 
                     // Pair incoming removals with incoming additions of
                     // identical blanked-name source text: a rename, not two
@@ -506,6 +536,90 @@ fn strip_common<'a>(a: &'a [FnDef], b: &[FnDef]) -> Vec<&'a FnDef> {
         }
     }
     leftover
+}
+
+/// Rename compatibility between a removed def's signature and an added
+/// def's signature: `Some` on exact equality today. A future similarity
+/// metric widens this to graded scores without touching the pairing logic.
+fn rename_score(candidate: &str, original: &str) -> Option<()> {
+    (candidate == original).then_some(())
+}
+
+/// One side's rename evidence: a base def identified by `(name, index
+/// within its base group)` that this side deleted, and the new name/row it
+/// reappeared under.
+struct SidePair {
+    old_name: String,
+    old_idx: usize,
+    new_name: String,
+    new_row: usize,
+}
+
+/// A base definition both branches renamed, to different names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DivergentRename {
+    base_name: String,
+    ours_new_name: String,
+    ours_row: usize,
+    theirs_new_name: String,
+    theirs_row: usize,
+}
+
+/// Greedily pair each removed def with the first unconsumed added def whose
+/// signature matches exactly under a different name. Entries are consumed
+/// once on both sides, so duplicates pair one-to-one.
+fn pair_side_renames(
+    removed: &[(String, usize, FnDef)],
+    added: &[(String, FnDef)],
+) -> Vec<SidePair> {
+    let mut used = vec![false; added.len()];
+    let mut pairs = Vec::new();
+    for (old_name, old_idx, old_def) in removed {
+        let found = added.iter().enumerate().find(|(i, (new_name, new_def))| {
+            !used[*i]
+                && new_name != old_name
+                && rename_score(&new_def.signature, &old_def.signature).is_some()
+        });
+        if let Some((i, (new_name, new_def))) = found {
+            used[i] = true;
+            pairs.push(SidePair {
+                old_name: old_name.clone(),
+                old_idx: *old_idx,
+                new_name: new_name.clone(),
+                new_row: new_def.row,
+            });
+        }
+    }
+    pairs
+}
+
+/// Detect definitions both branches renamed to different names: pair
+/// removals to additions within each side, then join across sides on
+/// `(base name, base index)`. Fires only when both sides paired and the new
+/// names differ; convergent renames join on equal names and stay silent.
+fn find_divergent_renames(
+    removed_ours: &[(String, usize, FnDef)],
+    added_ours: &[(String, FnDef)],
+    removed_theirs: &[(String, usize, FnDef)],
+    added_theirs: &[(String, FnDef)],
+) -> Vec<DivergentRename> {
+    let ours_pairs = pair_side_renames(removed_ours, added_ours);
+    let theirs_pairs = pair_side_renames(removed_theirs, added_theirs);
+    let mut divergent = Vec::new();
+    for tp in &theirs_pairs {
+        if let Some(op) = ours_pairs.iter().find(|op| {
+            op.old_name == tp.old_name && op.old_idx == tp.old_idx && op.new_name != tp.new_name
+        }) {
+            divergent.push(DivergentRename {
+                base_name: tp.old_name.clone(),
+                ours_new_name: op.new_name.clone(),
+                ours_row: op.new_row,
+                theirs_new_name: tp.new_name.clone(),
+                theirs_row: tp.new_row,
+            });
+        }
+    }
+    divergent
 }
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
