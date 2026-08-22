@@ -5,7 +5,7 @@
 use clap::{Parser, Subcommand};
 use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
-use oot::dispute::{Dispute, Docket, Kind, Severity, Verdict};
+use oot::dispute::{finalize_adjudication, Docket, Kind, Severity, Verdict};
 use oot::docket;
 use oot::engine::Engine;
 use oot::policy::MeaningPolicy;
@@ -202,36 +202,15 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let mut disputes = eng.diff_snapshots(&change.base, &change.head)?;
             disputes.extend(vis_disputes);
 
-            let mut touched_paths: Vec<String> = change
-                .base
-                .files
-                .keys()
-                .chain(change.head.files.keys())
-                .filter(|p| change.base.files.get(*p) != change.head.files.get(*p))
-                .cloned()
-                .collect();
-            touched_paths.sort();
-            touched_paths.dedup();
-
-            if touched_paths.is_empty() {
-                disputes.push(Dispute::empty_change());
-            }
-
-            let verdict = if cloaked {
-                Verdict::Cloaked
-            } else if visibility_policy.embargo_until.is_some() {
-                Verdict::Embargoed
-            } else {
-                meaning_policy.evaluate(&disputes)
-            };
-
-            let intent = change.intent.clone().unwrap_or_else(|| {
-                if touched_paths.is_empty() {
-                    "no files changed".into()
-                } else {
-                    touched_paths.join(", ")
-                }
-            });
+            let (disputes, intent, verdict) = finalize_adjudication(
+                disputes,
+                &change.base.files,
+                &change.head.files,
+                intent.clone(),
+                cloaked,
+                visibility_policy.embargo_until.is_some(),
+                &meaning_policy,
+            );
 
             let docket = Docket {
                 change: change.name.clone(),

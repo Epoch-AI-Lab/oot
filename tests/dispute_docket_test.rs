@@ -182,3 +182,22 @@ fn test_docket_render_verdicts() {
     assert!(rendered_adjudicated.contains("verdict:    ▶ ADJUDICATED \n"));
     assert!(rendered_adjudicated.contains("dispute:    none"));
 }
+
+#[test]
+fn test_docket_loads_legacy_scope_field() {
+    // Old saved dockets carry "scope"; the serde alias must keep them loadable.
+    let legacy_json = r#"{
+        "change": "feature/legacy",
+        "source": "git",
+        "base": "main",
+        "head": "feature/legacy",
+        "disputes": [],
+        "scope": "pre-rename intent",
+        "authors": ["@old"],
+        "verdict": "adjudicated",
+        "embargo": null
+    }"#;
+
+    let docket: Docket = serde_json::from_str(legacy_json).expect("legacy docket must load");
+    assert_eq!(docket.intent, "pre-rename intent");
+}

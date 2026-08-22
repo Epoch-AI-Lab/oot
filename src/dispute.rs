@@ -57,8 +57,9 @@ pub struct Dispute {
 impl Dispute {
     /// Low-severity notice that a change contains no file differences.
     ///
-    /// Does not affect blocking or review thresholds; it only makes the
-    /// empty change visible on the docket instead of passing silently.
+    /// Purely informational: [`finalize_adjudication`] evaluates the verdict
+    /// before appending this notice, so it never reaches blocking or review
+    /// thresholds regardless of the meaning policy.
     pub fn empty_change() -> Dispute {
         Dispute {
             id: "D000".into(),
@@ -68,6 +69,54 @@ impl Dispute {
             detail: "no file differences between base and head".into(),
         }
     }
+}
+
+/// Shared adjudication tail used by every entry point (dir snapshots, git, jj).
+///
+/// Computes touched paths, evaluates the verdict, appends the empty-change
+/// notice, and resolves the docket intent. The verdict is evaluated *before*
+/// the notice is appended so the notice cannot influence thresholds.
+///
+/// Returns `(disputes, intent, verdict)`.
+pub fn finalize_adjudication(
+    mut disputes: Vec<Dispute>,
+    base: &std::collections::HashMap<String, String>,
+    head: &std::collections::HashMap<String, String>,
+    user_intent: Option<String>,
+    cloaked: bool,
+    embargo_active: bool,
+    meaning_policy: &crate::policy::MeaningPolicy,
+) -> (Vec<Dispute>, String, Verdict) {
+    let mut touched_paths: Vec<String> = base
+        .keys()
+        .chain(head.keys())
+        .filter(|p| base.get(*p) != head.get(*p))
+        .cloned()
+        .collect();
+    touched_paths.sort();
+    touched_paths.dedup();
+
+    let verdict = if cloaked {
+        Verdict::Cloaked
+    } else if embargo_active {
+        Verdict::Embargoed
+    } else {
+        meaning_policy.evaluate(&disputes)
+    };
+
+    if touched_paths.is_empty() {
+        disputes.push(Dispute::empty_change());
+    }
+
+    let intent = user_intent.unwrap_or_else(|| {
+        if touched_paths.is_empty() {
+            "no files changed".to_string()
+        } else {
+            touched_paths.join(", ")
+        }
+    });
+
+    (disputes, intent, verdict)
 }
 
 /// The final adjudication verdict for a change.

@@ -6,7 +6,7 @@
 //! caller's working copy.
 
 use crate::change::{Change, Snapshot, Source};
-use crate::dispute::{Dispute, Docket, Kind, Severity, Verdict};
+use crate::dispute::{finalize_adjudication, Dispute, Docket, Kind, Severity};
 use crate::engine::Engine;
 use crate::policy::MeaningPolicy;
 use crate::visibility::VisibilityPolicy;
@@ -294,35 +294,15 @@ impl JjAdapter {
             .any(|d| d.kind == Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
-        let mut touched_paths: Vec<String> = base_snapshot
-            .files
-            .keys()
-            .chain(head_snapshot.files.keys())
-            .filter(|p| base_snapshot.files.get(*p) != head_snapshot.files.get(*p))
-            .cloned()
-            .collect();
-        touched_paths.sort();
-        touched_paths.dedup();
-
-        if touched_paths.is_empty() {
-            disputes.push(Dispute::empty_change());
-        }
-
-        let verdict = if cloaked {
-            Verdict::Cloaked
-        } else if visibility_policy.embargo_until.is_some() {
-            Verdict::Embargoed
-        } else {
-            meaning_policy.evaluate(&disputes)
-        };
-
-        let intent = options.intent.clone().unwrap_or_else(|| {
-            if touched_paths.is_empty() {
-                "no files changed".to_string()
-            } else {
-                touched_paths.join(", ")
-            }
-        });
+        let (disputes, intent, verdict) = finalize_adjudication(
+            disputes,
+            &base_snapshot.files,
+            &head_snapshot.files,
+            options.intent.clone(),
+            cloaked,
+            visibility_policy.embargo_until.is_some(),
+            meaning_policy,
+        );
 
         let docket = Docket {
             change: change.name,
