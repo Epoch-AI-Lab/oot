@@ -5,3 +5,6 @@
 !fixtures/repo/head/secrets/.env
 *.DS_Store
 .useit/
+CD_res/session-notes/
+CD_res/product-finding/
+CD_res/implementation/
