@@ -18,3 +18,17 @@ Text conversion happens only in the structural engine at parse time
 store unconverted bytes. Pinned by
 `test_cli_distinct_binaries_are_not_collapsed`.
 
+## ~~Same-named functions tracked by first occurrence only~~ RESOLVED 2026-08-22
+
+`FunctionMap` was `HashMap<name, Def>`, so a second same-key definition in
+one file was dropped with an ambiguity note and the first occurrence's
+changes shadowed the rest. The map now holds every definition
+(`HashMap<String, Vec<FnDef>>`) and diffing aligns each name group by
+content: exact body match first, positional pairing of leftovers, remainder
+becomes added/removed. Qualified keys (`(Type).name`) stay rejected — they
+are unstable under impl-block refactors
+(`test_engine_impl_move_is_not_a_conflict`). Pinned by
+`test_engine_duplicate_function_names_tracked_separately`,
+`test_engine_go_same_name_methods_tracked_separately`, and
+`test_engine_rust_impl_method_collision_tracked_separately`.
+

@@ -74,7 +74,7 @@ Working seed — the engine runs, the docket renders, and git + Jujutsu ingestio
 - [x] Git adapter with 3-way adjudication
 - [x] Jujutsu adapter with 3-way adjudication (`--source jj`, revsets accepted)
 
-**Known limitation:** functions that share a bare name within one file (e.g., a `render` method on two classes, or same-named Go methods on two types) are tracked by first occurrence only; the docket flags them as ambiguous rather than tracking each definition separately.
+Same-named definitions in one file (e.g. a `render` method on two classes) are each tracked separately: diffing matches identical bodies first, then pairs the rest, so only the definition that actually changed is reported.
 
 ## License
 
