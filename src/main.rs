@@ -86,6 +86,11 @@ enum Commands {
         /// Directory to create the exported repository in.
         #[arg(long)]
         out: String,
+        /// Path to a visibility-policy TOML. Defaults to `./visibility.toml`
+        /// when present; with no policy found, export is unfiltered and
+        /// byte-exact.
+        #[arg(long)]
+        visibility: Option<String>,
     },
 }
 
@@ -285,7 +290,24 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        Commands::Export { out } => {
+        Commands::Export { out, visibility } => {
+            let policy = match &visibility {
+                Some(p) => Some(VisibilityPolicy::load(std::path::Path::new(p))?),
+                None => {
+                    let candidate = std::path::Path::new("visibility.toml");
+                    if candidate.exists() {
+                        Some(VisibilityPolicy::load(candidate)?)
+                    } else {
+                        None
+                    }
+                }
+            };
+
+            // An embargo holds every change: there is nothing safe to export.
+            if let Some(date) = policy.as_ref().and_then(|p| p.embargo_until.as_deref()) {
+                anyhow::bail!("export refused: store is under embargo until {date}");
+            }
+
             let out_path = std::path::PathBuf::from(&out);
             if out_path.exists() {
                 anyhow::bail!("export directory already exists: {out}");
@@ -298,11 +320,19 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             if refs.is_empty() {
                 anyhow::bail!("store has no imported history (run `oot import` first)");
             }
-            store.replay(&out_path)?;
+            store.replay(&out_path, policy.as_ref())?;
 
             for (branch, head_id) in &refs {
-                let sha = store.point_ref(&out_path, branch, head_id)?;
-                println!("branch {branch} -> {sha}");
+                match store.branch_head_sha(head_id)? {
+                    Some(sha) => {
+                        store.point_ref(&out_path, branch, &sha)?;
+                        println!("branch {branch} -> {sha}");
+                    }
+                    None => {
+                        store.log_branch_omitted(branch, head_id)?;
+                        println!("branch {branch} omitted (entire history withheld)");
+                    }
+                }
             }
 
             // Point HEAD at the first branch so `git log` works immediately.

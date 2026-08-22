@@ -41,6 +41,14 @@ impl VisibilityPolicy {
         Ok(p)
     }
 
+    /// Whether a touched path matches any private-path fragment.
+    /// The single matching semantic shared by adjudication and export filtering.
+    pub fn path_is_private(&self, path: &str) -> bool {
+        self.private_paths
+            .iter()
+            .any(|p| path.contains(p.trim_start_matches('/')))
+    }
+
     /// Evaluate visibility rules against a change.
     ///
     /// Emits a visibility dispute for:
@@ -63,11 +71,7 @@ impl VisibilityPolicy {
             if !touched {
                 continue;
             }
-            let private = self
-                .private_paths
-                .iter()
-                .any(|p| path.contains(p.trim_start_matches('/')));
-            if private {
+            if self.path_is_private(path) {
                 out.push(Dispute {
                     id: format!("V{:03}", n),
                     location: path.clone(),

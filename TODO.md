@@ -80,14 +80,13 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
 
 ## NEXT (in order)
 
-1. ~~Dogfood for real~~ DONE 2026-08-22: store work committed, `oot-mirror`
-   branch pushed from the export (byte-identical to main, incl. signed
-   merges), CI green. Dogfooding caught two real bugs: signed-merge SHA
-   divergence (fixed, see above) and `parse_offset` rejecting bare-Z UTC
-   dates — CI runners are UTC, so import crashed there but not locally.
-   Pinned by the `Z` case in `test_parse_offset`.
-2. Visibility-filtered export: strip `private-to` paths / hold `embargo-until`
-   changes at export time. This is the point of the whole bridge.
+1. ~~Dogfood for real~~ DONE 2026-08-22.
+2. ~~Visibility-filtered export~~ DONE 2026-08-22: `oot export` auto-loads
+   `./visibility.toml` (or `--visibility <path>`); changes touching private
+   paths are withheld, kept trees are rebuilt minus those paths via temp-index
+   plumbing, children remap to nearest kept ancestors, empty results skipped,
+   embargoed stores refuse export entirely. Every withholding decision lands
+   in `.oot/export-log.jsonl`. Pinned by `tests/export_visibility_test.rs`.
 3. `oot record` — capture working-copy deltas as new changes without git
    (first true "Oot as source of control" write path).
 
@@ -97,6 +96,13 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
 - Signed commits downstream of a rebuilt change lose their signatures
   (reconstruction cannot forge them; SHAs then differ). Unmodified history is
   byte-exact — see resolved friction above.
+- Any filtered export rebuilds ALL commits (identity fast path off), so even
+  clean signed commits lose signatures when one taint exists. Per-subtree
+  reuse is possible later if it matters.
+- Filtered exports still share the store odb via alternates: withheld blobs
+  are unreachable from refs (a push transfers nothing) but resolve locally
+  until `git repack -a -d` runs in the export. Never hand out a filtered
+  export directory alongside its `.oot`.
 - Commit messages must be valid UTF-8 without `\x00`/`\x01`; violations fail loudly.
 - Exported repo reads blobs through alternates; run `git repack -a -d` in the
   export once before deleting `.oot` if you want it standalone.

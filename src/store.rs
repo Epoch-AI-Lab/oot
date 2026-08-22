@@ -12,9 +12,10 @@
 //! A change id is the `git hash-object` SHA of its canonical JSON, so records
 //! are content-addressed like everything else in the store.
 
+use crate::visibility::VisibilityPolicy;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -25,6 +26,9 @@ const OBJECTS_DIR: &str = "objects.git";
 const CHANGES_DIR: &str = "changes";
 const MAP_DIR: &str = "map";
 const REFS_DIR: &str = "refs";
+const EXPORT_LOG: &str = "export-log.jsonl";
+/// Git's well-known empty tree; used to diff root commits against nothing.
+const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
 /// Author or committer identity plus the exact timestamp needed to
 /// reproduce a byte-identical Git commit on export.
@@ -334,7 +338,20 @@ impl Store {
     /// - Reconstruction path: otherwise `git commit-tree` rebuilds the commit
     ///   from preserved author/committer/timestamps/message/tree plus remapped
     ///   parents (used downstream of filtered or rewritten history).
-    pub fn replay(&self, out_repo: &Path) -> Result<Vec<(String, String)>> {
+    ///
+    /// With a visibility policy whose `private_paths` are non-empty, export
+    /// runs filtered: every change touching a private path is withheld, every
+    /// kept tree is rewritten minus those paths, children remap to their
+    /// nearest kept ancestors, and changes left empty by stripping are
+    /// skipped. Every withholding decision lands in `.oot/export-log.jsonl`.
+    /// Filtering any part of history disables the identity fast path for the
+    /// whole export — rebuilt history must be internally consistent, so no
+    /// original objects are reused alongside it.
+    pub fn replay(
+        &self,
+        out_repo: &Path,
+        policy: Option<&VisibilityPolicy>,
+    ) -> Result<Vec<(String, String)>> {
         // Attach the store's odb permanently so every later git operation in
         // the exported repo (update-ref, log, push) resolves our objects.
         // Content addressing means commits already present via alternates are
@@ -350,13 +367,40 @@ impl Store {
                 .as_encoded_bytes(),
         )?;
 
+        let filtering = policy.is_some_and(|p| !p.private_paths.is_empty());
+
+        // Taint pass: decide once, up front, which changes touch private paths.
+        let mut withheld: HashMap<String, String> = HashMap::new();
+        if filtering {
+            let pol = policy.expect("checked above");
+            for id in self.index()? {
+                let record = self.get_change(&id)?;
+                let hits: Vec<String> = self
+                    .touched_paths(&record)?
+                    .into_iter()
+                    .filter(|p| pol.path_is_private(p))
+                    .collect();
+                if !hits.is_empty() {
+                    withheld.insert(id, format!("private path match: {}", hits.join(", ")));
+                }
+            }
+        }
+
+        let index_file = self.root.join("export").join("rebuild-index.tmp");
         let mut sha_of: HashMap<String, String> = HashMap::new();
         let mut source_sha_of: HashMap<String, String> = HashMap::new();
+        // Exported sha -> rebuilt tree sha (filtered mode only).
+        let mut tree_of: HashMap<String, String> = HashMap::new();
         let mut exported = Vec::new();
 
         for id in self.index()? {
             let record = self.get_change(&id)?;
             if let Some(sha) = self.exported_sha(&id)? {
+                if filtering {
+                    let tree =
+                        self.strip_tree(out_repo, &record.tree, policy.unwrap(), &index_file)?;
+                    tree_of.insert(sha.clone(), tree);
+                }
                 sha_of.insert(id.clone(), sha.clone());
                 exported.push((id, sha));
                 continue;
@@ -364,40 +408,64 @@ impl Store {
 
             // Identity fast path: reuse the original commit object when the
             // whole ancestry below is byte-exact, so signatures and other
-            // extra headers survive without reconstruction.
-            if let Some(orig) = &record.source_sha {
-                let parents_exact = record.parents.iter().all(|p| {
-                    sha_of
-                        .get(p)
-                        .is_some_and(|e| source_sha_of.get(p) == Some(e))
-                });
-                if parents_exact && self.commit_object_exists(orig)? {
-                    std::fs::write(self.export_map_path(&id), orig)?;
-                    sha_of.insert(id.clone(), orig.clone());
-                    source_sha_of.insert(id.clone(), orig.clone());
-                    exported.push((id.clone(), orig.clone()));
-                    continue;
+            // extra headers survive without reconstruction. Never taken while
+            // filtering: reused objects must not mix with rebuilt history.
+            if !filtering {
+                if let Some(orig) = &record.source_sha {
+                    let parents_exact = record.parents.iter().all(|p| {
+                        sha_of
+                            .get(p)
+                            .is_some_and(|e| source_sha_of.get(p) == Some(e))
+                    });
+                    if parents_exact && self.commit_object_exists(orig)? {
+                        std::fs::write(self.export_map_path(&id), orig)?;
+                        sha_of.insert(id.clone(), orig.clone());
+                        source_sha_of.insert(id.clone(), orig.clone());
+                        exported.push((id.clone(), orig.clone()));
+                        continue;
+                    }
                 }
             }
 
-            let mut cmd = Command::new("git");
-            cmd.args(["--git-dir"])
-                .arg(out_repo.join(".git"))
-                .arg("commit-tree")
-                .arg(&record.tree)
-                .env(
-                    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                    self.git_dir().join("objects"),
-                )
-                .env("GIT_AUTHOR_NAME", &record.author.name)
-                .env("GIT_AUTHOR_EMAIL", &record.author.email)
-                .env("GIT_AUTHOR_DATE", record.author.date_env())
-                .env("GIT_COMMITTER_NAME", &record.committer.name)
-                .env("GIT_COMMITTER_EMAIL", &record.committer.email)
-                .env("GIT_COMMITTER_DATE", record.committer.date_env())
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+            // Filtered path: withhold tainted changes, strip kept trees,
+            // remap parents to nearest kept ancestors.
+            if filtering {
+                if let Some(reason) = withheld.get(&id) {
+                    self.log_withheld(&id, record.source_sha.as_deref(), reason)?;
+                    continue;
+                }
+                let pol = policy.unwrap();
+                let tree = self.strip_tree(out_repo, &record.tree, pol, &index_file)?;
+                let mut parent_shas: Vec<String> = Vec::new();
+                for p in &record.parents {
+                    for anc in self.nearest_kept(p, &sha_of)? {
+                        if !parent_shas.contains(&anc) {
+                            parent_shas.push(anc);
+                        }
+                    }
+                }
+
+                // A change left empty by stripping carries nothing over its
+                // kept ancestry: skip it rather than ship an empty commit.
+                // Root commits are always kept so children retain a root.
+                let empty_over_ancestry = !parent_shas.is_empty()
+                    && parent_shas.iter().all(|p| tree_of.get(p) == Some(&tree));
+                if empty_over_ancestry {
+                    let why = "empty after private-path stripping".to_string();
+                    self.log_withheld(&id, record.source_sha.as_deref(), &why)?;
+                    continue;
+                }
+
+                let mut cmd = self.commit_tree_cmd(out_repo, &tree, &record);
+                for p in &parent_shas {
+                    cmd.args(["-p", p]);
+                }
+                let sha = self.finish_commit(cmd, &record.message, &id)?;
+                tree_of.insert(sha.clone(), tree);
+                sha_of.insert(id.clone(), sha.clone());
+                exported.push((id.clone(), sha));
+                continue;
+            }
 
             let missing = record
                 .parents
@@ -407,44 +475,252 @@ impl Store {
             if missing > 0 {
                 bail!("change {id} references unexported parents");
             }
+            let mut cmd = self.commit_tree_cmd(out_repo, &record.tree, &record);
             for p in &record.parents {
                 cmd.args(["-p", &sha_of[p]]);
             }
-
-            let mut child = cmd.spawn().context("failed to run git commit-tree")?;
-            use std::io::Write;
-            child
-                .stdin
-                .take()
-                .context("commit-tree has no stdin")?
-                .write_all(record.message.as_bytes())?;
-            let output = child.wait_with_output()?;
-            if !output.status.success() {
-                bail!(
-                    "commit-tree failed for change {id}: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            let sha = String::from_utf8(output.stdout)?.trim().to_string();
-            std::fs::create_dir_all(self.root.join("export"))?;
-            std::fs::write(self.export_map_path(&id), &sha)?;
+            let sha = self.finish_commit(cmd, &record.message, &id)?;
             sha_of.insert(id.clone(), sha.clone());
             exported.push((id, sha));
         }
         Ok(exported)
     }
 
-    /// Update a branch ref in the exported repository to point at the
-    /// exported commit for change id `head_id`.
-    pub fn point_ref(&self, out_repo: &Path, branch: &str, head_id: &str) -> Result<String> {
-        let sha = self
-            .exported_sha(head_id)?
-            .ok_or_else(|| anyhow!("change {head_id} has not been exported yet"))?;
+    /// Nearest exported ancestors of change `id`, walking up through any
+    /// changes that were withheld or skipped. Order-stable and deduped.
+    fn nearest_kept(&self, id: &str, sha_of: &HashMap<String, String>) -> Result<Vec<String>> {
+        let mut out: Vec<String> = Vec::new();
+        let mut queue = vec![id.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(id.to_string());
+        while let Some(cur) = queue.pop() {
+            if let Some(sha) = sha_of.get(&cur) {
+                if !out.contains(sha) {
+                    out.push(sha.clone());
+                }
+                continue;
+            }
+            for p in self.get_change(&cur)?.parents {
+                if seen.insert(p.clone()) {
+                    queue.push(p);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// The exported head commit for a branch whose head change is `head_id`,
+    /// walking up through withheld/skipped changes. `None` means the branch's
+    /// entire history was withheld and the ref should be omitted.
+    pub fn branch_head_sha(&self, head_id: &str) -> Result<Option<String>> {
+        let mut queue = vec![head_id.to_string()];
+        let mut seen: HashSet<String> = HashSet::new();
+        seen.insert(head_id.to_string());
+        while let Some(cur) = queue.pop() {
+            if let Some(sha) = self.exported_sha(&cur)? {
+                return Ok(Some(sha));
+            }
+            for p in self.get_change(&cur)?.parents {
+                if seen.insert(p.clone()) {
+                    queue.push(p);
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Paths a change touches relative to each of its parents, read straight
+    /// from the store's odb. A merge's touched set is the union over its
+    /// parents; root commits diff against git's empty tree.
+    pub fn touched_paths(&self, record: &ChangeRecord) -> Result<Vec<String>> {
+        let parent_trees: Vec<String> = if record.parents.is_empty() {
+            vec![EMPTY_TREE.to_string()]
+        } else {
+            record
+                .parents
+                .iter()
+                .map(|p| Ok(self.get_change(p)?.tree))
+                .collect::<Result<Vec<_>>>()?
+        };
+        let mut out = Vec::new();
+        for pt in parent_trees {
+            let output = Command::new("git")
+                .args(["--git-dir"])
+                .arg(self.git_dir())
+                .args(["diff-tree", "-r", "-z", "--name-only", &pt, &record.tree])
+                .output()
+                .context("failed to diff trees in the store's odb")?;
+            if !output.status.success() {
+                bail!(
+                    "diff-tree failed for {}: {}",
+                    record.tree,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            out.extend(
+                output
+                    .stdout
+                    .split(|&b| b == 0)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| String::from_utf8_lossy(s).to_string()),
+            );
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// Rebuild `tree` minus every path matching the policy's private
+    /// fragments. Pure plumbing against a temporary index; deterministic for
+    /// a given tree + policy. Derived objects land in the export's odb.
+    fn strip_tree(
+        &self,
+        out_repo: &Path,
+        tree: &str,
+        policy: &VisibilityPolicy,
+        index_file: &Path,
+    ) -> Result<String> {
+        let git_cmd = || {
+            let mut c = Command::new("git");
+            c.args(["--git-dir"]);
+            c.arg(out_repo.join(".git"));
+            c.env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                self.git_dir().join("objects"),
+            );
+            c.env("GIT_INDEX_FILE", index_file);
+            c
+        };
+        run(git_cmd().args(["read-tree", tree]))?;
+
+        let listed = git_cmd()
+            .args(["ls-files", "-z"])
+            .output()
+            .context("failed to list the rebuild index")?;
+        if !listed.status.success() {
+            bail!(
+                "git ls-files failed during strip: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            );
+        }
+        let victims: Vec<String> = listed
+            .stdout
+            .split(|&b| b == 0)
+            .filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).to_string())
+            .filter(|p| policy.path_is_private(p))
+            .collect();
+        if !victims.is_empty() {
+            run(git_cmd()
+                .args(["update-index", "--force-remove", "--"])
+                .args(&victims))?;
+        }
+
+        let written = git_cmd()
+            .args(["write-tree"])
+            .output()
+            .context("failed to write the stripped tree")?;
+        if !written.status.success() {
+            bail!(
+                "git write-tree failed during strip: {}",
+                String::from_utf8_lossy(&written.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8(written.stdout)?.trim().to_string())
+    }
+
+    /// A `git commit-tree` invocation preset with this record's identity and
+    /// timestamps; callers append `-p <sha>` per parent and pipe the message.
+    fn commit_tree_cmd(&self, out_repo: &Path, tree: &str, record: &ChangeRecord) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.args(["--git-dir"])
+            .arg(out_repo.join(".git"))
+            .arg("commit-tree")
+            .arg(tree)
+            .env(
+                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+                self.git_dir().join("objects"),
+            )
+            .env("GIT_AUTHOR_NAME", &record.author.name)
+            .env("GIT_AUTHOR_EMAIL", &record.author.email)
+            .env("GIT_AUTHOR_DATE", record.author.date_env())
+            .env("GIT_COMMITTER_NAME", &record.committer.name)
+            .env("GIT_COMMITTER_EMAIL", &record.committer.email)
+            .env("GIT_COMMITTER_DATE", record.committer.date_env())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        cmd
+    }
+
+    /// Pipe the message into a prepared commit-tree command, cache the result
+    /// in the export map, and return the new commit sha.
+    fn finish_commit(&self, mut cmd: Command, message: &str, id: &str) -> Result<String> {
+        let mut child = cmd.spawn().context("failed to run git commit-tree")?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .context("commit-tree has no stdin")?
+            .write_all(message.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            bail!(
+                "commit-tree failed for change {id}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        let sha = String::from_utf8(output.stdout)?.trim().to_string();
+        std::fs::create_dir_all(self.root.join("export"))?;
+        std::fs::write(self.export_map_path(id), &sha)?;
+        Ok(sha)
+    }
+
+    /// Append one withholding decision to `.oot/export-log.jsonl`. This is
+    /// the audit trail for filtered exports: it says exactly what was left
+    /// out of an export and why, before anyone pushes anything anywhere.
+    fn log_withheld(&self, id: &str, source_sha: Option<&str>, reason: &str) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "withheld-change",
+            "change": id,
+            "source_sha": source_sha,
+            "reason": reason,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Record that a whole branch was omitted from an export because its head
+    /// history was entirely withheld.
+    pub fn log_branch_omitted(&self, branch: &str, head_id: &str) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "branch-omitted",
+            "branch": branch,
+            "change": head_id,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Update a branch ref in the exported repository to point at `sha`.
+    pub fn point_ref(&self, out_repo: &Path, branch: &str, sha: &str) -> Result<()> {
         run(Command::new("git")
             .args(["--git-dir"])
             .arg(out_repo.join(".git"))
-            .args(["update-ref", &format!("refs/heads/{branch}"), &sha]))?;
-        Ok(sha)
+            .args(["update-ref", &format!("refs/heads/{branch}"), sha]))?;
+        Ok(())
     }
 
     fn export_map_path(&self, id: &str) -> PathBuf {
@@ -568,6 +844,13 @@ pub fn parse_offset(iso: &str) -> Result<String> {
         4 => Ok(format!("{sign}{digits}")),
         _ => bail!("unsupported timezone offset in date '{iso}'"),
     }
+}
+
+fn now_epoch() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
