@@ -51,3 +51,11 @@ right; only line numbers are swapped. Right fix: similarity-based leftover
 pairing (edit distance or tree-sitter diff hash) instead of document order.
 Trigger: when a docket consumer starts using dispute rows for navigation.
 
+## Fallback conflict message says "modified" for pure deletion divergence
+
+When both branches delete different copies of a same-named def, the High
+dispute reuses the "both branches modified function `X` differently"
+wording (severity is correct, only the verb is off). Right fix: a dedicated
+"deleted differently" message variant. Trigger: first docket consumer that
+pattern-matches dispute details.
+

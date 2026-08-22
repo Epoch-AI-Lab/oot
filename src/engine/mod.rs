@@ -301,6 +301,16 @@ impl Engine {
                             // Convergent clean change
                             continue;
                         }
+                        // When neither side deleted anything, identical defs
+                        // converged and a leftover on one side alone is an
+                        // additive duplication, not a conflict.
+                        if o_gone.is_empty()
+                            && t_gone.is_empty()
+                            && (strip_common(o_list, t_list).is_empty()
+                                || strip_common(t_list, o_list).is_empty())
+                        {
+                            continue;
+                        }
                         // Divergent modifications -> 3-way semantic conflict
                         let row = t_list
                             .first()
@@ -481,6 +491,21 @@ fn contained_in(a: &[FnDef], b: &[FnDef]) -> bool {
         }
     }
     true
+}
+
+/// The defs of `a` that have no identical counterpart in `b`.
+fn strip_common<'a>(a: &'a [FnDef], b: &[FnDef]) -> Vec<&'a FnDef> {
+    let mut rest: Vec<&str> = b.iter().map(|d| d.src.as_str()).collect();
+    let mut leftover = Vec::new();
+    for d in a {
+        match rest.iter().position(|s| *s == d.src) {
+            Some(i) => {
+                rest.swap_remove(i);
+            }
+            None => leftover.push(d),
+        }
+    }
+    leftover
 }
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
@@ -1013,6 +1038,53 @@ mod tests {
             "superset additions must not fabricate a conflict, got {:?}",
             disputes
         );
+    }
+
+    #[test]
+    fn test_engine_3way_identical_mutation_plus_duplication_is_clean() {
+        // Regression: both branches converge on the same body and theirs
+        // additionally keeps a second copy. The merge is a trivial union.
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn f() -> i32 { 1 }\n"),
+                &snap("pub fn f() -> i32 { 42 }\n"),
+                &snap("pub fn f() -> i32 { 42 }\npub fn f() -> i32 { 42 }\n"),
+            )
+            .unwrap();
+
+        assert!(
+            !disputes.iter().any(|d| d.severity == Severity::High),
+            "identical mutation plus duplication must not conflict, got {:?}",
+            disputes
+        );
+    }
+
+    #[test]
+    fn test_engine_3way_shared_deletion_with_converged_edit_is_clean() {
+        // Both sides delete `f` and converge on `g`: clean, as before.
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn f() -> i32 { 1 }\npub fn g() -> i32 { 2 }\n"),
+                &snap("pub fn g() -> i32 { 42 }\n"),
+                &snap("pub fn g() -> i32 { 42 }\n"),
+            )
+            .unwrap();
+
+        assert!(disputes.is_empty(), "got {:?}", disputes);
     }
 
     #[test]
