@@ -251,7 +251,7 @@ impl Engine {
                             && t_changed.is_empty()
                             && t_gone.is_empty()
                         {
-                            if same_defs(o_list, t_list) {
+                            if contained_in(o_list, t_list) || contained_in(t_list, o_list) {
                                 continue;
                             }
                             let row = t_list
@@ -297,7 +297,7 @@ impl Engine {
                             continue;
                         }
                         // Case 3: Both branches modified relative to base
-                        if same_defs(o_list, t_list) {
+                        if contained_in(o_list, t_list) && contained_in(t_list, o_list) {
                             // Convergent clean change
                             continue;
                         }
@@ -469,13 +469,18 @@ fn align_defs(base: &[FnDef], head: &[FnDef]) -> (Vec<(usize, usize)>, Vec<usize
     (changed, gone, fresh)
 }
 
-/// Whether two def lists hold the same source texts, ignoring order.
-fn same_defs(a: &[FnDef], b: &[FnDef]) -> bool {
-    let mut sa: Vec<&str> = a.iter().map(|d| d.src.as_str()).collect();
-    let mut sb: Vec<&str> = b.iter().map(|d| d.src.as_str()).collect();
-    sa.sort_unstable();
-    sb.sort_unstable();
-    sa == sb
+/// Whether every def in `a` also appears in `b` (multiplicity-aware).
+fn contained_in(a: &[FnDef], b: &[FnDef]) -> bool {
+    let mut rest: Vec<&str> = b.iter().map(|d| d.src.as_str()).collect();
+    for d in a {
+        match rest.iter().position(|s| *s == d.src) {
+            Some(i) => {
+                rest.swap_remove(i);
+            }
+            None => return false,
+        }
+    }
+    true
 }
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
@@ -982,6 +987,32 @@ mod tests {
             .unwrap();
 
         assert!(disputes.is_empty(), "got {:?}", disputes);
+    }
+
+    #[test]
+    fn test_engine_3way_superset_addition_is_clean() {
+        // Regression: ours' addition appearing verbatim inside theirs'
+        // additions is a trivial union, not a conflict.
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn a() {}\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 5 }\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 5 }\npub fn f() -> i32 { 6 }\n"),
+            )
+            .unwrap();
+
+        assert!(
+            !disputes.iter().any(|d| d.severity == Severity::High),
+            "superset additions must not fabricate a conflict, got {:?}",
+            disputes
+        );
     }
 
     #[test]
