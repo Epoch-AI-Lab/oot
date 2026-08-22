@@ -125,7 +125,10 @@ fn test_git_adapter_snapshot_extraction() {
         snapshot.files.get("src/lib.rs").unwrap(),
         "pub fn compute() -> i32 { 42 }\n\npub fn auth() -> bool { true }\n".as_bytes()
     );
-    assert_eq!(snapshot.files.get("assets/blob.bin").unwrap(), &[0xFF, 0x00, 0x81]);
+    assert_eq!(
+        snapshot.files.get("assets/blob.bin").unwrap(),
+        &[0xFF, 0x00, 0x81]
+    );
 }
 
 #[test]
