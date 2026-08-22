@@ -80,14 +80,14 @@ an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
 
 ## NEXT (in order)
 
-1. Dogfood for real: `oot init && oot import && oot export --out ../oot-git`
-   in this repo, push the export to GitHub as a mirror branch, verify CI green.
-   Local part DONE 2026-08-22: all 42 commits byte-identical incl. the 4
-   signed GitHub merges (see resolved friction above). Remaining: commit the
-   store work, push mirror, check CI.
+1. ~~Dogfood for real~~ DONE 2026-08-22: store work committed, `oot-mirror`
+   branch pushed from the export (byte-identical to main, incl. signed
+   merges), CI green. Dogfooding caught two real bugs: signed-merge SHA
+   divergence (fixed, see above) and `parse_offset` rejecting bare-Z UTC
+   dates — CI runners are UTC, so import crashed there but not locally.
+   Pinned by the `Z` case in `test_parse_offset`.
 2. Visibility-filtered export: strip `private-to` paths / hold `embargo-until`
-   changes at export time. This is the point of the whole bridge — do it only
-   after step 1 proves the faithful path.
+   changes at export time. This is the point of the whole bridge.
 3. `oot record` — capture working-copy deltas as new changes without git
    (first true "Oot as source of control" write path).
 
