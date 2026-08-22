@@ -9,4 +9,5 @@ pub mod dispute;
 pub mod docket;
 pub mod engine;
 pub mod policy;
+pub mod store;
 pub mod visibility;

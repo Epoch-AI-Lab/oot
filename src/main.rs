@@ -2,6 +2,7 @@
 //!
 //! Adjudicates changes across snapshots against meaning and visibility policies.
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
@@ -10,6 +11,9 @@ use oot::docket;
 use oot::engine::Engine;
 use oot::policy::MeaningPolicy;
 use oot::visibility::VisibilityPolicy;
+use std::process::Command;
+
+use oot::store::Store;
 
 /// Command-line parser for the Oot CLI.
 #[derive(Parser)]
@@ -66,6 +70,20 @@ enum Commands {
         /// Path to save the resulting docket as JSON.
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+    /// Initialize an Oot store (`.oot/`) in the current project.
+    Init,
+    /// Import git history from a repository into the Oot store.
+    Import {
+        /// Source git repository (defaults to discovering from the current directory).
+        #[arg(long)]
+        repo: Option<String>,
+    },
+    /// Export the store's history as a plain git repository ready for push.
+    Export {
+        /// Directory to create the exported repository in.
+        #[arg(long)]
+        out: String,
     },
 }
 
@@ -232,7 +250,85 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
 
             Ok(exit_code_for(docket.verdict))
         }
+        Commands::Init => {
+            let store = Store::init(".")?;
+            println!("initialized Oot store at {}", store.path().display());
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::Import { repo } => {
+            let source = match repo {
+                Some(r) => GitAdapter::new(&r)?,
+                None => GitAdapter::discover()?,
+            };
+            let store = Store::open(".")?;
+            let branches = store.fetch_branches(source.repo_root())?;
+            if branches.is_empty() {
+                anyhow::bail!("source repository has no branches");
+            }
+
+            for branch in &branches {
+                let commits = store.log_raw(source.repo_root(), branch)?;
+                if commits.is_empty() {
+                    eprintln!("branch {branch}: no commits, skipped");
+                    continue;
+                }
+                let mut head_id = String::new();
+                for raw in &commits {
+                    let id = store.put_commit(raw)?;
+                    store.index_push(&id)?;
+                    head_id = id;
+                }
+                store.set_ref(branch, &head_id)?;
+                println!("branch {branch}: {} change(s) imported", commits.len());
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::Export { out } => {
+            let out_path = std::path::PathBuf::from(&out);
+            if out_path.exists() {
+                anyhow::bail!("export directory already exists: {out}");
+            }
+            std::fs::create_dir_all(&out_path)?;
+            run_git(&["init", "--quiet"], &out_path)?;
+
+            let store = Store::open(".")?;
+            let refs = store.refs()?;
+            if refs.is_empty() {
+                anyhow::bail!("store has no imported history (run `oot import` first)");
+            }
+            store.replay(&out_path)?;
+
+            for (branch, head_id) in &refs {
+                let sha = store.point_ref(&out_path, branch, head_id)?;
+                println!("branch {branch} -> {sha}");
+            }
+
+            // Point HEAD at the first branch so `git log` works immediately.
+            let first = format!("refs/heads/{}", refs[0].0);
+            run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
+
+            println!(
+                "exported to {out}\nnext: cd {out} && git remote add origin <url> && git push -u origin --all"
+            );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
     }
+}
+
+fn run_git(args: &[&str], cwd: &std::path::Path) -> anyhow::Result<()> {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .with_context(|| format!("failed to run git {}", args.join(" ")))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Exit-code contract for `oot adjudicate`:

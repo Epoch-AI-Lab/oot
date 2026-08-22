@@ -2,35 +2,19 @@
 
 ## ~~Fixture `.env` policy noise~~ RESOLVED 2026-08-21
 
-Originally `VisibilityPolicy::check` flagged private-path fragments against
-*every* file in the head snapshot, so the intentional `.env` fixture cloaked
-every change. Fixed by aligning the code with its own documented contract:
-only paths *touched* by a change (added, removed, or content-modified vs
-base) are checked. See `test_visibility_policy_only_flags_touched_private_paths`.
+Only paths *touched* by a change are checked against private-path policy now.
+Pinned by `test_visibility_policy_only_flags_touched_private_paths`.
 
 ## ~~Binary change detection is lossy~~ RESOLVED 2026-08-22
 
-`Snapshot.files` now stores raw bytes (`HashMap<String, Vec<u8>>`). Change
-detection compares bytes exactly, so two distinct binaries never compare
-equal even when their lossy text collapses to the same U+FFFD sequence.
-Text conversion happens only in the structural engine at parse time
-(`as_text`, src/engine/mod.rs). All three ingestion paths (dir, git, jj)
-store unconverted bytes. Pinned by
-`test_cli_distinct_binaries_are_not_collapsed`.
+`Snapshot.files` stores raw bytes; text conversion happens only at parse time.
+Pinned by `test_cli_distinct_binaries_are_not_collapsed`.
 
 ## ~~Same-named functions tracked by first occurrence only~~ RESOLVED 2026-08-22
 
-`FunctionMap` was `HashMap<name, Def>`, so a second same-key definition in
-one file was dropped with an ambiguity note and the first occurrence's
-changes shadowed the rest. The map now holds every definition
-(`HashMap<String, Vec<FnDef>>`) and diffing aligns each name group by
-content: exact body match first, positional pairing of leftovers, remainder
-becomes added/removed. Qualified keys (`(Type).name`) stay rejected — they
-are unstable under impl-block refactors
-(`test_engine_impl_move_is_not_a_conflict`). Pinned by
-`test_engine_duplicate_function_names_tracked_separately`,
-`test_engine_go_same_name_methods_tracked_separately`, and
-`test_engine_rust_impl_method_collision_tracked_separately`.
+`FunctionMap` holds every same-named definition and diffing aligns each name
+group by content. Pinned by `test_engine_duplicate_function_names_tracked_separately`
+and friends.
 
 ## Rename/rename divergence is swallowed
 
@@ -59,3 +43,61 @@ wording (severity is correct, only the verb is off). Right fix: a dedicated
 "deleted differently" message variant. Trigger: first docket consumer that
 pattern-matches dispute details.
 
+## ~~Signed commits lose their signatures~~ RESOLVED 2026-08-22
+
+Dogfooding on this repo found it immediately: 4 GitHub-signed merge commits
+diverged on export, rewriting every downstream SHA. Fix: export now reuses the
+original commit object from the store odb whenever every parent exported to
+its own original sha (`source_sha` on `ChangeRecord` + identity fast path in
+`replay`). Signatures only break downstream of genuinely rebuilt changes —
+exactly where step 2's visibility filtering will rebuild anyway.
+Pinned by `tests/store_roundtrip_test.rs::test_roundtrip_preserves_extra_commit_headers`.
+
+# In progress: Oot store + git exporter (dogfooding Oot on Oot)
+
+Decision (2026-08-22): Oot becomes future source control. Bridge to GitHub is
+an exporter, not a fork of git. Storage is a bare git odb inside `.oot/`
+(jj-style: model is ours, bytes are git's).
+
+## DONE — all tests green (`cargo test`: 11 suites, incl. round-trip)
+
+- `src/store.rs` — `.oot/` store: bare git odb at `.oot/objects.git`,
+  `changes/<id>.json` records content-addressed via `git hash-object`,
+  `.oot/map/<orig-sha>` for idempotent import, `.oot/refs/<branch>`,
+  append-only `.oot/.index` in import order.
+- Parents are stored as **change ids** (not original commit shas) so the DAG
+  lives in Oot's own address space.
+- CLI: `oot init`, `oot import --repo <src>` (all branches), `oot export --out <dir>`.
+- Export attaches the store odb via `<out>/.git/objects/info/alternates`.
+  Because trees/authors/timestamps/offsets/messages/parents are preserved,
+  git reproduces **byte-identical commit SHAs** — pinned by
+  `tests/store_roundtrip_test.rs::test_full_roundtrip_preserves_every_commit_sha`
+  (merge commit, binary blob, unicode message, non-UTC offsets).
+- Gotchas already hit (do not rediscover): root commits have empty `%P`;
+  `git log --pretty=format:` inserts `\n` between entries (records use `\x01`);
+  `commit-tree`/`hash-object` skip writing objects that already exist via
+  alternates, which is why update-ref needed the alternates *file*, not just env.
+
+## NEXT (in order)
+
+1. Dogfood for real: `oot init && oot import && oot export --out ../oot-git`
+   in this repo, push the export to GitHub as a mirror branch, verify CI green.
+   Local part DONE 2026-08-22: all 42 commits byte-identical incl. the 4
+   signed GitHub merges (see resolved friction above). Remaining: commit the
+   store work, push mirror, check CI.
+2. Visibility-filtered export: strip `private-to` paths / hold `embargo-until`
+   changes at export time. This is the point of the whole bridge — do it only
+   after step 1 proves the faithful path.
+3. `oot record` — capture working-copy deltas as new changes without git
+   (first true "Oot as source of control" write path).
+
+## Deliberate cuts (v1)
+
+- Tags and annotated tags are not imported/exported.
+- Signed commits downstream of a rebuilt change lose their signatures
+  (reconstruction cannot forge them; SHAs then differ). Unmodified history is
+  byte-exact — see resolved friction above.
+- Commit messages must be valid UTF-8 without `\x00`/`\x01`; violations fail loudly.
+- Exported repo reads blobs through alternates; run `git repack -a -d` in the
+  export once before deleting `.oot` if you want it standalone.
+- No gc/pruning in the store yet.
