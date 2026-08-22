@@ -1,8 +1,16 @@
 # Oot governing Oot.
 #
-# Path fragments (substring match) that must never appear in a change's
-# head snapshot. Touched paths raise High-severity visibility disputes,
-# which cloak the change and exit nonzero.
+# This one file feeds two consumers:
+#
+# - `oot adjudicate`: a change whose head snapshot touches a path below
+#   raises a High-severity visibility dispute. The change is cloaked and
+#   the run exits nonzero.
+# - `oot export`: changes touching these paths are withheld entirely, kept
+#   trees are rebuilt minus those paths, and an active embargo schedule
+#   makes export refuse outright. Every decision lands in
+#   `.oot/export-log.jsonl`.
+#
+# Path fragments are matched by substring against touched paths.
 private_paths = [".env", "secrets/", ".pem"]
 
 # No embargo schedule for this repo yet; add `embargo_until = "YYYY-MM-DD"`
