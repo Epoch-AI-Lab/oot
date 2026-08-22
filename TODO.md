@@ -299,7 +299,7 @@ court; the declared direction is that it becomes the source control itself."
 
 - [ ] PR-O1 fix/rename-rename-dispute
 - [ ] PR-O2 docs/positioning
-- [ ] PR-O3 feat/store-court
+- [x] PR-O3 feat/store-court
 - [ ] PR-O4 feat/oot-update
 
 Mark your PR's box `[x]` in the same branch before opening it.
