@@ -2,7 +2,7 @@
 name = "oot"
 version = "0.1.0"
 edition = "2021"
-description = "Git settles lines. Oot settles meaning."
+description = "Repos track lines. Oot governs changes: who may see them, what they mean, and when they may ship."
 license = "MIT"
 
 [dependencies]
