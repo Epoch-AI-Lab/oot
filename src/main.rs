@@ -6,6 +6,7 @@ use anyhow::Context;
 use clap::{Parser, Subcommand};
 use oot::adapter::{GitAdapter, GitAdjudicateOptions, JjAdapter, JjAdjudicateOptions};
 use oot::change::{Change, Snapshot, Source};
+use oot::court;
 use oot::dispute::{finalize_adjudication, Docket, Kind, Severity, Verdict};
 use oot::docket;
 use oot::engine::Engine;
@@ -72,6 +73,10 @@ enum Commands {
         /// Path to save the resulting docket as JSON.
         #[arg(long, short = 'o')]
         output: Option<String>,
+        /// Store mode only: skip persisting the docket into `.oot/dockets/`
+        /// and the `.oot/adjudications.jsonl` audit trail.
+        #[arg(long)]
+        no_save: bool,
     },
     /// Initialize an Oot store (`.oot/`) in the current project.
     Init,
@@ -115,6 +120,11 @@ enum Commands {
         #[arg(long)]
         visibility: Option<String>,
     },
+    /// Render a docket persisted by a previous `oot adjudicate --change`.
+    Docket {
+        /// Change id or unique prefix.
+        id: String,
+    },
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
@@ -135,6 +145,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             visibility,
             docket,
             output,
+            no_save,
         } => {
             if let Some(path) = docket {
                 let d = docket::load(std::path::Path::new(&path))?;
@@ -151,6 +162,50 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 None => VisibilityPolicy::default(),
             };
             let eng = Engine::new()?;
+
+            // Store-backed adjudication: `--change <id|prefix>` engages only
+            // when an Oot store opens here and no other adjudication mode was
+            // requested; otherwise the existing modes below behave untouched.
+            // Once engaged, an unresolvable id fails loudly rather than
+            // silently falling through.
+            let other_mode = source.is_some()
+                || base.is_some()
+                || head.is_some()
+                || base_ref.is_some()
+                || head_ref.is_some()
+                || repo.is_some()
+                || docket.is_some();
+            let store = match (change.clone(), other_mode) {
+                (Some(_), false) => Store::open(".").ok(),
+                _ => None,
+            };
+            if let Some(store) = store {
+                let change_flag = change.as_deref().expect("checked above");
+                let id = store.resolve_change(change_flag)?;
+                let authors_list = authors.as_ref().map(|a| {
+                    a.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                });
+                let persisted = court::adjudicate_change(
+                    &store,
+                    &id,
+                    &eng,
+                    &meaning_policy,
+                    &visibility_policy,
+                    intent.clone(),
+                    authors_list,
+                )?;
+                print!("{}", persisted.docket.render());
+                if !no_save {
+                    court::save_docket(&store, &persisted)?;
+                    court::log_adjudication(&store, &persisted)?;
+                }
+                if let Some(out_path) = output {
+                    docket::save(&persisted.docket, std::path::Path::new(&out_path))?;
+                }
+                return Ok(exit_code_for(persisted.docket.verdict));
+            }
 
             // VCS 3-way In-Memory Adjudication (git or jj)
             if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
@@ -353,6 +408,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 "recorded {id} on {branch} as {kind}: {} file(s)",
                 files.len()
             );
+            println!("next: oot adjudicate --change {}", &id[..7]);
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Status { branch } => {
@@ -512,6 +568,13 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             println!(
                 "exported to {out}\nnext: cd {out} && git remote add origin <url> && git push -u origin --all"
             );
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::Docket { id } => {
+            let store = Store::open(".")?;
+            let change_id = store.resolve_change(&id)?;
+            let persisted = court::load_docket(&store, &change_id)?;
+            print!("{}", persisted.docket.render());
             Ok(std::process::ExitCode::SUCCESS)
         }
     }

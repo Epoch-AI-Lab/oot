@@ -12,6 +12,7 @@
 //! A change id is the `git hash-object` SHA of its canonical JSON, so records
 //! are content-addressed like everything else in the store.
 
+use crate::change::Snapshot;
 use crate::visibility::VisibilityPolicy;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -331,6 +332,91 @@ impl Store {
     /// compare working-copy content against trees without polluting the odb.
     pub fn blob_sha(&self, bytes: &[u8]) -> Result<String> {
         self.hash_object(bytes, "blob", false)
+    }
+
+    /// Read one blob's exact bytes from the store's odb.
+    pub fn read_blob(&self, sha: &str) -> Result<Vec<u8>> {
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["cat-file", "blob", sha])
+            .output()
+            .context("failed to read a blob from the store's odb")?;
+        if !out.status.success() {
+            bail!(
+                "cat-file blob {sha} failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(out.stdout)
+    }
+
+    /// Rebuild a [`Snapshot`] from a tree in the store's odb: `ls-tree -r -z`
+    /// lists the blobs, `read_blob` fetches each one. Gitlinks (submodules)
+    /// are skipped — they point at other commits rather than hold content,
+    /// so there is nothing to adjudicate.
+    pub fn snapshot_from_tree(&self, tree: &str) -> Result<Snapshot> {
+        let listed = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["ls-tree", "-r", "-z", tree])
+            .output()
+            .context("failed to read the tree from the store's odb")?;
+        if !listed.status.success() {
+            bail!(
+                "git ls-tree failed for {tree}: {}",
+                String::from_utf8_lossy(&listed.stderr).trim()
+            );
+        }
+
+        let mut snap = Snapshot::default();
+        for entry in listed.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let record = String::from_utf8_lossy(entry);
+            let (meta, path) = record
+                .split_once('\t')
+                .ok_or_else(|| anyhow!("malformed ls-tree entry: {record}"))?;
+            let mut parts = meta.splitn(3, ' ');
+            let _mode = parts.next().unwrap_or_default();
+            let kind = parts.next().unwrap_or_default();
+            let sha = parts.next().unwrap_or_default();
+            if kind != "blob" {
+                continue;
+            }
+            snap.files.insert(path.to_string(), self.read_blob(sha)?);
+        }
+        Ok(snap)
+    }
+
+    /// Resolve a change id or unique prefix to its full id. Exact match wins;
+    /// otherwise the prefix must select exactly one stored change or this
+    /// fails loudly listing every candidate.
+    pub fn resolve_change(&self, id_or_prefix: &str) -> Result<String> {
+        let changes = self.root.join(CHANGES_DIR);
+        if changes.join(format!("{id_or_prefix}.json")).exists() {
+            return Ok(id_or_prefix.to_string());
+        }
+        let mut candidates: Vec<String> = Vec::new();
+        for entry in std::fs::read_dir(&changes)? {
+            let name = entry?.file_name().to_string_lossy().to_string();
+            if let Some(stem) = name.strip_suffix(".json") {
+                if stem.starts_with(id_or_prefix) {
+                    candidates.push(stem.to_string());
+                }
+            }
+        }
+        candidates.sort();
+        match candidates.as_slice() {
+            [] => bail!("no change matching '{id_or_prefix}' in store (see `oot log`)"),
+            [one] => Ok(one.clone()),
+            many => bail!(
+                "ambiguous change prefix '{id_or_prefix}' matches {} changes:\n{}",
+                many.len(),
+                many.iter()
+                    .map(|c| format!("  {c}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        }
     }
 
     /// Store file contents as blobs in the odb and assemble them into a
@@ -1200,6 +1286,123 @@ mod tests {
             store.refs().unwrap(),
             vec![("feature/one".to_string(), id.clone())]
         );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_snapshot_from_tree_and_read_blob_roundtrip() {
+        let tmp = std::env::temp_dir().join(format!("oot-snap-test-{}", std::process::id()));
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+
+        let files = vec![
+            WorkFile {
+                path: "lib.rs".into(),
+                contents: b"pub fn a() {}\n".to_vec(),
+                executable: false,
+            },
+            WorkFile {
+                path: "deep/nested/bin.dat".into(),
+                contents: vec![0x00, 0xff, 0x7f, 0x80],
+                executable: false,
+            },
+            WorkFile {
+                path: "run.sh".into(),
+                contents: b"#!/bin/sh\n".to_vec(),
+                executable: true,
+            },
+        ];
+        let tree = store.write_tree_from_files(&files).unwrap();
+
+        let snap = store.snapshot_from_tree(&tree).unwrap();
+        assert_eq!(snap.files.len(), 3);
+        assert_eq!(snap.files["lib.rs"], b"pub fn a() {}\n".to_vec());
+        assert_eq!(
+            snap.files["deep/nested/bin.dat"],
+            vec![0x00, 0xff, 0x7f, 0x80]
+        );
+
+        let (sha, _) = store
+            .tree_files(&tree)
+            .unwrap()
+            .get("run.sh")
+            .unwrap()
+            .clone();
+        assert_eq!(store.read_blob(&sha).unwrap(), b"#!/bin/sh\n".to_vec());
+        assert!(store.read_blob("does-not-exist").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_resolve_change_exact_prefix_and_ambiguity() {
+        let tmp = std::env::temp_dir().join(format!("oot-resolve-test-{}", std::process::id()));
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+
+        // Two crafted ids sharing a long prefix; resolve_change works on
+        // stored filenames, so hand-written records are a deterministic fixture.
+        let changes = store.path().join("changes");
+        for tail in ["1", "2"] {
+            let id = format!("aaaa00000000000000000000000000000000000{tail}");
+            let record = ChangeRecord {
+                parents: vec![],
+                tree: format!("tree-{tail}"),
+                author: Identity {
+                    name: "K".into(),
+                    email: "k@oot.dev".into(),
+                    time: 0,
+                    offset: "+0000".into(),
+                },
+                committer: Identity {
+                    name: "K".into(),
+                    email: "k@oot.dev".into(),
+                    time: 0,
+                    offset: "+0000".into(),
+                },
+                message: "crafted\n".into(),
+                source_sha: None,
+            };
+            std::fs::write(
+                changes.join(format!("{id}.json")),
+                serde_json::to_vec(&record).unwrap(),
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            store
+                .resolve_change("aaaa000000000000000000000000000000000001")
+                .unwrap(),
+            "aaaa000000000000000000000000000000000001",
+            "exact id wins"
+        );
+        assert_eq!(
+            store
+                .resolve_change("aaaa000000000000000000000000000000000002")
+                .unwrap(),
+            "aaaa000000000000000000000000000000000002"
+        );
+
+        let ambiguous = store.resolve_change("aaaa").unwrap_err().to_string();
+        assert!(
+            ambiguous.contains("ambiguous change prefix 'aaaa'"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("aaaa000000000000000000000000000000000001"),
+            "{ambiguous}"
+        );
+        assert!(
+            ambiguous.contains("aaaa000000000000000000000000000000000002"),
+            "{ambiguous}"
+        );
+
+        let missing = store.resolve_change("bbbb").unwrap_err().to_string();
+        assert!(missing.contains("no change matching 'bbbb'"), "{missing}");
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
