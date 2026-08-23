@@ -86,7 +86,7 @@ Working seed. The engine runs, the docket renders, git and Jujutsu ingestion are
 
 Same-named definitions in one file (e.g. a `render` method on two classes) are each tracked separately: diffing matches identical bodies first, then pairs the rest, so only the definition that actually changed is reported.
 
-Honest limits live in [TODO.md](./TODO.md) under "Deliberate cuts": nested ignore rules and negation patterns in pure-Oot projects, tags, signatures downstream of rebuilt history, gc, and more.
+Deliberate cuts for now: nested ignore rules and negation patterns in pure-Oot projects, tags, signatures downstream of rebuilt history, gc, and more.
 
 ## License
 
