@@ -223,6 +223,14 @@ impl Engine {
                     let mut pending_removed: Vec<(String, FnDef)> = Vec::new();
                     let empty: Vec<FnDef> = Vec::new();
 
+                    // Every disappearance/appearance relative to base, tagged
+                    // by side and stashed before any dispatch decision runs.
+                    // Stashing here changes no existing emissions.
+                    let mut removed_ours: Vec<(String, usize, FnDef)> = Vec::new();
+                    let mut added_ours: Vec<(String, FnDef)> = Vec::new();
+                    let mut removed_theirs: Vec<(String, usize, FnDef)> = Vec::new();
+                    let mut added_theirs: Vec<(String, FnDef)> = Vec::new();
+
                     for name in all_fn_names {
                         let b_list = b_fns.get(name).unwrap_or(&empty);
                         let o_list = o_fns.get(name).unwrap_or(&empty);
@@ -230,6 +238,19 @@ impl Engine {
 
                         let (o_changed, o_gone, o_fresh) = align_defs(b_list, o_list);
                         let (t_changed, t_gone, t_fresh) = align_defs(b_list, t_list);
+
+                        for bi in &o_gone {
+                            removed_ours.push((name.clone(), *bi, b_list[*bi].clone()));
+                        }
+                        for hi in &o_fresh {
+                            added_ours.push((name.clone(), o_list[*hi].clone()));
+                        }
+                        for bi in &t_gone {
+                            removed_theirs.push((name.clone(), *bi, b_list[*bi].clone()));
+                        }
+                        for ti in &t_fresh {
+                            added_theirs.push((name.clone(), t_list[*ti].clone()));
+                        }
 
                         let ours_touched =
                             !(o_changed.is_empty() && o_gone.is_empty() && o_fresh.is_empty());
@@ -339,6 +360,51 @@ impl Engine {
                             )
                         };
                         disputes.push(meaning(&mut n, path, row, detail, Severity::High));
+                    }
+
+                    // A base def both branches renamed to different names is
+                    // the swallowed rename/rename dispute: one High per such
+                    // def, located at theirs' new copy (fallback ours, then 0).
+                    let divergent_renames = find_divergent_renames(
+                        &removed_ours,
+                        &added_ours,
+                        &removed_theirs,
+                        &added_theirs,
+                    );
+                    let mut claimed_theirs: Vec<(&str, usize)> = Vec::new();
+                    for d in &divergent_renames {
+                        let row = if d.theirs_row > 0 {
+                            d.theirs_row
+                        } else if d.ours_row > 0 {
+                            d.ours_row
+                        } else {
+                            0
+                        };
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            row,
+                            format!(
+                                "3-way conflict: both branches renamed function `{}` differently \
+                                 (`{}` -> `{}` in target, `{}` -> `{}` in incoming)",
+                                d.base_name,
+                                d.base_name,
+                                d.ours_new_name,
+                                d.base_name,
+                                d.theirs_new_name
+                            ),
+                            Severity::High,
+                        ));
+                        claimed_theirs.push((&d.theirs_new_name, d.theirs_row));
+                    }
+                    // Defs already reported as the incoming half of a
+                    // divergent rename must not resurface as Low additions.
+                    if !claimed_theirs.is_empty() {
+                        pending_added.retain(|(name, def)| {
+                            !claimed_theirs
+                                .iter()
+                                .any(|(cn, row)| *cn == name.as_str() && *row == def.row)
+                        });
                     }
 
                     // Pair incoming removals with incoming additions of
@@ -506,6 +572,90 @@ fn strip_common<'a>(a: &'a [FnDef], b: &[FnDef]) -> Vec<&'a FnDef> {
         }
     }
     leftover
+}
+
+/// Rename compatibility between a removed def's signature and an added
+/// def's signature: `Some` on exact equality today. A future similarity
+/// metric widens this to graded scores without touching the pairing logic.
+fn rename_score(candidate: &str, original: &str) -> Option<()> {
+    (candidate == original).then_some(())
+}
+
+/// One side's rename evidence: a base def identified by `(name, index
+/// within its base group)` that this side deleted, and the new name/row it
+/// reappeared under.
+struct SidePair {
+    old_name: String,
+    old_idx: usize,
+    new_name: String,
+    new_row: usize,
+}
+
+/// A base definition both branches renamed, to different names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DivergentRename {
+    base_name: String,
+    ours_new_name: String,
+    ours_row: usize,
+    theirs_new_name: String,
+    theirs_row: usize,
+}
+
+/// Greedily pair each removed def with the first unconsumed added def whose
+/// signature matches exactly under a different name. Entries are consumed
+/// once on both sides, so duplicates pair one-to-one.
+fn pair_side_renames(
+    removed: &[(String, usize, FnDef)],
+    added: &[(String, FnDef)],
+) -> Vec<SidePair> {
+    let mut used = vec![false; added.len()];
+    let mut pairs = Vec::new();
+    for (old_name, old_idx, old_def) in removed {
+        let found = added.iter().enumerate().find(|(i, (new_name, new_def))| {
+            !used[*i]
+                && new_name != old_name
+                && rename_score(&new_def.signature, &old_def.signature).is_some()
+        });
+        if let Some((i, (new_name, new_def))) = found {
+            used[i] = true;
+            pairs.push(SidePair {
+                old_name: old_name.clone(),
+                old_idx: *old_idx,
+                new_name: new_name.clone(),
+                new_row: new_def.row,
+            });
+        }
+    }
+    pairs
+}
+
+/// Detect definitions both branches renamed to different names: pair
+/// removals to additions within each side, then join across sides on
+/// `(base name, base index)`. Fires only when both sides paired and the new
+/// names differ; convergent renames join on equal names and stay silent.
+fn find_divergent_renames(
+    removed_ours: &[(String, usize, FnDef)],
+    added_ours: &[(String, FnDef)],
+    removed_theirs: &[(String, usize, FnDef)],
+    added_theirs: &[(String, FnDef)],
+) -> Vec<DivergentRename> {
+    let ours_pairs = pair_side_renames(removed_ours, added_ours);
+    let theirs_pairs = pair_side_renames(removed_theirs, added_theirs);
+    let mut divergent = Vec::new();
+    for tp in &theirs_pairs {
+        if let Some(op) = ours_pairs.iter().find(|op| {
+            op.old_name == tp.old_name && op.old_idx == tp.old_idx && op.new_name != tp.new_name
+        }) {
+            divergent.push(DivergentRename {
+                base_name: tp.old_name.clone(),
+                ours_new_name: op.new_name.clone(),
+                ours_row: op.new_row,
+                theirs_new_name: tp.new_name.clone(),
+                theirs_row: tp.new_row,
+            });
+        }
+    }
+    divergent
 }
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
@@ -1114,5 +1264,103 @@ mod tests {
         let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
         assert_eq!(disputes.len(), 2);
         assert!(disputes.iter().all(|d| d.severity == Severity::High));
+    }
+
+    fn rm(name: &str, idx: usize, sig: &str) -> (String, usize, FnDef) {
+        (
+            name.to_string(),
+            idx,
+            FnDef {
+                src: String::new(),
+                row: 1,
+                signature: sig.to_string(),
+            },
+        )
+    }
+
+    fn ad(name: &str, row: usize, sig: &str) -> (String, FnDef) {
+        (
+            name.to_string(),
+            FnDef {
+                src: String::new(),
+                row,
+                signature: sig.to_string(),
+            },
+        )
+    }
+
+    #[test]
+    fn test_rename_score_is_exact_only() {
+        assert!(rename_score("fn () {}", "fn () {}").is_some());
+        assert!(rename_score("fn () {}", "fn (x) {}").is_none());
+    }
+
+    #[test]
+    fn test_pair_side_consumes_each_added_once() {
+        let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigA")];
+        let added = vec![ad("x", 3, "sigA")];
+        let pairs = pair_side_renames(&removed, &added);
+        assert_eq!(pairs.len(), 1, "one added def cannot serve two removals");
+        assert_eq!(pairs[0].old_idx, 0);
+        assert_eq!(pairs[0].new_name, "x");
+    }
+
+    #[test]
+    fn test_pair_side_matches_duplicates_one_to_one() {
+        let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigB")];
+        let added = vec![ad("y", 5, "sigB"), ad("x", 3, "sigA")];
+        let pairs = pair_side_renames(&removed, &added);
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs.iter().any(|p| p.old_idx == 0 && p.new_name == "x"));
+        assert!(pairs.iter().any(|p| p.old_idx == 1 && p.new_name == "y"));
+    }
+
+    #[test]
+    fn test_pair_side_rejects_equal_names() {
+        // Same name on both sides is no rename; it is handled by the
+        // regular changed/gone alignment.
+        let removed = vec![rm("f", 0, "sigA")];
+        let added = vec![ad("f", 3, "sigA")];
+        assert!(pair_side_renames(&removed, &added).is_empty());
+    }
+
+    #[test]
+    fn test_find_divergent_requires_both_sides_and_different_names() {
+        let removed_ours = vec![rm("f", 0, "sigA")];
+        let added_ours = vec![ad("g", 2, "sigA")];
+        let removed_theirs = vec![rm("f", 0, "sigA")];
+
+        // Convergent rename: both sides landed on `g`, stays silent.
+        let added_theirs_convergent = vec![ad("g", 4, "sigA")];
+        assert!(find_divergent_renames(
+            &removed_ours,
+            &added_ours,
+            &removed_theirs,
+            &added_theirs_convergent,
+        )
+        .is_empty());
+
+        // Theirs deleted without renaming: no join.
+        assert!(
+            find_divergent_renames(&removed_ours, &added_ours, &removed_theirs, &[],).is_empty()
+        );
+
+        // Divergent: ours f -> g, theirs f -> k.
+        let added_theirs_divergent = vec![ad("k", 7, "sigA")];
+        assert_eq!(
+            find_divergent_renames(
+                &removed_ours,
+                &added_ours,
+                &removed_theirs,
+                &added_theirs_divergent,
+            ),
+            vec![DivergentRename {
+                base_name: "f".into(),
+                ours_new_name: "g".into(),
+                ours_row: 2,
+                theirs_new_name: "k".into(),
+                theirs_row: 7,
+            }]
+        );
     }
 }

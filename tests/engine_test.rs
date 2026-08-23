@@ -651,3 +651,140 @@ func (b B) Name() string {
     assert_eq!(disputes.len(), 1, "got {:?}", disputes);
     assert_eq!(disputes[0].detail, "both sides changed `Name`");
 }
+
+#[test]
+fn test_engine_3way_rename_rename_divergence_is_high_with_pinned_detail() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    let disputes = engine
+        .diff_3way(
+            &snap("pub fn f() -> i32 { 1 }\n"),
+            &snap("pub fn g() -> i32 { 1 }\n"),
+            &snap("pub fn k() -> i32 { 1 }\n"),
+        )
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+    assert_eq!(disputes[0].severity, Severity::High);
+    assert_eq!(
+        disputes[0].detail,
+        "3-way conflict: both branches renamed function `f` differently (`f` -> `g` in target, `f` -> `k` in incoming)"
+    );
+    assert_eq!(
+        disputes[0].location, "src/lib.rs:1",
+        "located at theirs' new copy"
+    );
+}
+
+#[test]
+fn test_engine_3way_delete_delete_with_coincidental_adds_is_unchanged() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    // Both sides delete `f`; each happens to add an unrelated helper with a
+    // different body. No rename pairing anywhere, so nothing may change:
+    // no High fabricated, theirs' addition still reports as Low.
+    let disputes = engine
+        .diff_3way(
+            &snap("pub fn f() -> i32 { 1 }\n"),
+            &snap("pub fn p() -> i32 { 11 }\n"),
+            &snap("pub fn q() -> i32 { 22 }\n"),
+        )
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+    assert_eq!(disputes[0].severity, Severity::Low);
+    assert_eq!(disputes[0].detail, "incoming branch added function `q`");
+}
+
+#[test]
+fn test_engine_3way_convergent_rename_is_clean() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    let disputes = engine
+        .diff_3way(
+            &snap("pub fn f() -> i32 { 1 }\n"),
+            &snap("pub fn g() -> i32 { 1 }\n"),
+            &snap("pub fn g() -> i32 { 1 }\n"),
+        )
+        .expect("Diff failed");
+
+    assert!(disputes.is_empty(), "got {:?}", disputes);
+}
+
+#[test]
+fn test_engine_3way_two_divergent_renames_emit_two_highs() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    let disputes = engine
+        .diff_3way(
+            &snap("pub fn f() -> i32 { 1 }\npub fn h() -> i32 { 2 }\n"),
+            &snap("pub fn g() -> i32 { 1 }\npub fn h2() -> i32 { 2 }\n"),
+            &snap("pub fn k() -> i32 { 1 }\npub fn h3() -> i32 { 2 }\n"),
+        )
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2, "got {:?}", disputes);
+    assert!(disputes.iter().all(|d| d.severity == Severity::High));
+    assert!(disputes.iter().any(|d| d.detail
+        == "3-way conflict: both branches renamed function `f` differently (`f` -> `g` in target, `f` -> `k` in incoming)"));
+    assert!(disputes.iter().any(|d| d.detail
+        == "3-way conflict: both branches renamed function `h` differently (`h` -> `h2` in target, `h` -> `h3` in incoming)"));
+}
+
+#[test]
+fn test_engine_3way_rename_vs_body_edit_reports_modify_delete_gap() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("src/lib.rs".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    // Known gap: ours renames f -> g while theirs edits f in place. The
+    // exact-signature detector cannot pair the edited def, so this reports
+    // modify/delete and stays silent about g until similarity scoring lands.
+    let disputes = engine
+        .diff_3way(
+            &snap("pub fn f() -> i32 { 1 }\n"),
+            &snap("pub fn g() -> i32 { 1 }\n"),
+            &snap("pub fn f() -> i32 { 42 }\n"),
+        )
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+    assert_eq!(disputes[0].severity, Severity::High);
+    assert_eq!(
+        disputes[0].detail,
+        "3-way conflict: function `f` modified in incoming branch but deleted in target"
+    );
+}
