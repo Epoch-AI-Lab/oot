@@ -289,8 +289,10 @@ impl Store {
     }
 
     /// The head change id of `branch`, if the branch has any.
+    /// Branch names are percent-encoded (`%` -> `%25`, `/` -> `%2F`)
+    /// so the mapping is unambiguous and reversible.
     pub fn head_id(&self, branch: &str) -> Result<Option<String>> {
-        let safe = branch.replace('/', "__");
+        let safe = encode_branch(branch);
         let f = self.root.join(REFS_DIR).join(safe);
         if !f.exists() {
             return Ok(None);
@@ -323,6 +325,7 @@ impl Store {
             let mode = parts.next().unwrap_or_default();
             let _kind = parts.next().unwrap_or_default();
             let sha = parts.next().unwrap_or_default();
+            validate_tree_path(path)?;
             map.insert(path.to_string(), (sha.to_string(), mode == "100755"));
         }
         Ok(map)
@@ -382,6 +385,8 @@ impl Store {
             if kind != "blob" {
                 continue;
             }
+            // FATAL fix: sanitize paths coming verbatim from git ls-tree.
+            validate_tree_path(path)?;
             snap.files.insert(path.to_string(), self.read_blob(sha)?);
         }
         Ok(snap)
@@ -537,7 +542,7 @@ impl Store {
 
     /// Record the head change id for a branch.
     pub fn set_ref(&self, branch: &str, id: &str) -> Result<()> {
-        let safe = branch.replace('/', "__");
+        let safe = encode_branch(branch);
         std::fs::write(self.root.join(REFS_DIR).join(safe), id)?;
         Ok(())
     }
@@ -548,7 +553,8 @@ impl Store {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
-            let name = entry.file_name().to_string_lossy().replace("__", "/");
+            let raw = entry.file_name().to_string_lossy().to_string();
+            let name = decode_branch(&raw);
             let id = std::fs::read_to_string(entry.path())?.trim().to_string();
             out.push((name, id));
         }
@@ -1182,6 +1188,71 @@ pub fn format_date(identity: &Identity) -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn encode_branch(branch: &str) -> String {
+    branch.replace('%', "%25").replace('/', "%2F")
+}
+
+fn decode_branch(raw: &str) -> String {
+    // Scan char-by-char to avoid double-decode issues (e.g. "%252F").
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        if raw[i..].starts_with("%2F") {
+            out.push('/');
+            i += 3;
+        } else if raw[i..].starts_with("%25") {
+            out.push('%');
+            i += 3;
+        } else {
+            let c = raw[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
+pub fn validate_tree_path(path: &str) -> Result<()> {
+    if path.contains('\0') {
+        bail!("invalid path in tree: '{}': contains NUL byte", path);
+    }
+    if path.is_empty() {
+        bail!("invalid path in tree: '{}': empty path", path);
+    }
+    if path.starts_with('/') {
+        bail!("invalid path in tree: '{}': absolute path", path);
+    }
+    if path.contains("//") {
+        bail!(
+            "invalid path in tree: '{}': empty path component (//)",
+            path
+        );
+    }
+    if path.split('/').any(|c| c.is_empty()) {
+        bail!("invalid path in tree: '{}': empty path component", path);
+    }
+    use std::path::{Component, Path};
+    let p = Path::new(path);
+    for comp in p.components() {
+        match comp {
+            Component::ParentDir => {
+                bail!("invalid path in tree: '{}': contains '..' component", path);
+            }
+            Component::CurDir => {
+                bail!("invalid path in tree: '{}': contains '.' component", path);
+            }
+            Component::RootDir => {
+                bail!("invalid path in tree: '{}': absolute path component", path);
+            }
+            Component::Prefix(_) => {
+                bail!("invalid path in tree: '{}': prefix component", path);
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
