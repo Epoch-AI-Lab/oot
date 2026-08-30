@@ -20,7 +20,11 @@ mod update;
 
 /// Command-line parser for the Oot CLI.
 #[derive(Parser)]
-#[command(name = "oot", about = "Git settles lines. Oot settles meaning.")]
+#[command(
+    name = "oot",
+    version,
+    about = "Git settles lines. Oot settles meaning."
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -32,6 +36,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Adjudicate a Change and print its docket.
+    #[command(alias = "court")]
     Adjudicate {
         /// Change name or identifier.
         #[arg(long)]
@@ -125,7 +130,11 @@ enum Commands {
     /// Render a docket persisted by a previous `oot adjudicate --change`.
     Docket {
         /// Change id or unique prefix.
-        id: String,
+        #[arg(value_name = "ID")]
+        id: Option<String>,
+        /// Change id or unique prefix.
+        #[arg(long)]
+        change: Option<String>,
     },
     /// Materialize a stored change's tree into the working copy.
     /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
@@ -594,9 +603,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             );
             Ok(std::process::ExitCode::SUCCESS)
         }
-        Commands::Docket { id } => {
+        Commands::Docket { id, change } => {
+            let target_id = change
+                .or(id)
+                .ok_or_else(|| anyhow::anyhow!("specify a change id or pass --change <id>"))?;
             let store = Store::open(".")?;
-            let change_id = store.resolve_change(&id)?;
+            let change_id = store.resolve_change(&target_id)?;
             let persisted = court::load_docket(&store, &change_id)?;
             print!("{}", persisted.docket.render());
             Ok(std::process::ExitCode::SUCCESS)

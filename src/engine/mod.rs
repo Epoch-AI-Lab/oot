@@ -658,7 +658,15 @@ fn find_divergent_renames(
     divergent
 }
 
+/// Maximum file size in bytes to subject to full Tree-Sitter AST extraction.
+/// Files exceeding this cap skip recursive AST parsing to prevent denial of
+/// service on massive generated or bundled assets.
+pub const MAX_AST_PARSE_SIZE_BYTES: usize = 5 * 1024 * 1024;
+
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
+    if source.len() > MAX_AST_PARSE_SIZE_BYTES {
+        return None;
+    }
     parser.set_language(language).ok()?;
     parser.parse(source, None)
 }

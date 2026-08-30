@@ -170,3 +170,39 @@ fn test_visibility_policy_slash_stripping_and_matching() {
     let disputes = policy.check(&change);
     assert_eq!(disputes.len(), 2);
 }
+
+#[test]
+fn test_visibility_policy_detects_deleted_private_paths() {
+    let policy = VisibilityPolicy {
+        private_paths: vec!["secrets/".into(), ".env".into()],
+        embargo_until: None,
+        private_branches: vec![],
+    };
+
+    let mut base = Snapshot::default();
+    base.files
+        .insert("secrets/api_token.txt".into(), "secret123".into());
+    base.files
+        .insert("src/lib.rs".into(), "pub fn run() {}".into());
+
+    let mut head = Snapshot::default();
+    head.files
+        .insert("src/lib.rs".into(), "pub fn run() {}".into());
+    // secrets/api_token.txt was deleted in head
+
+    let change = Change {
+        name: "pr-delete-secret".into(),
+        source: Source::Git,
+        base_ref: "main".into(),
+        head_ref: "pr-delete-secret".into(),
+        base,
+        head,
+        authors: vec!["@contributor".into()],
+        intent: Some("Cleanup".into()),
+    };
+
+    let disputes = policy.check(&change);
+    assert_eq!(disputes.len(), 1);
+    assert_eq!(disputes[0].location, "secrets/api_token.txt");
+    assert_eq!(disputes[0].kind, Kind::Visibility);
+}

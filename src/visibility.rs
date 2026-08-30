@@ -61,16 +61,27 @@ impl VisibilityPolicy {
         let mut out = Vec::new();
         let mut n = 1;
 
-        // Check private paths among files the change actually touches
+        // Check private paths among files the change touches (added, modified, or deleted)
+        let mut touched_paths: Vec<&String> = Vec::new();
         for (path, head_content) in &change.head.files {
             let touched = change
                 .base
                 .files
                 .get(path)
                 .is_none_or(|base_content| base_content != head_content);
-            if !touched {
-                continue;
+            if touched {
+                touched_paths.push(path);
             }
+        }
+        for path in change.base.files.keys() {
+            if !change.head.files.contains_key(path) {
+                touched_paths.push(path);
+            }
+        }
+        touched_paths.sort();
+        touched_paths.dedup();
+
+        for path in touched_paths {
             if self.path_is_private(path) {
                 out.push(Dispute {
                     id: format!("V{:03}", n),
