@@ -16,6 +16,8 @@ use std::process::Command;
 
 use oot::store::Store;
 
+mod update;
+
 /// Command-line parser for the Oot CLI.
 #[derive(Parser)]
 #[command(name = "oot", about = "Git settles lines. Oot settles meaning.")]
@@ -124,6 +126,22 @@ enum Commands {
     Docket {
         /// Change id or unique prefix.
         id: String,
+    },
+    /// Materialize a stored change's tree into the working copy.
+    /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
+    Update {
+        /// Change id or unique prefix to materialize.
+        #[arg(long, conflicts_with = "branch")]
+        change: Option<String>,
+        /// Branch whose head to materialize (defaults to the store's only branch, or `main`).
+        #[arg(long, conflicts_with = "change")]
+        branch: Option<String>,
+        /// Overwrite local changes and delete untracked files not in target when the working copy is dirty.
+        #[arg(long)]
+        force: bool,
+        /// Preview what would change without touching the working copy. Ignored files are hidden (matches status).
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -429,7 +447,13 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let mut deleted = Vec::new();
             if let Some(head) = &head_id {
                 let head_tree = store.get_change(head)?.tree;
-                for (path, sha_mode) in store.tree_files(&head_tree)? {
+                // Consistency: head is verbatim but work is filtered; filter head
+                // the same way so ignored files (e.g. junk.log) don't show as
+                // deleted and status agrees with update's dirty check.
+                let (same_git_root, ignore_rules) = build_ignore_state(&root);
+                let head_files = store.tree_files(&head_tree)?;
+                let head_filtered = filtered_tree(&head_files, &root, same_git_root, &ignore_rules);
+                for (path, sha_mode) in head_filtered {
                     match work.remove(&path) {
                         Some(current) if current != sha_mode => modified.push(path),
                         Some(_) => {}
@@ -448,7 +472,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 &head_id,
                 added.is_empty() && modified.is_empty() && deleted.is_empty(),
             ) {
-                (_, true) => match head_id.as_deref().map(|h| &h[..7]) {
+                (_, true) => match head_id.as_deref().map(|h| &h[..7.min(h.len())]) {
                     Some(id) => println!("branch {branch} @ {id}: up to date"),
                     None => println!("branch {branch}: empty store, nothing recorded yet"),
                 },
@@ -577,6 +601,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             print!("{}", persisted.docket.render());
             Ok(std::process::ExitCode::SUCCESS)
         }
+        Commands::Update {
+            change,
+            branch,
+            force,
+            dry_run,
+        } => update::run(change, branch, force, dry_run),
     }
 }
 
@@ -598,7 +628,7 @@ fn run_git(args: &[&str], cwd: &std::path::Path) -> anyhow::Result<()> {
 
 /// Branch selection shared by record/status/log: explicit flag wins;
 /// otherwise the store's only branch; otherwise a fresh store starts on main.
-fn resolve_branch(store: &Store, flag: Option<String>) -> anyhow::Result<String> {
+pub(crate) fn resolve_branch(store: &Store, flag: Option<String>) -> anyhow::Result<String> {
     match flag {
         Some(b) => Ok(b),
         None => match store.refs()?.as_slice() {
@@ -701,7 +731,9 @@ fn local_offset() -> anyhow::Result<String> {
 /// Recursively collect working-copy files into [`WorkFile`]s. `.oot` and
 /// `.git` are never captured; symlinks are never followed; when the project
 /// sits at a git worktree root, `.gitignore` rules are honored best-effort.
-fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::WorkFile>> {
+pub(crate) fn collect_worktree(
+    root: &std::path::Path,
+) -> anyhow::Result<Vec<oot::store::WorkFile>> {
     fn walk(
         dir: &std::path::Path,
         rel: &str,
@@ -748,6 +780,12 @@ fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::Wo
     // decides (full semantics). Pure-Oot projects fall back to a minimal
     // matcher over the root .gitignore — enough for names, directories,
     // and * globs; negations are not supported.
+    let (same_git_root, ignore_rules) = build_ignore_state(root);
+    files.retain(|f| !is_path_ignored(root, &f.path, same_git_root, &ignore_rules));
+    Ok(files)
+}
+
+pub(crate) fn build_ignore_state(root: &std::path::Path) -> (bool, Vec<String>) {
     let toplevel = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(root)
@@ -757,23 +795,56 @@ fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::Wo
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
     let same_git_root = toplevel
         .map(|top| {
-            std::fs::canonicalize(root)
-                .map(|r| r.to_string_lossy() == top)
-                .unwrap_or(false)
+            let canonical_root = std::fs::canonicalize(root).ok();
+            if let Some(canonical_root) = canonical_root {
+                std::fs::canonicalize(std::path::Path::new(&top))
+                    .map(|p| p == canonical_root)
+                    .unwrap_or_else(|_| canonical_root.to_string_lossy() == top)
+            } else {
+                false
+            }
         })
         .unwrap_or(false);
-    if same_git_root {
-        files.retain(|f| !is_git_ignored(root, &f.path));
+    let ignore_rules: Vec<String> = if same_git_root {
+        Vec::new()
     } else {
-        let rules = std::fs::read_to_string(root.join(".gitignore"))
+        std::fs::read_to_string(root.join(".gitignore"))
             .unwrap_or_default()
             .lines()
             .map(|l| l.trim().to_string())
             .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
-            .collect::<Vec<_>>();
-        files.retain(|f| !simple_ignored(&f.path, &rules));
+            .collect()
+    };
+    (same_git_root, ignore_rules)
+}
+
+pub(crate) fn is_path_ignored(
+    root: &std::path::Path,
+    path: &str,
+    same_git_root: bool,
+    ignore_rules: &[String],
+) -> bool {
+    if same_git_root {
+        is_git_ignored(root, path)
+    } else {
+        simple_ignored(path, ignore_rules)
     }
-    Ok(files)
+}
+
+/// Filter a `tree_files` map the same way `collect_worktree` filters the
+/// working copy: ignored paths are hidden so `status` and `update` agree.
+/// The input map is verbatim from the store; the output is what the user
+/// should see.
+pub(crate) fn filtered_tree(
+    tree: &std::collections::HashMap<String, (String, bool)>,
+    root: &std::path::Path,
+    same_git_root: bool,
+    ignore_rules: &[String],
+) -> std::collections::HashMap<String, (String, bool)> {
+    tree.iter()
+        .filter(|(p, _)| !is_path_ignored(root, p, same_git_root, ignore_rules))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Best-effort .gitignore subset for projects without git: exact names,
