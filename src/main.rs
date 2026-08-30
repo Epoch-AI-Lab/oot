@@ -15,7 +15,8 @@ use oot::visibility::VisibilityPolicy;
 use std::process::Command;
 
 use oot::store::Store;
-use oot::store::validate_tree_path;
+
+mod update;
 
 /// Command-line parser for the Oot CLI.
 #[derive(Parser)]
@@ -450,10 +451,9 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 // the same way so ignored files (e.g. junk.log) don't show as
                 // deleted and status agrees with update's dirty check.
                 let (same_git_root, ignore_rules) = build_ignore_state(&root);
-                for (path, sha_mode) in store.tree_files(&head_tree)? {
-                    if is_path_ignored(&root, &path, same_git_root, &ignore_rules) {
-                        continue;
-                    }
+                let head_files = store.tree_files(&head_tree)?;
+                let head_filtered = filtered_tree(&head_files, &root, same_git_root, &ignore_rules);
+                for (path, sha_mode) in head_filtered {
                     match work.remove(&path) {
                         Some(current) if current != sha_mode => modified.push(path),
                         Some(_) => {}
@@ -606,323 +606,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             branch,
             force,
             dry_run,
-        } => {
-            let root = std::env::current_dir()?;
-            let store = Store::open(&root)?;
-
-            // Resolve target tree.
-            let is_change_target = change.is_some();
-            let (target_tree, target_desc) = if let Some(c) = change {
-                let id = store.resolve_change(&c)?;
-                let rec = store.get_change(&id)?;
-                (rec.tree, format!("change {}", &id[..7.min(id.len())]))
-            } else {
-                let b = resolve_branch(&store, branch.clone())?;
-                let hid = store
-                    .head_id(&b)?
-                    .ok_or_else(|| anyhow::anyhow!("branch '{b}' has no changes"))?;
-                let rec = store.get_change(&hid)?;
-                (
-                    rec.tree,
-                    format!("branch {b} @ {}", &hid[..7.min(hid.len())]),
-                )
-            };
-
-            // Current head for dirty check — only require branch resolution for branch targets.
-            // When --change is used (branch==None), try to infer head without requiring --branch: single-branch stores can distinguish clean vs dirty work, multi-branch falls back to work vs target direct check.
-            let (current_branch_opt, current_tree) = if is_change_target {
-                let inferred = match store.refs() {
-                    Ok(refs) if refs.len() == 1 => store
-                        .head_id(&refs[0].0)
-                        .ok()
-                        .flatten()
-                        .and_then(|h| store.get_change(&h).ok())
-                        .map(|r| r.tree)
-                        .unwrap_or_default(),
-                    _ => String::new(),
-                };
-                (None, inferred)
-            } else {
-                let current_branch = resolve_branch(&store, branch.clone())?;
-                let current_head_id = store.head_id(&current_branch)?;
-                let current_tree = if let Some(ref hid) = current_head_id {
-                    store.get_change(hid)?.tree
-                } else {
-                    String::new()
-                };
-                (Some(current_branch), current_tree)
-            };
-
-            let files = collect_worktree(&root)?;
-            let mut work: std::collections::HashMap<String, (String, bool)> =
-                std::collections::HashMap::new();
-            for f in &files {
-                work.insert(f.path.clone(), (store.blob_sha(&f.contents)?, f.executable));
-            }
-
-            // Prepare target data before dirty check so dirty == work != target.
-            let target_files = store.tree_files(&target_tree)?;
-            let snapshot = store.snapshot_from_tree(&target_tree)?;
-
-            // FATAL fix: validate every path from the tree before touching the filesystem.
-            // Git ls-tree is verbatim; a crafted tree could contain `..`, absolute, or `//`.
-            {
-                for path in snapshot.files.keys().chain(target_files.keys()) {
-                    validate_tree_path(path)?;
-                    // Defense-in-depth: even after join, path must stay inside root.
-                    let full = root.join(path);
-                    if !full.starts_with(&root) {
-                        anyhow::bail!("invalid path in tree: '{}': escapes repository root", path);
-                    }
-                }
-            }
-
-            // Consistency: work comes from collect_worktree (filtered via .gitignore)
-            // but tree_files/snapshot are verbatim. For dirty detection we compare
-            // filtered views so an ignored file like junk.log does not make status
-            // and update disagree. Materialization below still writes verbatim
-            // (including ignored files) — status will then hide them.
-            let head_files = if current_tree.is_empty() {
-                std::collections::HashMap::new()
-            } else {
-                store.tree_files(&current_tree)?
-            };
-            // Build filtered views matching collect_worktree's ignore rules.
-            let (same_git_root, ignore_rules) = build_ignore_state(&root);
-            let head_filtered: std::collections::HashMap<String, (String, bool)> = head_files
-                .iter()
-                .filter(|(p, _)| !is_path_ignored(&root, p, same_git_root, &ignore_rules))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let target_filtered: std::collections::HashMap<String, (String, bool)> = target_files
-                .iter()
-                .filter(|(p, _)| !is_path_ignored(&root, p, same_git_root, &ignore_rules))
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            let work_is_clean = work == head_filtered;
-            let dirty = work != target_filtered;
-            if is_change_target {
-                if dirty && !force && !dry_run && !work_is_clean {
-                    anyhow::bail!(
-                        "working copy is dirty; use --force to overwrite (target {target_desc}). --force will delete untracked files not in target"
-                    );
-                }
-            } else if dirty && !force && !dry_run && !work_is_clean {
-                let current_branch = current_branch_opt.as_deref().unwrap_or("unknown");
-                anyhow::bail!(
-                    "working copy is dirty; use --force to overwrite (target {target_desc} differs from {current_branch}). --force will delete untracked files not in target"
-                );
-            }
-
-            if dry_run {
-                // dry-run uses filtered view (hidden ignored files match status)
-                // Dry-run uses filtered views so its verdict matches the dirty gate
-                // and `oot status`. Verbatim target still writes ignored files on
-                // real update, but that is hidden from status by design.
-                let mut added = Vec::new();
-                let mut modified = Vec::new();
-                let mut deleted = Vec::new();
-                for (path, sha_mode) in &target_filtered {
-                    match work.get(path) {
-                        None => added.push(path.clone()),
-                        Some(cur) if cur != sha_mode => modified.push(path.clone()),
-                        Some(_) => {}
-                    }
-                }
-                for path in work.keys() {
-                    if !target_filtered.contains_key(path) {
-                        deleted.push(path.clone());
-                    }
-                }
-                for v in [&mut added, &mut modified, &mut deleted] {
-                    v.sort();
-                }
-                if added.is_empty() && modified.is_empty() && deleted.is_empty() {
-                    println!("would update to {target_desc}: already up to date");
-                } else {
-                    println!("would update to {target_desc}:");
-                    for (tag, paths) in [("A", &added), ("M", &modified), ("D", &deleted)] {
-                        for p in paths {
-                            println!("  {tag} {p}");
-                        }
-                    }
-                }
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-
-            // Already up to date: no diff between filtered work and filtered target — skip rewriting.
-            if work == target_filtered {
-                println!("already up to date");
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-
-            // Materialize: delete files not in target, then write target files.
-            // Atomicity: deletes propagate errors (except NotFound); writes use
-            // temp-file + rename so a crash never leaves a truncated file.
-            // --force is required to delete untracked files not in target
-            // (enforced by the dirty gate above); without --force we never
-            // delete precious untracked work.
-            for path in work.keys() {
-                if !target_files.contains_key(path) {
-                    let p = root.join(path);
-                    // Never touch .oot/.git/.jj — work already excludes them.
-                    match std::fs::remove_file(&p) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                        Err(e) => anyhow::bail!("failed to delete {}: {e}", p.display()),
-                    }
-                    // Remove empty parent dirs up to root (but never .oot/.git/.jj or root itself).
-                    if let Some(parent) = p.parent() {
-                        let mut cur = parent;
-                        while cur != root
-                            && cur
-                                .file_name()
-                                .is_some_and(|n| n != ".oot" && n != ".git" && n != ".jj")
-                        {
-                            // Lstat: if cur is a symlink, remove the symlink itself rather than following it.
-                            if let Ok(meta) = std::fs::symlink_metadata(cur) {
-                                if meta.file_type().is_symlink() {
-                                    let _ = std::fs::remove_file(cur);
-                                    if let Some(par) = cur.parent() {
-                                        cur = par;
-                                    } else {
-                                        break;
-                                    }
-                                    continue;
-                                }
-                            }
-                            let empty = std::fs::read_dir(cur)
-                                .map(|mut it| it.next().is_none())
-                                .unwrap_or(false);
-                            if empty {
-                                match std::fs::remove_dir(cur) {
-                                    Ok(()) => {}
-                                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                                    Err(e) => {
-                                        anyhow::bail!("failed to remove dir {}: {e}", cur.display())
-                                    }
-                                }
-                                if let Some(par) = cur.parent() {
-                                    cur = par;
-                                } else {
-                                    break;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            for (path, contents) in &snapshot.files {
-                // Preserve exec bits from tree.
-                let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
-                let full = root.join(path);
-                // F2 fix: never follow symlinks — lstat and remove symlink at target path.
-                if let Ok(meta) = std::fs::symlink_metadata(&full) {
-                    if meta.file_type().is_symlink() {
-                        match std::fs::remove_file(&full) {
-                            Ok(()) => {}
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(e) => {
-                                anyhow::bail!("failed to remove symlink {}: {e}", full.display())
-                            }
-                        }
-                    }
-                }
-                if let Some(parent) = full.parent() {
-                    // Ensure no parent component is a symlink escaping the repo.
-                    if let Ok(rel) = parent.strip_prefix(&root) {
-                        let mut cur = root.clone();
-                        for comp in rel.components() {
-                            cur.push(comp);
-                            if let Ok(meta) = std::fs::symlink_metadata(&cur) {
-                                if meta.file_type().is_symlink() {
-                                    match std::fs::remove_file(&cur) {
-                                        Ok(()) => {}
-                                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                        Err(e) => anyhow::bail!(
-                                            "failed to remove symlink {}: {e}",
-                                            cur.display()
-                                        ),
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    std::fs::create_dir_all(parent)?;
-                }
-                // Atomic write via temp file + rename.
-                let dir = full.parent().unwrap_or(&root);
-                let nanos = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let tmp_name = format!(
-                    ".oot-tmp-{}-{}-{}",
-                    std::process::id(),
-                    nanos,
-                    full.file_name()
-                        .map(|n| n.to_string_lossy().to_string())
-                        .unwrap_or_else(|| "file".to_string())
-                );
-                let tmp = dir.join(tmp_name);
-                // If tmp is already a symlink, remove it before create_new to avoid symlink following.
-                if let Ok(meta) = std::fs::symlink_metadata(&tmp) {
-                    if meta.file_type().is_symlink() {
-                        let _ = std::fs::remove_file(&tmp);
-                    }
-                }
-                // Use create_new to avoid following a pre-existing symlink at tmp.
-                {
-                    use std::io::Write;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::OpenOptionsExt;
-                        let mut opts = std::fs::OpenOptions::new();
-                        opts.write(true).create_new(true);
-                        // O_NOFOLLOW = 0o400000 on Linux; use raw constant to avoid libc dependency.
-                        opts.custom_flags(0o400000);
-                        let mut f = opts
-                            .open(&tmp)
-                            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-                        f.write_all(contents)
-                            .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-                    }
-                    #[cfg(not(unix))]
-                    {
-                        let mut f = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .open(&tmp)
-                            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-                        f.write_all(contents)
-                            .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-                    }
-                }
-                if let Err(e) = std::fs::rename(&tmp, &full) {
-                    let _ = std::fs::remove_file(&tmp);
-                    anyhow::bail!(
-                        "failed to rename {} -> {}: {e}",
-                        tmp.display(),
-                        full.display()
-                    );
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Ok(meta) = std::fs::metadata(&full) {
-                        let mut perms = meta.permissions();
-                        perms.set_mode(if executable { 0o755 } else { 0o644 });
-                        let _ = std::fs::set_permissions(&full, perms);
-                    }
-                }
-            }
-
-            println!("updated to {target_desc}");
-            Ok(std::process::ExitCode::SUCCESS)
-        }
+        } => update::run(change, branch, force, dry_run),
     }
 }
 
@@ -944,7 +628,7 @@ fn run_git(args: &[&str], cwd: &std::path::Path) -> anyhow::Result<()> {
 
 /// Branch selection shared by record/status/log: explicit flag wins;
 /// otherwise the store's only branch; otherwise a fresh store starts on main.
-fn resolve_branch(store: &Store, flag: Option<String>) -> anyhow::Result<String> {
+pub(crate) fn resolve_branch(store: &Store, flag: Option<String>) -> anyhow::Result<String> {
     match flag {
         Some(b) => Ok(b),
         None => match store.refs()?.as_slice() {
@@ -1047,7 +731,9 @@ fn local_offset() -> anyhow::Result<String> {
 /// Recursively collect working-copy files into [`WorkFile`]s. `.oot` and
 /// `.git` are never captured; symlinks are never followed; when the project
 /// sits at a git worktree root, `.gitignore` rules are honored best-effort.
-fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::WorkFile>> {
+pub(crate) fn collect_worktree(
+    root: &std::path::Path,
+) -> anyhow::Result<Vec<oot::store::WorkFile>> {
     fn walk(
         dir: &std::path::Path,
         rel: &str,
@@ -1099,7 +785,7 @@ fn collect_worktree(root: &std::path::Path) -> anyhow::Result<Vec<oot::store::Wo
     Ok(files)
 }
 
-fn build_ignore_state(root: &std::path::Path) -> (bool, Vec<String>) {
+pub(crate) fn build_ignore_state(root: &std::path::Path) -> (bool, Vec<String>) {
     let toplevel = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .current_dir(root)
@@ -1132,7 +818,7 @@ fn build_ignore_state(root: &std::path::Path) -> (bool, Vec<String>) {
     (same_git_root, ignore_rules)
 }
 
-fn is_path_ignored(
+pub(crate) fn is_path_ignored(
     root: &std::path::Path,
     path: &str,
     same_git_root: bool,
@@ -1143,6 +829,22 @@ fn is_path_ignored(
     } else {
         simple_ignored(path, ignore_rules)
     }
+}
+
+/// Filter a `tree_files` map the same way `collect_worktree` filters the
+/// working copy: ignored paths are hidden so `status` and `update` agree.
+/// The input map is verbatim from the store; the output is what the user
+/// should see.
+pub(crate) fn filtered_tree(
+    tree: &std::collections::HashMap<String, (String, bool)>,
+    root: &std::path::Path,
+    same_git_root: bool,
+    ignore_rules: &[String],
+) -> std::collections::HashMap<String, (String, bool)> {
+    tree.iter()
+        .filter(|(p, _)| !is_path_ignored(root, p, same_git_root, ignore_rules))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 /// Best-effort .gitignore subset for projects without git: exact names,

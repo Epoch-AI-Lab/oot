@@ -65,20 +65,23 @@ fn test_update_restores_branch_head() {
     assert!(ok, "{out}");
     assert!(out.contains("M a.txt"), "{out}");
 
-    // Without --force must refuse when target differs
+    // Without --force now does a 3-way merge and keeps dirty work (no --force ever)
     let (ok, out) = oot(&["update"], &proj);
-    assert!(!ok, "should refuse dirty without --force");
-    assert!(out.contains("dirty"), "{out}");
-    assert!(out.contains("--force"), "{out}");
+    assert!(ok, "dirty without --force should merge, not bail: {out}");
+    assert!(out.contains("merged") || out.contains("keep"), "{out}");
+    // Merge kept dirty work: a.txt stays v2, b.txt stays deleted, c.txt stays
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v2\n");
+    assert!(!proj.join("b.txt").exists(), "merge keeps deleted b.txt");
+    assert!(proj.join("c.txt").exists(), "merge keeps new c.txt");
 
-    // Dry-run previews without touching disk
+    // Dry-run previews without touching disk (shows merge)
     let (ok, out) = oot(&["update", "--dry-run"], &proj);
     assert!(ok, "{out}");
     assert!(out.contains("would update"), "{out}");
     // Still dirty after dry-run
     assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v2\n");
 
-    // With --force it restores
+    // With --force it restores (discards work)
     let (ok, msg) = oot(&["update", "--force"], &proj);
     assert!(ok, "{msg}");
     assert!(msg.contains("updated to"), "{msg}");
@@ -144,11 +147,17 @@ fn test_update_refuses_dirty_when_target_equals_current() {
     let (ok, msg) = oot(&["record", "-m", "first"], &proj);
     assert!(ok, "{msg}");
 
-    // Dirty but target == current (no-arg update)
+    // Dirty but target == current (no-arg update) — merge keeps dirty, force restores
     std::fs::write(proj.join("a.txt"), "dirty\n").unwrap();
     let (ok, out) = oot(&["update"], &proj);
-    assert!(!ok, "dirty work with target==current must require --force");
-    assert!(out.contains("dirty"), "{out}");
+    assert!(
+        ok,
+        "dirty with target==current should merge-keep, not bail: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+        "dirty\n"
+    );
 
     // With --force it restores even though target==current
     let (ok, msg) = oot(&["update", "--force"], &proj);
