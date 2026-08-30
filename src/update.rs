@@ -3,7 +3,7 @@
 //! This module owns the whole `Update` flow so `main.rs` stays as dispatch.
 //! It does not move branch pointers; `oot record` saves the result.
 
-use anyhow::Context;
+use anyhow::{Context, Result};
 use oot::store::{validate_tree_path, Store};
 use std::path::Path;
 
@@ -35,31 +35,22 @@ pub fn run(
         )
     };
 
-    // Current head for dirty check — only require branch resolution for branch targets.
-    // When --change is used (branch==None), try to infer head without requiring --branch:
-    // single-branch stores can distinguish clean vs dirty work, multi-branch falls back
-    // to work vs target direct check.
-    let (current_branch_opt, current_tree) = if is_change_target {
-        let inferred = match store.refs() {
-            Ok(refs) if refs.len() == 1 => store
-                .head_id(&refs[0].0)
+    // Current head for dirty check — infer current branch if store has a unique single
+    // branch. For multi-branch stores without explicit current branch tracking, current_tree
+    // is empty so uncommitted work is safely protected via 3-way merge conflict handling.
+    let (current_branch_opt, current_tree) = {
+        let inferred_branch = crate::resolve_branch(&store, None).ok();
+        let inferred_tree = match &inferred_branch {
+            Some(b) => store
+                .head_id(b)
                 .ok()
                 .flatten()
                 .and_then(|h| store.get_change(&h).ok())
                 .map(|r| r.tree)
                 .unwrap_or_default(),
-            _ => String::new(),
+            None => String::new(),
         };
-        (None, inferred)
-    } else {
-        let current_branch = crate::resolve_branch(&store, branch.clone())?;
-        let current_head_id = store.head_id(&current_branch)?;
-        let current_tree = if let Some(ref hid) = current_head_id {
-            store.get_change(hid)?.tree
-        } else {
-            String::new()
-        };
-        (Some(current_branch), current_tree)
+        (inferred_branch, inferred_tree)
     };
 
     let files = crate::collect_worktree(&root)?;
@@ -202,7 +193,7 @@ pub fn run(
     // marker (and thus the dir) instead of deleting it. This lets you keep
     // empty dirs like `logs/` or `tmp/` across updates.
     for path in work.keys() {
-        if path.ends_with(".ootkeep") || path.ends_with(".oothave") {
+        if is_keep_marker(path) {
             continue;
         }
         if !target_files.contains_key(path) {
@@ -216,7 +207,8 @@ pub fn run(
             // Remove empty parent dirs up to root (but never .oot/.git/.jj or root itself).
             if let Some(parent) = p.parent() {
                 let mut cur = parent;
-                while cur != root
+                while cur.starts_with(&root)
+                    && cur != root
                     && cur
                         .file_name()
                         .is_some_and(|n| n != ".oot" && n != ".git" && n != ".jj")
@@ -265,87 +257,7 @@ pub fn run(
         // Preserve exec bits from tree.
         let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         let full = root.join(path);
-        // Never follow symlinks — lstat and remove symlink at target path.
-        if let Ok(meta) = std::fs::symlink_metadata(&full) {
-            if meta.file_type().is_symlink() {
-                match std::fs::remove_file(&full) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        anyhow::bail!("failed to remove symlink {}: {e}", full.display())
-                    }
-                }
-            }
-        }
-        if let Some(parent) = full.parent() {
-            // Ensure no parent component is a symlink escaping the repo.
-            if let Ok(rel) = parent.strip_prefix(&root) {
-                let mut cur = root.clone();
-                for comp in rel.components() {
-                    cur.push(comp);
-                    if let Ok(meta) = std::fs::symlink_metadata(&cur) {
-                        if meta.file_type().is_symlink() {
-                            match std::fs::remove_file(&cur) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    anyhow::bail!("failed to remove symlink {}: {e}", cur.display())
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            std::fs::create_dir_all(parent)?;
-        }
-        // Atomic write via temp file + rename.
-        let dir = full.parent().unwrap_or(Path::new(&root));
-        let tmp_name = format!(
-            ".oot-tmp-{}-{}",
-            random_hex(),
-            full.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string())
-        );
-        let tmp = dir.join(tmp_name);
-        // If tmp is already a symlink, remove it before create_new to avoid symlink following.
-        if let Ok(meta) = std::fs::symlink_metadata(&tmp) {
-            if meta.file_type().is_symlink() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
-        // Use create_new + O_NOFOLLOW so a pre-existing symlink at tmp is never followed.
-        // Fuck Windows — oot only targets Unix (Linux/macOS). This is the only path.
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            // O_NOFOLLOW = 0o400000 on Linux; raw constant avoids a libc dep.
-            opts.custom_flags(0o400000);
-            let mut f = opts
-                .open(&tmp)
-                .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-            f.write_all(contents)
-                .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &full) {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::bail!(
-                "failed to rename {} -> {}: {e}",
-                tmp.display(),
-                full.display()
-            );
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&full) {
-                let mut perms = meta.permissions();
-                perms.set_mode(if executable { 0o755 } else { 0o644 });
-                let _ = std::fs::set_permissions(&full, perms);
-            }
-        }
+        write_file_atomic(&full, &root, contents, executable)?;
     }
 
     println!("updated to {target_desc}");
@@ -495,7 +407,7 @@ fn materialize_merge(
         if keep_work.contains(path) {
             continue;
         }
-        if path.ends_with(".ootkeep") || path.ends_with(".oothave") {
+        if is_keep_marker(path) {
             continue;
         }
         if !take_target.contains(path) {
@@ -515,7 +427,8 @@ fn materialize_merge(
             }
             if let Some(parent) = p.parent() {
                 let mut cur = parent;
-                while cur != root
+                while cur.starts_with(root)
+                    && cur != root
                     && cur
                         .file_name()
                         .is_some_and(|n| n != ".oot" && n != ".git" && n != ".jj")
@@ -595,77 +508,7 @@ fn materialize_merge(
 
         let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         let full = root.join(path);
-        if let Ok(meta) = std::fs::symlink_metadata(&full) {
-            if meta.file_type().is_symlink() {
-                match std::fs::remove_file(&full) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => anyhow::bail!("failed to remove symlink {}: {e}", full.display()),
-                }
-            }
-        }
-        if let Some(parent) = full.parent() {
-            if let Ok(rel) = parent.strip_prefix(root) {
-                let mut cur = root.to_path_buf();
-                for comp in rel.components() {
-                    cur.push(comp);
-                    if let Ok(meta) = std::fs::symlink_metadata(&cur) {
-                        if meta.file_type().is_symlink() {
-                            match std::fs::remove_file(&cur) {
-                                Ok(()) => {}
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                                Err(e) => {
-                                    anyhow::bail!("failed to remove symlink {}: {e}", cur.display())
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            std::fs::create_dir_all(parent)?;
-        }
-        let dir = full.parent().unwrap_or(Path::new(root));
-        let tmp_name = format!(
-            ".oot-tmp-{}-{}",
-            random_hex(),
-            full.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "file".to_string())
-        );
-        let tmp = dir.join(tmp_name);
-        if let Ok(meta) = std::fs::symlink_metadata(&tmp) {
-            if meta.file_type().is_symlink() {
-                let _ = std::fs::remove_file(&tmp);
-            }
-        }
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create_new(true);
-            opts.custom_flags(0o400000);
-            let mut f = opts
-                .open(&tmp)
-                .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
-            f.write_all(contents)
-                .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
-        }
-        if let Err(e) = std::fs::rename(&tmp, &full) {
-            let _ = std::fs::remove_file(&tmp);
-            anyhow::bail!(
-                "failed to rename {} -> {}: {e}",
-                tmp.display(),
-                full.display()
-            );
-        }
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Ok(meta) = std::fs::metadata(&full) {
-                let mut perms = meta.permissions();
-                perms.set_mode(if executable { 0o755 } else { 0o644 });
-                let _ = std::fs::set_permissions(&full, perms);
-            }
-        }
+        write_file_atomic(&full, root, contents, executable)?;
     }
 
     if !conflicts.is_empty() {
@@ -692,6 +535,107 @@ fn materialize_merge(
         println!("updated to {target_desc} (merged)");
     }
     Ok(std::process::ExitCode::SUCCESS)
+}
+
+fn is_keep_marker(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| name == ".ootkeep" || name == ".oothave")
+}
+
+fn write_file_atomic(full: &Path, root: &Path, contents: &[u8], executable: bool) -> Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(full) {
+        if meta.file_type().is_symlink() {
+            match std::fs::remove_file(full) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => anyhow::bail!("failed to remove symlink {}: {e}", full.display()),
+            }
+        }
+    }
+    if let Some(parent) = full.parent() {
+        if let Ok(rel) = parent.strip_prefix(root) {
+            let mut cur = root.to_path_buf();
+            for comp in rel.components() {
+                cur.push(comp);
+                if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+                    if meta.file_type().is_symlink() {
+                        match std::fs::remove_file(&cur) {
+                            Ok(()) => {}
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            Err(e) => {
+                                anyhow::bail!("failed to remove symlink {}: {e}", cur.display())
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let dir = full.parent().unwrap_or(root);
+    let full_name = full
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    // Truncate suffix if name is long to prevent ENAMETOOLONG
+    let suffix = if full_name.len() > 128 {
+        &full_name[..128]
+    } else {
+        &full_name
+    };
+    let tmp_name = format!(".oot-tmp-{}-{}", random_hex(), suffix);
+    let tmp = dir.join(tmp_name);
+
+    if let Ok(meta) = std::fs::symlink_metadata(&tmp) {
+        if meta.file_type().is_symlink() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    }
+
+    let write_res = (|| -> Result<()> {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(0o400000);
+        }
+        let mut f = opts
+            .open(&tmp)
+            .with_context(|| format!("failed to create temp file {}", tmp.display()))?;
+        f.write_all(contents)
+            .with_context(|| format!("failed to write temp file {}", tmp.display()))?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, full) {
+        let _ = std::fs::remove_file(&tmp);
+        anyhow::bail!(
+            "failed to rename {} -> {}: {e}",
+            tmp.display(),
+            full.display()
+        );
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = std::fs::metadata(full) {
+            let mut perms = meta.permissions();
+            perms.set_mode(if executable { 0o755 } else { 0o644 });
+            let _ = std::fs::set_permissions(full, perms);
+        }
+    }
+    Ok(())
 }
 
 /// 16-hex-char random suffix for temp files.

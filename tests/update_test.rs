@@ -566,3 +566,151 @@ fn test_update_ghost_branch_fails() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_update_vcs_dir_traversal_forbidden() {
+    use oot::store::validate_tree_path;
+    assert!(validate_tree_path(".git/hooks/pre-commit").is_err());
+    assert!(validate_tree_path(".GIT/config").is_err());
+    assert!(validate_tree_path("sub/.git/evil").is_err());
+    assert!(validate_tree_path(".oot/changes/000.json").is_err());
+    assert!(validate_tree_path(".jj/repo").is_err());
+    assert!(validate_tree_path("src/lib.rs").is_ok());
+    assert!(validate_tree_path("deep/nested/file.txt").is_ok());
+}
+
+#[test]
+fn test_update_keep_marker_exact_vs_suffix() {
+    let tmp = unique_tmp("keep-marker");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::create_dir_all(proj.join("logs")).unwrap();
+    std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
+    std::fs::write(proj.join("doc.ootkeep"), "regular text file\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    // Target change has neither
+    std::fs::write(proj.join("other.txt"), "hello\n").unwrap();
+    let _ = std::fs::remove_file(proj.join("doc.ootkeep"));
+    let (ok, msg) = oot(&["record", "-m", "second"], &proj);
+    assert!(ok, "{msg}");
+
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let lines: Vec<&str> = log.lines().collect();
+    let second_id = lines[0].split_whitespace().next().unwrap();
+    let first_id = lines[1].split_whitespace().next().unwrap();
+
+    // Restore first change
+    let (ok, msg) = oot(&["update", "--change", &first_id[..7], "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("logs/.ootkeep").exists());
+    assert!(proj.join("doc.ootkeep").exists());
+
+    // Update to second change with --force: logs/.ootkeep must survive, doc.ootkeep must be deleted
+    let (ok, msg) = oot(&["update", "--change", &second_id[..7], "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(
+        proj.join("logs/.ootkeep").exists(),
+        ".ootkeep marker must survive across updates"
+    );
+    assert!(
+        !proj.join("doc.ootkeep").exists(),
+        "regular file ending with .ootkeep must be deleted when not in target"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_branch_with_slashes() {
+    let tmp = unique_tmp("branch-slashes");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("feature.txt"), "feat\n").unwrap();
+    let (ok, msg) = oot(
+        &["record", "--branch", "feat/auth-v2", "-m", "feat commit"],
+        &proj,
+    );
+    assert!(ok, "{msg}");
+
+    let _ = std::fs::remove_file(proj.join("feature.txt"));
+    std::fs::write(proj.join("bugfix.txt"), "fix\n").unwrap();
+    let (ok, msg) = oot(
+        &["record", "--branch", "fix/bug#123", "-m", "fix commit"],
+        &proj,
+    );
+    assert!(ok, "{msg}");
+
+    // Switch between branches with slashes and special chars
+    let (ok, msg) = oot(&["update", "--branch", "feat/auth-v2", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("feature.txt").exists());
+    assert!(!proj.join("bugfix.txt").exists());
+
+    let (ok, msg) = oot(&["update", "--branch", "fix/bug#123", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("bugfix.txt").exists());
+    assert!(!proj.join("feature.txt").exists());
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_3way_conflict_preserves_work() {
+    let tmp = unique_tmp("3way-conflict");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    // Base change on main
+    std::fs::write(proj.join("a.txt"), "base a\n").unwrap();
+    std::fs::write(proj.join("b.txt"), "base b\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "main", "-m", "base"], &proj);
+    assert!(ok, "{msg}");
+
+    // Target change on branch feat: target deletes a.txt and modifies b.txt
+    let _ = std::fs::remove_file(proj.join("a.txt"));
+    std::fs::write(proj.join("b.txt"), "target b\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "target"], &proj);
+    assert!(ok, "{msg}");
+
+    // Reset back to main
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+
+    // Create local modifications on main: work modifies a.txt and modifies b.txt differently
+    std::fs::write(proj.join("a.txt"), "local dirty a\n").unwrap();
+    std::fs::write(proj.join("b.txt"), "local dirty b\n").unwrap();
+
+    // 3-way update to feat without --force: must NOT overwrite local modifications
+    let (ok, out) = oot(&["update", "--branch", "feat"], &proj);
+    assert!(
+        ok,
+        "update with conflicts should succeed and keep work: {out}"
+    );
+    assert!(
+        out.contains("merge conflicts") || out.contains("conflict"),
+        "{out}"
+    );
+
+    // Local work must be preserved
+    assert_eq!(
+        std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+        "local dirty a\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("b.txt")).unwrap(),
+        "local dirty b\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

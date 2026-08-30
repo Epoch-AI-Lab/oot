@@ -396,6 +396,10 @@ impl Store {
     /// otherwise the prefix must select exactly one stored change or this
     /// fails loudly listing every candidate.
     pub fn resolve_change(&self, id_or_prefix: &str) -> Result<String> {
+        if id_or_prefix.contains('/') || id_or_prefix.contains('\\') || id_or_prefix.contains("..")
+        {
+            bail!("invalid change id '{id_or_prefix}'");
+        }
         let changes = self.root.join(CHANGES_DIR);
         if changes.join(format!("{id_or_prefix}.json")).exists() {
             return Ok(id_or_prefix.to_string());
@@ -506,6 +510,9 @@ impl Store {
 
     /// Load a change record by id.
     pub fn get_change(&self, id: &str) -> Result<ChangeRecord> {
+        if id.contains('/') || id.contains('\\') || id.contains("..") {
+            bail!("invalid change id '{id}'");
+        }
         let path = self.root.join(CHANGES_DIR).join(format!("{id}.json"));
         let bytes =
             std::fs::read(&path).with_context(|| format!("change {id} not found in store"))?;
@@ -1249,7 +1256,17 @@ pub fn validate_tree_path(path: &str) -> Result<()> {
             Component::Prefix(_) => {
                 bail!("invalid path in tree: '{}': prefix component", path);
             }
-            _ => {}
+            Component::Normal(os) => {
+                let name = os.to_string_lossy();
+                let lower = name.to_ascii_lowercase();
+                if lower == ".git" || lower == ".oot" || lower == ".jj" {
+                    bail!(
+                        "invalid path in tree: '{}': cannot write into vcs directory '{}'",
+                        path,
+                        name
+                    );
+                }
+            }
         }
     }
     Ok(())
