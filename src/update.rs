@@ -193,7 +193,7 @@ pub fn run(
     // marker (and thus the dir) instead of deleting it. This lets you keep
     // empty dirs like `logs/` or `tmp/` across updates.
     for path in work.keys() {
-        if is_keep_marker(path) {
+        if !force && is_keep_marker(path) {
             continue;
         }
         if !target_files.contains_key(path) {
@@ -225,8 +225,8 @@ pub fn run(
                             continue;
                         }
                     }
-                    // Keep placeholder dirs that hold a keep marker.
-                    if cur.join(".ootkeep").exists() || cur.join(".oothave").exists() {
+                    // Keep placeholder dirs that hold a keep marker (unless --force).
+                    if !force && (cur.join(".ootkeep").exists() || cur.join(".oothave").exists()) {
                         break;
                     }
                     let empty = std::fs::read_dir(cur)
@@ -254,9 +254,18 @@ pub fn run(
     }
 
     for (path, contents) in &snapshot.files {
+        let full = root.join(path);
+        if !force && full.exists() && !work.contains_key(path) {
+            if let Ok(existing_bytes) = std::fs::read(&full) {
+                if existing_bytes != *contents {
+                    anyhow::bail!(
+                        "untracked working file '{path}' would be overwritten by update; commit, move, or pass --force"
+                    );
+                }
+            }
+        }
         // Preserve exec bits from tree.
         let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
-        let full = root.join(path);
         write_file_atomic(&full, &root, contents, executable)?;
     }
 
@@ -506,8 +515,18 @@ fn materialize_merge(
             continue;
         }
 
-        let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         let full = root.join(path);
+        if !is_filtered_path && full.exists() && !work.contains_key(path) {
+            if let Ok(existing_bytes) = std::fs::read(&full) {
+                if existing_bytes != *contents {
+                    anyhow::bail!(
+                        "untracked working file '{path}' would be overwritten by update; commit, move, or pass --force"
+                    );
+                }
+            }
+        }
+
+        let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         write_file_atomic(&full, root, contents, executable)?;
     }
 

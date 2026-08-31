@@ -7,19 +7,29 @@ use serde::Deserialize;
 use std::path::Path;
 
 /// Thresholds for *meaning* disputes. Visibility has its own policy.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct MeaningPolicy {
     /// Severity names (lowercase, e.g. `"high"`) that block the change.
+    #[serde(default = "default_block_on")]
     pub block_on: Vec<String>,
     /// Severity names (lowercase, e.g. `"review"`, `"high"`) that require human review.
+    #[serde(default = "default_review_on")]
     pub review_on: Vec<String>,
+}
+
+fn default_block_on() -> Vec<String> {
+    vec!["high".into()]
+}
+
+fn default_review_on() -> Vec<String> {
+    vec!["review".into(), "high".into()]
 }
 
 impl Default for MeaningPolicy {
     fn default() -> Self {
         MeaningPolicy {
-            block_on: vec!["high".into()],
-            review_on: vec!["review".into(), "high".into()],
+            block_on: default_block_on(),
+            review_on: default_review_on(),
         }
     }
 }
@@ -42,8 +52,12 @@ impl MeaningPolicy {
             if d.kind != Kind::Meaning || d.id == crate::dispute::EMPTY_CHANGE_ID {
                 continue;
             }
-            let s = d.severity.as_str();
-            if self.block_on.iter().any(|b| b.eq_ignore_ascii_case(s)) {
+            let s = d.severity.as_str().trim();
+            if self
+                .block_on
+                .iter()
+                .any(|b| b.trim().eq_ignore_ascii_case(s))
+            {
                 return Verdict::Blocked;
             }
         }
@@ -54,10 +68,11 @@ impl MeaningPolicy {
     pub fn requires_review(&self, disputes: &[Dispute]) -> bool {
         disputes.iter().any(|d| {
             d.kind == Kind::Meaning
+                && d.id != crate::dispute::EMPTY_CHANGE_ID
                 && self
                     .review_on
                     .iter()
-                    .any(|r| r.eq_ignore_ascii_case(d.severity.as_str()))
+                    .any(|r| r.trim().eq_ignore_ascii_case(d.severity.as_str().trim()))
         })
     }
 
@@ -67,10 +82,11 @@ impl MeaningPolicy {
             .iter()
             .filter(|d| {
                 d.kind == Kind::Meaning
+                    && d.id != crate::dispute::EMPTY_CHANGE_ID
                     && self
                         .review_on
                         .iter()
-                        .any(|r| r.eq_ignore_ascii_case(d.severity.as_str()))
+                        .any(|r| r.trim().eq_ignore_ascii_case(d.severity.as_str().trim()))
             })
             .count()
     }

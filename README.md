@@ -74,7 +74,7 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 - [x] Change ingestion from git snapshots (in-memory via `git ls-tree`/`cat-file`) and materialized dirs
 - [x] Jujutsu ingestion (in-memory via `jj file list`/`file show`, revsets, real conflict detection)
 - [x] Visibility policy: private paths, private branches, embargo schedules
-- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript)
+- [x] Meaning disputes from the structural engine (tree-sitter: Rust, Go, JavaScript, TypeScript, TSX, Python)
 - [x] Docket format with visibility and embargo (JSON/TOML + render)
 - [x] In-memory path (no checkout needed for git)
 - [x] Git adapter with 3-way adjudication
@@ -85,26 +85,25 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 - [x] `oot log` / `oot status`: `[git]`/`[oot]` tags, offset-aware dates
 - [x] `oot update`: put any stored change back on disk, 3-way merge that keeps dirty work, `--force` to discard, `--dry-run` to preview, `.ootkeep` keeps placeholder dirs
 - [x] `oot adjudicate --change` + `oot docket`: judge stored changes directly, sidecar dockets + audit log
+- [x] `oot gc` / `oot prune`: sweep unreferenced changes, dockets, mappings, and pack/prune the bare Git ODB with grace periods
 - [x] Export to git: byte-identical round-trip (merges, binaries, unicode, non-UTC), sigs survive when not rebuilt
-- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, log to `.oot/export-log.jsonl`
+- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, log to `.oot/export-log.jsonl`
 
 Same-named defs in one file (two `render` methods) are tracked separately: we match identical bodies first, then pair the rest, so only the real change is reported.
 
-Cuts for now: nested ignore negation in pure-Oot projects, tags, sigs downstream of rebuilt history, gc, and a few more.
+Cuts for now: nested ignore negation in pure-Oot projects, tags, sigs downstream of rebuilt history, and a few more.
 
 ## License
 
-Adjudication runtime, docket format, adapters, store and exporter are MIT. A court that hides its logic is not a fucking court, so the gate stays open.
+Adjudication runtime, docket format, adapters, store, garbage collector, and exporter are MIT. A court that hides its logic is not a fucking court, so the gate stays open.
 
 ## Roadmap
 
 We havent built this shit yet. It needs real users to be worth the cost, and we have none so we aint rushing.
 
-- **Store-to-court adjudication.** Judge straight off stored changes, not snapshots. Ships next after `update`.
 - **Hosted intent scoring.** A model that checks what a change says vs what it does. Structural engine catches *that* code changed, this catches *what it means*. Needs a server and a model and someone to pay.
 - **Embargo distribution.** Actually sending held patches quietly to maintainers before the public diff. Needs keys and auth. Detection already ships.
-- **Per-subtree signature reuse.** Filtered export rebuilds every commit today, so clean sigs are lost. Reusing untouched subtrees would keep them.
-- **Store gc and pruning.** Store grows forever right now.
+- **Per-subtree signature reuse on rewritten commits.** Rebuilding with selective signature reuse.
 
 ## Try it
 
@@ -129,6 +128,8 @@ GIT_AUTHOR_NAME=you GIT_AUTHOR_EMAIL=you@example.com ./target/release/oot record
 ./target/release/oot log
 ./target/release/oot update --dry-run
 ./target/release/oot update --change a1b2c3d
+./target/release/oot gc --dry-run
+./target/release/oot gc --force
 ./target/release/oot export --out exported   # auto-applies ./visibility.toml when present
 ```
 

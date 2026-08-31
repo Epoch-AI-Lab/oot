@@ -82,7 +82,7 @@ impl GitAdapter {
     /// Compute the common ancestor commit SHA (merge-base) between two revisions.
     pub fn merge_base(&self, ref_a: &str, ref_b: &str) -> Result<String> {
         let output = Command::new("git")
-            .args(["merge-base", ref_a, ref_b])
+            .args(["merge-base", "--", ref_a, ref_b])
             .current_dir(&self.repo_root)
             .output()
             .with_context(|| {
@@ -90,10 +90,15 @@ impl GitAdapter {
             })?;
 
         if !output.status.success() {
-            return Err(anyhow!(
-                "Failed to find merge-base between '{ref_a}' and '{ref_b}': {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let msg = if err.is_empty() {
+                format!(
+                    "no common merge base found between '{ref_a}' and '{ref_b}' (unrelated histories)"
+                )
+            } else {
+                format!("Failed to find merge-base between '{ref_a}' and '{ref_b}': {err}")
+            };
+            return Err(anyhow!(msg));
         }
 
         Ok(String::from_utf8(output.stdout)?.trim().to_string())
@@ -102,7 +107,7 @@ impl GitAdapter {
     /// Extract commit authors across a revision or range (e.g. `base..head`).
     pub fn authors(&self, rev_range: &str) -> Result<Vec<String>> {
         let output = Command::new("git")
-            .args(["log", "--format=%an", rev_range])
+            .args(["log", "--format=%an", "--", rev_range])
             .current_dir(&self.repo_root)
             .output()
             .with_context(|| format!("Failed to query authors for range '{rev_range}'"))?;
@@ -126,7 +131,7 @@ impl GitAdapter {
     /// Extract an in-memory `Snapshot` directly from Git object storage without touching the working tree.
     pub fn extract_snapshot(&self, rev: &str) -> Result<Snapshot> {
         let output = Command::new("git")
-            .args(["ls-tree", "-r", "-z", rev])
+            .args(["ls-tree", "-r", "-z", "--", rev])
             .current_dir(&self.repo_root)
             .output()
             .with_context(|| format!("Failed to list tree for '{rev}'"))?;
@@ -150,9 +155,14 @@ impl GitAdapter {
             if let Some((meta, path)) = entry_str.split_once('\t') {
                 let parts: Vec<&str> = meta.split_whitespace().collect();
                 if parts.len() >= 3 && parts[1] == "blob" {
+                    // Skip symlinks (mode 120000)
+                    if parts[0] == "120000" {
+                        continue;
+                    }
+                    crate::store::validate_tree_path(path)?;
                     let blob_sha = parts[2];
                     let blob_output = Command::new("git")
-                        .args(["cat-file", "-p", blob_sha])
+                        .args(["cat-file", "blob", blob_sha])
                         .current_dir(&self.repo_root)
                         .output()
                         .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
@@ -225,13 +235,14 @@ impl GitAdapter {
             .any(|d| d.kind == crate::dispute::Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
+        let is_embargoed = visibility_policy.is_under_embargo();
         let (disputes, intent, verdict) = finalize_adjudication(
             disputes,
             &base_snapshot.files,
             &head_snapshot.files,
             options.intent.clone(),
             cloaked,
-            visibility_policy.embargo_until.is_some(),
+            is_embargoed,
             meaning_policy,
         );
 
@@ -244,7 +255,11 @@ impl GitAdapter {
             intent,
             authors,
             verdict,
-            embargo: visibility_policy.embargo_note(),
+            embargo: if is_embargoed {
+                visibility_policy.embargo_note()
+            } else {
+                None
+            },
         };
 
         Ok(docket)

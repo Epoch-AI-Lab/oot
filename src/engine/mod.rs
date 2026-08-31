@@ -6,7 +6,7 @@
 use crate::change::Snapshot;
 use crate::dispute::{Dispute, Kind, Severity};
 use crate::engine::language::{registry, LangConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use tree_sitter::{Language, Node, Parser, Tree};
 
 pub mod language;
@@ -272,7 +272,18 @@ impl Engine {
                             && t_changed.is_empty()
                             && t_gone.is_empty()
                         {
-                            if contained_in(o_list, t_list) || contained_in(t_list, o_list) {
+                            if o_list == t_list {
+                                continue;
+                            }
+                            let o_extra = strip_common(o_list, t_list);
+                            let t_extra = strip_common(t_list, o_list);
+                            if o_extra.is_empty() && !t_extra.is_empty() {
+                                for d in t_extra {
+                                    pending_added.push((name.clone(), d.clone()));
+                                }
+                                continue;
+                            }
+                            if !o_extra.is_empty() && t_extra.is_empty() {
                                 continue;
                             }
                             let row = t_list
@@ -313,8 +324,11 @@ impl Engine {
                             }
                             continue;
                         }
-                        // Case 2: Unilateral change by target (ours) - no dispute for incoming merge
+                        // Case 2: Unilateral change by target (ours) - no dispute for target changes, but track incoming additions
                         if t_changed.is_empty() && t_gone.is_empty() {
+                            for ti in &t_fresh {
+                                pending_added.push((name.clone(), t_list[*ti].clone()));
+                            }
                             continue;
                         }
                         // Case 3: Both branches modified relative to base
@@ -372,6 +386,7 @@ impl Engine {
                         &added_theirs,
                     );
                     let mut claimed_theirs: Vec<(&str, usize)> = Vec::new();
+                    let mut claimed_base: HashSet<&str> = HashSet::new();
                     for d in &divergent_renames {
                         let row = if d.theirs_row > 0 {
                             d.theirs_row
@@ -396,15 +411,19 @@ impl Engine {
                             Severity::High,
                         ));
                         claimed_theirs.push((&d.theirs_new_name, d.theirs_row));
+                        claimed_base.insert(&d.base_name);
                     }
-                    // Defs already reported as the incoming half of a
-                    // divergent rename must not resurface as Low additions.
+                    // Defs already reported as part of a divergent rename
+                    // must not resurface as Low additions or Review removals.
                     if !claimed_theirs.is_empty() {
                         pending_added.retain(|(name, def)| {
                             !claimed_theirs
                                 .iter()
                                 .any(|(cn, row)| *cn == name.as_str() && *row == def.row)
                         });
+                    }
+                    if !claimed_base.is_empty() {
+                        pending_removed.retain(|(name, _)| !claimed_base.contains(name.as_str()));
                     }
 
                     // Pair incoming removals with incoming additions of
@@ -504,7 +523,7 @@ impl Engine {
 
 /// One extracted definition: source text, 1-based row, and a rename
 /// signature (the body with its own name blanked out).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct FnDef {
     src: String,
     row: usize,
@@ -705,7 +724,7 @@ fn file_function_summary(tree: Option<&Tree>, source: &str, config: &LangConfig)
     let count: usize = fns.values().map(Vec::len).sum();
     let preview: Vec<String> = names.iter().take(3).map(|s| s.to_string()).collect();
     let noun = if count == 1 { "function" } else { "functions" };
-    if count > 3 {
+    if names.len() > 3 {
         format!("{} {}: {}, …", count, noun, preview.join(", "))
     } else {
         format!("{} {}: {}", count, noun, preview.join(", "))
@@ -723,40 +742,47 @@ fn extract_functions(tree: Option<&Tree>, source: &str, config: &LangConfig) -> 
 }
 
 fn collect(node: Node, source: &str, map: &mut FunctionMap, config: &LangConfig) {
-    let mut matched = false;
+    let mut captured = false;
     for kind in config.function_kinds {
         if node.kind() == kind.node_kind {
-            matched = true;
             if let Some(key) = config.function_key(kind, node, source) {
-                let name_node = node.child_by_field_name("name");
-                insert(key, node, name_node, source, map);
+                let name_node = config.name_node(node);
+                if insert(key, node, name_node, source, map) {
+                    captured = true;
+                    break;
+                }
             }
         }
     }
-    for wrapped in config.wrapped_functions {
-        if node.kind() != wrapped.node_kind {
-            continue;
-        }
-        matched = true;
-        let (Some(name_node), Some(body)) = (
-            node.child_by_field_name(wrapped.name_field),
-            node.child_by_field_name(wrapped.body_field),
-        ) else {
-            continue;
-        };
-        if wrapped.name_kinds.contains(&name_node.kind())
-            && wrapped.body_kinds.contains(&body.kind())
-        {
-            let key = name_node
-                .utf8_text(source.as_bytes())
-                .unwrap_or("")
-                .to_string();
-            insert(key, body, None, source, map);
+    if !captured {
+        for wrapped in config.wrapped_functions {
+            if node.kind() != wrapped.node_kind {
+                continue;
+            }
+            let (Some(name_node), Some(raw_body)) = (
+                node.child_by_field_name(wrapped.name_field),
+                node.child_by_field_name(wrapped.body_field),
+            ) else {
+                continue;
+            };
+            let body = crate::engine::language::unwrap_callable(raw_body);
+            if wrapped.name_kinds.contains(&name_node.kind())
+                && wrapped.body_kinds.contains(&body.kind())
+            {
+                let key = name_node
+                    .utf8_text(source.as_bytes())
+                    .unwrap_or("")
+                    .to_string();
+                if insert(key, node, Some(name_node), source, map) {
+                    captured = true;
+                    break;
+                }
+            }
         }
     }
-    // Do not recurse into nodes that yielded a function: nested definitions
+    // Do not recurse into nodes that yielded a tracked function: nested definitions
     // are covered by the enclosing function's source span.
-    if matched {
+    if captured {
         return;
     }
     let mut cursor = node.walk();
@@ -767,24 +793,44 @@ fn collect(node: Node, source: &str, map: &mut FunctionMap, config: &LangConfig)
 
 /// Record a named function under `key`. Every definition is kept; diffing
 /// aligns same-key groups by content (see [`align_defs`]).
-fn insert(key: String, body: Node, name_node: Option<Node>, source: &str, map: &mut FunctionMap) {
+fn insert(
+    key: String,
+    body: Node,
+    name_node: Option<Node>,
+    source: &str,
+    map: &mut FunctionMap,
+) -> bool {
     if key.is_empty() {
-        return;
+        return false;
     }
-    let src = body.utf8_text(source.as_bytes()).unwrap_or("").to_string();
+    let Ok(src) = body.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let src = src.to_string();
     let row = body.start_position().row + 1;
     // Signature: the body with its own name blanked, so two functions
     // that differ only by what they are called compare equal and pair
     // as a rename.
     let signature = match name_node {
-        Some(n) if n.start_byte() >= body.start_byte() && n.end_byte() <= body.end_byte() => {
+        Some(n)
+            if n.start_byte() >= body.start_byte()
+                && n.end_byte() <= body.end_byte()
+                && n.start_byte() <= n.end_byte() =>
+        {
             let rel_start = n.start_byte() - body.start_byte();
             let rel_end = n.end_byte() - body.start_byte();
-            let mut sig = String::with_capacity(src.len());
-            sig.push_str(&src[..rel_start]);
-            sig.push('\u{0}');
-            sig.push_str(&src[rel_end..]);
-            sig
+            if rel_end <= src.len()
+                && src.is_char_boundary(rel_start)
+                && src.is_char_boundary(rel_end)
+            {
+                let mut sig = String::with_capacity(src.len());
+                sig.push_str(&src[..rel_start]);
+                sig.push('\u{0}');
+                sig.push_str(&src[rel_end..]);
+                sig
+            } else {
+                src.clone()
+            }
         }
         _ => src.clone(),
     };
@@ -793,6 +839,7 @@ fn insert(key: String, body: Node, name_node: Option<Node>, source: &str, map: &
         row,
         signature,
     });
+    true
 }
 
 #[cfg(test)]

@@ -152,6 +152,21 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Garbage collect and prune unreferenced changes, dockets, and objects.
+    #[command(alias = "prune")]
+    Gc {
+        /// Preview unreachable data without deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Prune immediately without waiting for grace period.
+        #[arg(long, short)]
+        force: bool,
+
+        /// Custom expiration cutoff (e.g. "now", "14d", "30d").
+        #[arg(long)]
+        expire: Option<String>,
+    },
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
@@ -332,13 +347,14 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let mut disputes = eng.diff_snapshots(&change.base, &change.head)?;
             disputes.extend(vis_disputes);
 
+            let is_embargoed = visibility_policy.is_under_embargo();
             let (disputes, intent, verdict) = finalize_adjudication(
                 disputes,
                 &change.base.files,
                 &change.head.files,
                 intent.clone(),
                 cloaked,
-                visibility_policy.embargo_until.is_some(),
+                is_embargoed,
                 &meaning_policy,
             );
 
@@ -351,7 +367,11 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 intent,
                 authors: change.authors.clone(),
                 verdict,
-                embargo: visibility_policy.embargo_note(),
+                embargo: if is_embargoed {
+                    visibility_policy.embargo_note()
+                } else {
+                    None
+                },
             };
 
             print!("{}", docket.render());
@@ -562,9 +582,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 }
             };
 
-            // An embargo holds every change: there is nothing safe to export.
-            if let Some(date) = policy.as_ref().and_then(|p| p.embargo_until.as_deref()) {
-                anyhow::bail!("export refused: store is under embargo until {date}");
+            // An active embargo holds every change: there is nothing safe to export.
+            if let Some(p) = policy.as_ref() {
+                if p.is_under_embargo() {
+                    let date = p.embargo_until.as_deref().unwrap_or("active");
+                    anyhow::bail!("export refused: store is under embargo until {date}");
+                }
             }
 
             let out_path = std::path::PathBuf::from(&out);
@@ -581,10 +604,22 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             store.replay(&out_path, policy.as_ref())?;
 
+            let mut first_exported_branch = None;
+
             for (branch, head_id) in &refs {
+                if let Some(p) = &policy {
+                    if p.branch_is_private(branch) {
+                        store.log_branch_omitted(branch, head_id)?;
+                        println!("branch {branch} omitted (private branch)");
+                        continue;
+                    }
+                }
                 match store.branch_head_sha(head_id)? {
                     Some(sha) => {
                         store.point_ref(&out_path, branch, &sha)?;
+                        if first_exported_branch.is_none() {
+                            first_exported_branch = Some(branch.clone());
+                        }
                         println!("branch {branch} -> {sha}");
                     }
                     None => {
@@ -594,9 +629,15 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 }
             }
 
-            // Point HEAD at the first branch so `git log` works immediately.
-            let first = format!("refs/heads/{}", refs[0].0);
-            run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
+            // Point HEAD at the first exported branch so `git log` works immediately.
+            if let Some(first_branch) = first_exported_branch {
+                let first = format!("refs/heads/{first_branch}");
+                run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
+            } else {
+                println!(
+                    "warning: all branches were withheld by policy; no refs exported to {out}"
+                );
+            }
 
             println!(
                 "exported to {out}\nnext: cd {out} && git remote add origin <url> && git push -u origin --all"
@@ -619,6 +660,75 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             force,
             dry_run,
         } => update::run(change, branch, force, dry_run),
+        Commands::Gc {
+            dry_run,
+            force,
+            expire,
+        } => {
+            let root = std::env::current_dir()?;
+            let store = Store::open(&root)?;
+
+            let inferred_branch = resolve_branch(&store, None).ok();
+            let mut extra_roots = Vec::new();
+            if let Some(b) = inferred_branch {
+                if let Ok(Some(hid)) = store.head_id(&b) {
+                    extra_roots.push(hid);
+                }
+            }
+
+            let expire_cutoff = if force || expire.as_deref() == Some("now") {
+                None
+            } else if let Some(exp) = &expire {
+                let exp = exp.trim();
+                let (num_str, multiplier) = if let Some(stripped) = exp.strip_suffix('d') {
+                    (stripped, 86400)
+                } else if let Some(stripped) = exp.strip_suffix('w') {
+                    (stripped, 7 * 86400)
+                } else if let Some(stripped) = exp.strip_suffix('h') {
+                    (stripped, 3600)
+                } else if let Some(stripped) = exp.strip_suffix('m') {
+                    (stripped, 60)
+                } else {
+                    (exp, 86400)
+                };
+                let val: u64 = num_str
+                    .parse()
+                    .context("invalid expiration format (use e.g. '14d', '2w', '12h', or 'now')")?;
+                let secs = val.saturating_mul(multiplier);
+                Some(
+                    std::time::SystemTime::now()
+                        .checked_sub(std::time::Duration::from_secs(secs))
+                        .unwrap_or(std::time::UNIX_EPOCH),
+                )
+            } else {
+                Some(
+                    std::time::SystemTime::now()
+                        .checked_sub(std::time::Duration::from_secs(14 * 86400))
+                        .unwrap_or(std::time::UNIX_EPOCH),
+                )
+            };
+
+            let stats = store.gc(&extra_roots, expire_cutoff, force, dry_run)?;
+
+            if dry_run {
+                println!("  OOT GC (DRY RUN)");
+                println!("  ─────────────────────────────────────────");
+                println!("  live changes:      {}", stats.live_changes);
+                println!("  eligible changes:  {}", stats.changes_pruned);
+                println!("  eligible dockets:  {}", stats.dockets_pruned);
+                println!("  eligible map:      {}", stats.map_pruned);
+                println!("  eligible export:   {}", stats.export_pruned);
+            } else {
+                println!("  OOT GC");
+                println!("  ─────────────────────────────────────────");
+                println!("  live changes:    {}", stats.live_changes);
+                println!("  pruned changes:  {}", stats.changes_pruned);
+                println!("  pruned dockets:  {}", stats.dockets_pruned);
+                println!("  pruned map:      {}", stats.map_pruned);
+                println!("  pruned export:   {}", stats.export_pruned);
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
     }
 }
 

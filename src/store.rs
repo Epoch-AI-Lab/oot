@@ -560,6 +560,9 @@ impl Store {
         let mut out = Vec::new();
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
+            if !entry.path().is_file() {
+                continue;
+            }
             let raw = entry.file_name().to_string_lossy().to_string();
             let name = decode_branch(&raw);
             let id = std::fs::read_to_string(entry.path())?.trim().to_string();
@@ -598,9 +601,8 @@ impl Store {
     /// kept tree is rewritten minus those paths, children remap to their
     /// nearest kept ancestors, and changes left empty by stripping are
     /// skipped. Every withholding decision lands in `.oot/export-log.jsonl`.
-    /// Filtering any part of history disables the identity fast path for the
-    /// whole export — rebuilt history must be internally consistent, so no
-    /// original objects are reused alongside it.
+    /// Untouched commits and clean prefixes take the identity fast path on a
+    /// per-commit basis, preserving original commit hashes and GPG signatures.
     pub fn replay(
         &self,
         out_repo: &Path,
@@ -621,14 +623,22 @@ impl Store {
                 .as_encoded_bytes(),
         )?;
 
-        let filtering = policy.is_some_and(|p| !p.private_paths.is_empty());
+        let filtering =
+            policy.is_some_and(|p| !p.private_paths.is_empty() || !p.private_branches.is_empty());
 
         // Export mappings are only valid for the policy they were produced
         // under: a filtered export's shas mean nothing to an unfiltered one
         // and vice versa. A changed policy wipes the cache before anything
         // can silently mix decisions from two regimes.
         let filter_key = match policy {
-            Some(p) if filtering => p.private_paths.join("\u{1f}"),
+            Some(p) if filtering => {
+                format!(
+                    "{}\u{1f}{}\u{1f}{}",
+                    p.private_paths.join(","),
+                    p.private_branches.join(","),
+                    p.embargo_until.as_deref().unwrap_or_default()
+                )
+            }
             _ => String::new(),
         };
         self.reset_export_cache_if_policy_changed(&filter_key)?;
@@ -664,86 +674,92 @@ impl Store {
                     tree_of.insert(sha.clone(), tree);
                 }
                 sha_of.insert(id.clone(), sha.clone());
+                if record.source_sha.as_deref() == Some(&sha) {
+                    source_sha_of.insert(id.clone(), sha.clone());
+                }
                 exported.push((id, sha));
                 continue;
             }
 
-            // Identity fast path: reuse the original commit object when the
-            // whole ancestry below is byte-exact, so signatures and other
-            // extra headers survive without reconstruction. Never taken while
-            // filtering: reused objects must not mix with rebuilt history.
-            if !filtering {
-                if let Some(orig) = &record.source_sha {
-                    let parents_exact = record.parents.iter().all(|p| {
-                        sha_of
-                            .get(p)
-                            .is_some_and(|e| source_sha_of.get(p) == Some(e))
-                    });
-                    if parents_exact && self.commit_object_exists(orig)? {
-                        std::fs::write(self.export_map_path(&id), orig)?;
-                        sha_of.insert(id.clone(), orig.clone());
-                        source_sha_of.insert(id.clone(), orig.clone());
-                        exported.push((id.clone(), orig.clone()));
-                        continue;
-                    }
-                }
-            }
-
-            // Filtered path: withhold tainted changes, strip kept trees,
-            // remap parents to nearest kept ancestors.
+            // In filtered mode, check if the change was tainted and withheld.
             if filtering {
                 if let Some(reason) = withheld.get(&id) {
                     self.log_withheld(&id, record.source_sha.as_deref(), reason)?;
                     continue;
                 }
-                let pol = policy.unwrap();
-                let tree = self.strip_tree(&record.tree, pol, "")?;
-                let mut parent_shas: Vec<String> = Vec::new();
+            }
+
+            // Stripped tree for filtered exports, original tree otherwise.
+            let stripped_tree = if filtering {
+                self.strip_tree(&record.tree, policy.unwrap(), "")?
+            } else {
+                record.tree.clone()
+            };
+
+            // Filtered path: check if the change was left empty over its kept ancestry.
+            let parent_shas: Vec<String> = if filtering {
+                let mut ps = Vec::new();
                 for p in &record.parents {
                     for anc in self.nearest_kept(p, &sha_of)? {
-                        if !parent_shas.contains(&anc) {
-                            parent_shas.push(anc);
+                        if !ps.contains(&anc) {
+                            ps.push(anc);
                         }
                     }
                 }
-
-                // A change left empty by stripping carries nothing over its
-                // kept ancestry: skip it rather than ship an empty commit.
-                // Root commits are always kept so children retain a root.
-                let empty_over_ancestry = !parent_shas.is_empty()
-                    && parent_shas.iter().all(|p| tree_of.get(p) == Some(&tree));
+                let empty_over_ancestry =
+                    !ps.is_empty() && ps.iter().all(|p| tree_of.get(p) == Some(&stripped_tree));
                 if empty_over_ancestry {
                     let why = "empty after private-path stripping".to_string();
                     self.log_withheld(&id, record.source_sha.as_deref(), &why)?;
                     continue;
                 }
-
-                let mut cmd = self.commit_tree_cmd(&tree, &record);
-                for p in &parent_shas {
-                    cmd.args(["-p", p]);
+                ps
+            } else {
+                let missing = record
+                    .parents
+                    .iter()
+                    .filter(|p| !sha_of.contains_key(*p))
+                    .count();
+                if missing > 0 {
+                    bail!("change {id} references unexported parents");
                 }
-                let sha = self.finish_commit(cmd, &record.message, &id)?;
-                tree_of.insert(sha.clone(), tree);
-                sha_of.insert(id.clone(), sha.clone());
-                exported.push((id.clone(), sha));
-                continue;
+                record.parents.iter().map(|p| sha_of[p].clone()).collect()
+            };
+
+            // Identity fast path: reuse the original commit object when the
+            // tree was untouched by filtering and the whole ancestry below is
+            // byte-exact. This preserves GPG signatures, encodings, and
+            // commit SHAs across clean history prefixes and untouched subtrees.
+            if let Some(orig) = &record.source_sha {
+                let tree_untouched = stripped_tree == record.tree;
+                let parents_exact = record.parents.iter().all(|p| {
+                    sha_of
+                        .get(p)
+                        .is_some_and(|e| source_sha_of.get(p) == Some(e))
+                });
+                if tree_untouched && parents_exact && self.commit_object_exists(orig)? {
+                    std::fs::write(self.export_map_path(&id), orig)?;
+                    sha_of.insert(id.clone(), orig.clone());
+                    source_sha_of.insert(id.clone(), orig.clone());
+                    if filtering {
+                        tree_of.insert(orig.clone(), stripped_tree);
+                    }
+                    exported.push((id.clone(), orig.clone()));
+                    continue;
+                }
             }
 
-            let missing = record
-                .parents
-                .iter()
-                .filter(|p| !sha_of.contains_key(*p))
-                .count();
-            if missing > 0 {
-                bail!("change {id} references unexported parents");
-            }
-            let mut cmd = self.commit_tree_cmd(&record.tree, &record);
-            for p in &record.parents {
-                cmd.args(["-p", &sha_of[p]]);
+            // Reconstruction path: rebuild commit with remapped parents.
+            let mut cmd = self.commit_tree_cmd(&stripped_tree, &record);
+            for p in &parent_shas {
+                cmd.args(["-p", p]);
             }
             let sha = self.finish_commit(cmd, &record.message, &id)?;
+            if filtering {
+                tree_of.insert(sha.clone(), stripped_tree);
+            }
             sha_of.insert(id.clone(), sha.clone());
-            exported.push((id, sha));
+            exported.push((id.clone(), sha));
         }
         Ok(exported)
     }
@@ -777,13 +793,14 @@ impl Store {
     }
 
     /// Nearest exported ancestors of change `id`, walking up through any
-    /// changes that were withheld or skipped. Order-stable and deduped.
+    /// changes that were withheld or skipped. FIFO queue preserves parent order.
     fn nearest_kept(&self, id: &str, sha_of: &HashMap<String, String>) -> Result<Vec<String>> {
         let mut out: Vec<String> = Vec::new();
-        let mut queue = vec![id.to_string()];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(id.to_string());
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(id.to_string());
-        while let Some(cur) = queue.pop() {
+        while let Some(cur) = queue.pop_front() {
             if let Some(sha) = sha_of.get(&cur) {
                 if !out.contains(sha) {
                     out.push(sha.clone());
@@ -792,7 +809,7 @@ impl Store {
             }
             for p in self.get_change(&cur)?.parents {
                 if seen.insert(p.clone()) {
-                    queue.push(p);
+                    queue.push_back(p);
                 }
             }
         }
@@ -803,16 +820,17 @@ impl Store {
     /// walking up through withheld/skipped changes. `None` means the branch's
     /// entire history was withheld and the ref should be omitted.
     pub fn branch_head_sha(&self, head_id: &str) -> Result<Option<String>> {
-        let mut queue = vec![head_id.to_string()];
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(head_id.to_string());
         let mut seen: HashSet<String> = HashSet::new();
         seen.insert(head_id.to_string());
-        while let Some(cur) = queue.pop() {
+        while let Some(cur) = queue.pop_front() {
             if let Some(sha) = self.exported_sha(&cur)? {
                 return Ok(Some(sha));
             }
             for p in self.get_change(&cur)?.parents {
                 if seen.insert(p.clone()) {
-                    queue.push(p);
+                    queue.push_back(p);
                 }
             }
         }
@@ -892,8 +910,13 @@ impl Store {
             let sha = parts.next().unwrap_or_default().to_string();
 
             match kind.as_str() {
-                // Gitlinks (submodules) are commit refs we never rewrite.
-                "commit" => lines.push(record.to_string()),
+                "commit" => {
+                    if policy.path_is_private(&path) {
+                        changed = true;
+                        continue;
+                    }
+                    lines.push(record.to_string());
+                }
                 "blob" => {
                     if policy.path_is_private(&path) {
                         changed = true;
@@ -906,7 +929,11 @@ impl Store {
                     if sub != sha {
                         changed = true;
                     }
-                    lines.push(format!("{mode} tree {sub}\t{name}"));
+                    if sub != EMPTY_TREE {
+                        lines.push(format!("{mode} tree {sub}\t{name}"));
+                    } else {
+                        changed = true;
+                    }
                 }
                 other => bail!("unexpected entry kind '{other}' in tree {tree}"),
             }
@@ -916,21 +943,30 @@ impl Store {
             return Ok(tree.to_string());
         }
 
+        if lines.is_empty() {
+            return Ok(EMPTY_TREE.to_string());
+        }
+
         use std::io::Write;
         let mut child = Command::new("git")
             .args(["--git-dir"])
             .arg(self.git_dir())
-            .arg("mktree")
+            .args(["mktree", "-z"])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
             .context("failed to run git mktree")?;
+        let mut payload = Vec::new();
+        for line in lines {
+            payload.extend_from_slice(line.as_bytes());
+            payload.push(0);
+        }
         child
             .stdin
             .take()
             .context("mktree has no stdin")?
-            .write_all(lines.join("\n").as_bytes())?;
+            .write_all(&payload)?;
         let output = child.wait_with_output()?;
         if !output.status.success() {
             bail!(
@@ -950,11 +986,23 @@ impl Store {
             .arg(self.git_dir())
             .arg("commit-tree")
             .arg(tree)
-            .env("GIT_AUTHOR_NAME", &record.author.name)
-            .env("GIT_AUTHOR_EMAIL", &record.author.email)
+            .env(
+                "GIT_AUTHOR_NAME",
+                record.author.name.replace('\n', " ").replace('\r', ""),
+            )
+            .env(
+                "GIT_AUTHOR_EMAIL",
+                record.author.email.replace('\n', " ").replace('\r', ""),
+            )
             .env("GIT_AUTHOR_DATE", record.author.date_env())
-            .env("GIT_COMMITTER_NAME", &record.committer.name)
-            .env("GIT_COMMITTER_EMAIL", &record.committer.email)
+            .env(
+                "GIT_COMMITTER_NAME",
+                record.committer.name.replace('\n', " ").replace('\r', ""),
+            )
+            .env(
+                "GIT_COMMITTER_EMAIL",
+                record.committer.email.replace('\n', " ").replace('\r', ""),
+            )
             .env("GIT_COMMITTER_DATE", record.committer.date_env())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -1056,6 +1104,358 @@ impl Store {
         }
         Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
     }
+
+    /// Discover all change IDs reachable from the given roots and all branch refs.
+    /// Fails loudly if any reachable change record cannot be read.
+    pub fn reachable_changes(&self, extra_roots: &[String]) -> Result<HashSet<String>> {
+        let mut reachable = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+
+        for root in extra_roots {
+            if !root.is_empty() {
+                queue.push_back(root.clone());
+            }
+        }
+
+        for (_, head_id) in self.refs()? {
+            queue.push_back(head_id);
+        }
+
+        while let Some(id) = queue.pop_front() {
+            if reachable.insert(id.clone()) {
+                let rec = self.get_change(&id)?;
+                for parent in rec.parents {
+                    if !reachable.contains(&parent) {
+                        queue.push_back(parent);
+                    }
+                }
+            }
+        }
+
+        Ok(reachable)
+    }
+
+    /// Garbage collect and prune unreferenced changes, dockets, mappings, and odb objects.
+    pub fn gc(
+        &self,
+        extra_roots: &[String],
+        expire_cutoff: Option<std::time::SystemTime>,
+        force: bool,
+        dry_run: bool,
+    ) -> Result<GcStats> {
+        let live = self.reachable_changes(extra_roots)?;
+        let mut stats = GcStats {
+            live_changes: live.len(),
+            ..Default::default()
+        };
+
+        let is_expired = |path: &Path| -> bool {
+            if force || expire_cutoff.is_none() {
+                return true;
+            }
+            if let Ok(meta) = std::fs::metadata(path) {
+                if let Ok(mtime) = meta.modified() {
+                    if let Some(cutoff) = expire_cutoff {
+                        return mtime <= cutoff;
+                    }
+                }
+            }
+            false
+        };
+
+        // Pre-scan unreferenced changes that are NOT expired, and pin all their DAG ancestors
+        let mut pinned_by_unexpired = HashSet::new();
+        let changes_dir = self.root.join(CHANGES_DIR);
+        if changes_dir.exists() {
+            let mut unexpired_queue = std::collections::VecDeque::new();
+            for entry in std::fs::read_dir(&changes_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                        if !live.contains(id) && !is_expired(&path) {
+                            unexpired_queue.push_back(id.to_string());
+                        }
+                    }
+                }
+            }
+            while let Some(id) = unexpired_queue.pop_front() {
+                if pinned_by_unexpired.insert(id.clone()) {
+                    if let Ok(rec) = self.get_change(&id) {
+                        for p in rec.parents {
+                            if !live.contains(&p) && !pinned_by_unexpired.contains(&p) {
+                                unexpired_queue.push_back(p);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 1. Changes directory
+        if changes_dir.exists() {
+            for entry in std::fs::read_dir(&changes_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+                        if !live.contains(file_name)
+                            && !pinned_by_unexpired.contains(file_name)
+                            && is_expired(&path)
+                        {
+                            if !dry_run {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    stats.changes_pruned += 1;
+                                }
+                            } else {
+                                stats.changes_pruned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Dockets directory
+        let dockets_dir = self.root.join("dockets");
+        if dockets_dir.exists() {
+            for entry in std::fs::read_dir(&dockets_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_stem().and_then(|s| s.to_str()) {
+                        if !live.contains(file_name)
+                            && !pinned_by_unexpired.contains(file_name)
+                            && is_expired(&path)
+                        {
+                            if !dry_run {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    stats.dockets_pruned += 1;
+                                }
+                            } else {
+                                stats.dockets_pruned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Map directory (commit sha -> change id)
+        let map_dir = self.root.join(MAP_DIR);
+        if map_dir.exists() {
+            for entry in std::fs::read_dir(&map_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Ok(target_id) = std::fs::read_to_string(&path) {
+                        let target_id = target_id.trim();
+                        if !live.contains(target_id)
+                            && !pinned_by_unexpired.contains(target_id)
+                            && is_expired(&path)
+                        {
+                            if !dry_run {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    stats.map_pruned += 1;
+                                }
+                            } else {
+                                stats.map_pruned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Export directory (change id -> exported commit sha)
+        let export_dir = self.root.join("export");
+        if export_dir.exists() {
+            for entry in std::fs::read_dir(&export_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() {
+                    if let Some(file_name) = path.file_name().and_then(|s| s.to_str()) {
+                        if file_name != "policy-key"
+                            && file_name != EXPORT_LOG
+                            && !live.contains(file_name)
+                            && !pinned_by_unexpired.contains(file_name)
+                            && is_expired(&path)
+                        {
+                            if !dry_run {
+                                if std::fs::remove_file(&path).is_ok() {
+                                    stats.export_pruned += 1;
+                                }
+                            } else {
+                                stats.export_pruned += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Rewrite .index retaining only changes that still exist on disk
+        if !dry_run && stats.changes_pruned > 0 {
+            if let Ok(old_index) = self.index() {
+                let kept_ordered: Vec<String> = old_index
+                    .into_iter()
+                    .filter(|id| changes_dir.join(format!("{id}.json")).exists())
+                    .collect();
+                let tmp_index = self.root.join(".index.tmp");
+                let mut content = String::new();
+                for id in kept_ordered {
+                    content.push_str(&id);
+                    content.push('\n');
+                }
+                std::fs::write(&tmp_index, content)?;
+                std::fs::rename(tmp_index, self.root.join(".index"))?;
+            }
+        }
+
+        // 6. Object DB compaction and prune: protect trees and commits for ALL preserved changes
+        if !dry_run && stats.changes_pruned > 0 {
+            // Clean up any preexisting stale gc refs
+            let existing_gc = Command::new("git")
+                .args(["--git-dir"])
+                .arg(self.git_dir())
+                .args(["for-each-ref", "--format=%(refname)", "refs/oot/gc"])
+                .output();
+            if let Ok(out) = existing_gc {
+                for line in String::from_utf8_lossy(&out.stdout).lines() {
+                    let r = line.trim();
+                    if !r.is_empty() {
+                        let _ = Command::new("git")
+                            .args(["--git-dir"])
+                            .arg(self.git_dir())
+                            .args(["update-ref", "-d", r])
+                            .output();
+                    }
+                }
+            }
+
+            let mut gc_refs = Vec::new();
+            let mut seen_refs = HashSet::new();
+
+            let mut remaining_ids = Vec::new();
+            if changes_dir.exists() {
+                for entry in std::fs::read_dir(&changes_dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Some(id) = path.file_stem().and_then(|s| s.to_str()) {
+                            remaining_ids.push(id.to_string());
+                        }
+                    }
+                }
+            }
+
+            for id in &remaining_ids {
+                let record = self.get_change(id)?;
+                if record.tree != EMPTY_TREE {
+                    let ref_path = format!("refs/oot/gc/{}", record.tree);
+                    if seen_refs.insert(ref_path.clone()) {
+                        let out = Command::new("git")
+                            .args(["--git-dir"])
+                            .arg(self.git_dir())
+                            .args(["update-ref", &ref_path, &record.tree])
+                            .output()
+                            .context("failed to write protective GC tree ref")?;
+                        if !out.status.success() {
+                            bail!(
+                                "git update-ref failed for {ref_path}: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        gc_refs.push(ref_path);
+                    }
+                }
+
+                if let Some(src) = &record.source_sha {
+                    let src_ref = format!("refs/oot/gc/{}", src);
+                    if seen_refs.insert(src_ref.clone()) {
+                        let out = Command::new("git")
+                            .args(["--git-dir"])
+                            .arg(self.git_dir())
+                            .args(["update-ref", &src_ref, src])
+                            .output()
+                            .context("failed to write protective GC source ref")?;
+                        if !out.status.success() {
+                            bail!(
+                                "git update-ref failed for {src_ref}: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        gc_refs.push(src_ref);
+                    }
+                }
+
+                if let Some(exported_sha) = self.exported_sha(id)? {
+                    let exp_ref = format!("refs/oot/gc/{}", exported_sha);
+                    if seen_refs.insert(exp_ref.clone()) {
+                        let out = Command::new("git")
+                            .args(["--git-dir"])
+                            .arg(self.git_dir())
+                            .args(["update-ref", &exp_ref, &exported_sha])
+                            .output()
+                            .context("failed to write protective GC export commit ref")?;
+                        if !out.status.success() {
+                            bail!(
+                                "git update-ref failed for {exp_ref}: {}",
+                                String::from_utf8_lossy(&out.stderr).trim()
+                            );
+                        }
+                        gc_refs.push(exp_ref);
+                    }
+                }
+            }
+
+            let repack_out = Command::new("git")
+                .args(["--git-dir"])
+                .arg(self.git_dir())
+                .args(["repack", "-a", "-d"])
+                .output()
+                .context("failed to repack git odb during gc")?;
+            if !repack_out.status.success() {
+                bail!(
+                    "git repack failed during gc: {}",
+                    String::from_utf8_lossy(&repack_out.stderr).trim()
+                );
+            }
+
+            let prune_out = Command::new("git")
+                .args(["--git-dir"])
+                .arg(self.git_dir())
+                .args(["prune", "--expire=now"])
+                .output()
+                .context("failed to prune git odb during gc")?;
+            if !prune_out.status.success() {
+                bail!(
+                    "git prune failed during gc: {}",
+                    String::from_utf8_lossy(&prune_out.stderr).trim()
+                );
+            }
+
+            for ref_path in gc_refs {
+                let _ = Command::new("git")
+                    .args(["--git-dir"])
+                    .arg(self.git_dir())
+                    .args(["update-ref", "-d", &ref_path])
+                    .output();
+            }
+        }
+
+        Ok(stats)
+    }
+}
+
+/// Summary statistics from a store garbage collection and pruning run.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GcStats {
+    pub live_changes: usize,
+    pub changes_pruned: usize,
+    pub dockets_pruned: usize,
+    pub map_pruned: usize,
+    pub export_pruned: usize,
 }
 
 /// One commit as read from a source repository, before becoming a record.

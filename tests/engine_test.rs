@@ -788,3 +788,372 @@ fn test_engine_3way_rename_vs_body_edit_reports_modify_delete_gap() {
         "3-way conflict: function `f` modified in incoming branch but deleted in target"
     );
 }
+
+#[test]
+fn test_engine_typescript_types_interfaces_and_functions() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/models.ts".to_string(),
+        r#"
+export type UserId = string;
+
+export interface User {
+    id: UserId;
+    name: string;
+}
+
+export enum Role {
+    Admin,
+    Member,
+}
+
+export function getUser(id: UserId): User {
+    return { id, name: "Alice" };
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/models.ts".to_string(),
+        r#"
+export type UserId = number;
+
+export interface User {
+    id: UserId;
+    name: string;
+    email: string;
+}
+
+export enum Role {
+    Admin,
+    Member,
+    Guest,
+}
+
+export function getUser(id: UserId): User {
+    return { id, name: "Alice", email: "alice@example.com" };
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 4, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `UserId`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `User`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `Role`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `getUser`"));
+}
+
+#[test]
+fn test_engine_typescript_arrow_and_wrapped_functions() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/handlers.ts".to_string(),
+        r#"
+export const calculateScore: (val: number) => number = (val) => {
+    return val * 10;
+};
+
+export class Service {
+    handle = async (req: Request): Promise<Response> => {
+        return new Response("ok");
+    };
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/handlers.ts".to_string(),
+        r#"
+export const calculateScore: (val: number) => number = (val) => {
+    return val * 20;
+};
+
+export class Service {
+    handle = async (req: Request): Promise<Response> => {
+        return new Response("updated");
+    };
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `calculateScore`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `handle`"));
+}
+
+#[test]
+fn test_engine_tsx_components() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/App.tsx".to_string(),
+        r#"
+export function Button(props: { text: string }) {
+    return <button>{props.text}</button>;
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/App.tsx".to_string(),
+        r#"
+export function Button(props: { text: string; primary?: boolean }) {
+    return <button className={props.primary ? "btn-primary" : "btn"}>{props.text}</button>;
+}
+
+export const Modal = ({ isOpen }: { isOpen: boolean }) => {
+    return isOpen ? <div>Modal</div> : null;
+};
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `Button`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "added function `Modal`"));
+}
+
+#[test]
+fn test_engine_python_decorators_and_async() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "app.py".to_string(),
+        r#"
+@app.route("/login")
+def login():
+    return "login page"
+
+async def fetch_data():
+    return await api.get()
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "app.py".to_string(),
+        r#"
+@app.route("/auth/login")
+@require_ssl
+def login():
+    return "login page"
+
+async def fetch_data():
+    return await api.get_v2()
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `login`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `fetch_data`"));
+}
+
+#[test]
+fn test_engine_typescript_object_literal_and_type_assertions() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/advanced.ts".to_string(),
+        r#"
+export const actions = {
+    fetchUser: async (id: string) => {
+        return { id, role: "user" };
+    },
+};
+
+export const compute = ((x: number) => x * 2) as const;
+export const validate = ((x: string) => x.length > 0) satisfies Validator;
+
+export abstract class BaseController {
+    abstract handle(): Promise<void>;
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/advanced.ts".to_string(),
+        r#"
+export const actions = {
+    fetchUser: async (id: string) => {
+        return { id, role: "admin" };
+    },
+};
+
+export const compute = ((x: number) => x * 4) as const;
+export const validate = ((x: string) => x.length > 5) satisfies Validator;
+
+export abstract class BaseController {
+    abstract handle(): Promise<Response>;
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 4, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `fetchUser`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `compute`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `validate`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `handle`"));
+}
+
+#[test]
+fn test_engine_python_decorated_class_methods() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "models.py".to_string(),
+        r#"
+@dataclass
+class UserModel:
+    id: int
+    name: str
+
+    def full_name(self) -> str:
+        return self.name
+
+    @classmethod
+    def create(cls, name: str):
+        return cls(id=1, name=name)
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "models.py".to_string(),
+        r#"
+@dataclass
+class UserModel:
+    id: int
+    name: str
+
+    def full_name(self) -> str:
+        return self.name.strip()
+
+    @classmethod
+    def create(cls, name: str):
+        return cls(id=2, name=name)
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+
+    assert_eq!(disputes.len(), 2, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `full_name`"));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "both sides changed `create`"));
+}
+
+#[test]
+fn test_engine_go_interface_methods() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "service.go".to_string(),
+        r#"
+package service
+
+type UserService interface {
+    GetUser(id int) (*User, error)
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "service.go".to_string(),
+        r#"
+package service
+
+type UserService interface {
+    GetUser(id int) (*User, error)
+    DeleteUser(id int) error
+}
+"#
+        .as_bytes()
+        .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail == "added function `DeleteUser`"));
+}

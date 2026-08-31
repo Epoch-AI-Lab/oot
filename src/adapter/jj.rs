@@ -211,12 +211,13 @@ impl JjAdapter {
         let mut conflicted = Vec::new();
 
         for path in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            crate::store::validate_tree_path(path)?;
             let content = self.run_bytes(&["file", "show", "-r", rev, "--", path])?;
             let text = String::from_utf8_lossy(&content);
-            if text
-                .lines()
-                .any(|l| l.starts_with("<<<<<<<") && l.contains("conflict"))
-            {
+            if text.lines().any(|l| {
+                l.starts_with("<<<<<<<")
+                    && (l.contains("conflict") || l.contains("===") || l.ends_with(">>>>>>>"))
+            }) {
                 conflicted.push(path.to_string());
             } else {
                 files.insert(path.to_string(), content);
@@ -302,13 +303,14 @@ impl JjAdapter {
             .any(|d| d.kind == Kind::Visibility && d.severity == Severity::High);
         disputes.extend(vis_disputes);
 
+        let is_embargoed = visibility_policy.is_under_embargo();
         let (disputes, intent, verdict) = finalize_adjudication(
             disputes,
             &base_snapshot.files,
             &head_snapshot.files,
             options.intent.clone(),
             cloaked,
-            visibility_policy.embargo_until.is_some(),
+            is_embargoed,
             meaning_policy,
         );
 
@@ -325,7 +327,11 @@ impl JjAdapter {
             intent,
             authors,
             verdict,
-            embargo: visibility_policy.embargo_note(),
+            embargo: if is_embargoed {
+                visibility_policy.embargo_note()
+            } else {
+                None
+            },
         };
 
         Ok(docket)

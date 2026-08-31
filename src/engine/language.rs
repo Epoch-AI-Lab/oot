@@ -77,13 +77,176 @@ impl LangConfig {
 
     /// The map key for a directly named function node: its `name` field text.
     pub fn function_key(&self, _kind: &FunctionKind, node: Node, source: &str) -> Option<String> {
-        let name_node = node.child_by_field_name("name")?;
+        let name_node = self.name_node(node)?;
         name_node
             .utf8_text(source.as_bytes())
             .ok()
             .map(str::to_string)
     }
+
+    /// Extract the identifier node carrying the definition's name.
+    pub fn name_node<'a>(&self, node: Node<'a>) -> Option<Node<'a>> {
+        if node.kind() == "decorated_definition" {
+            if let Some(def) = node.child_by_field_name("definition") {
+                // If it decorates a class, do not treat the whole class as a function.
+                if def.kind() == "class_definition" {
+                    return None;
+                }
+                if let Some(name) = def.child_by_field_name("name") {
+                    return Some(name);
+                }
+            }
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "class_definition" {
+                    return None;
+                }
+                if child.kind() == "function_definition" || child.kind() == "method_definition" {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        return Some(name);
+                    }
+                }
+            }
+            None
+        } else {
+            node.child_by_field_name("name")
+        }
+    }
 }
+
+/// Recursively unwrap expressions (`as const`, `satisfies`, type assertions, parentheses)
+/// down to the underlying callable node.
+pub fn unwrap_callable<'a>(mut node: Node<'a>) -> Node<'a> {
+    while node.kind() == "as_expression"
+        || node.kind() == "satisfies_expression"
+        || node.kind() == "type_assertion"
+        || node.kind() == "parenthesized_expression"
+        || node.kind() == "non_null_expression"
+        || node.kind() == "call_expression"
+    {
+        if node.kind() == "call_expression" {
+            if let Some(args) = node.child_by_field_name("arguments") {
+                let mut found = None;
+                let mut cursor = args.walk();
+                for child in args.children(&mut cursor) {
+                    if child.kind() == "arrow_function" || child.kind() == "function_expression" {
+                        found = Some(child);
+                        break;
+                    }
+                }
+                if let Some(c) = found {
+                    node = c;
+                    continue;
+                }
+            }
+            break;
+        }
+        if let Some(child) = node.child_by_field_name("expression") {
+            node = child;
+        } else if let Some(child) = node.child_by_field_name("value") {
+            node = child;
+        } else if let Some(child) = node.named_child(0) {
+            node = child;
+        } else {
+            break;
+        }
+    }
+    node
+}
+
+const TS_FUNCTION_KINDS: &[FunctionKind] = &[
+    FunctionKind {
+        node_kind: "function_declaration",
+    },
+    FunctionKind {
+        node_kind: "generator_function_declaration",
+    },
+    FunctionKind {
+        node_kind: "method_definition",
+    },
+    FunctionKind {
+        node_kind: "method_signature",
+    },
+    FunctionKind {
+        node_kind: "abstract_method_signature",
+    },
+    FunctionKind {
+        node_kind: "function_signature",
+    },
+    FunctionKind {
+        node_kind: "type_alias_declaration",
+    },
+    FunctionKind {
+        node_kind: "interface_declaration",
+    },
+    FunctionKind {
+        node_kind: "enum_declaration",
+    },
+];
+
+const JS_TS_WRAPPED_FUNCTIONS: &[WrappedFunction] = &[
+    WrappedFunction {
+        node_kind: "variable_declarator",
+        name_field: "name",
+        name_kinds: &["identifier"],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "assignment_expression",
+        name_field: "left",
+        name_kinds: &["identifier"],
+        body_field: "right",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "pair",
+        name_field: "key",
+        name_kinds: &["property_identifier", "identifier", "string"],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "field_definition",
+        name_field: "property",
+        name_kinds: &["property_identifier", "private_property_identifier"],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "field_definition",
+        name_field: "name",
+        name_kinds: &[
+            "property_identifier",
+            "private_property_identifier",
+            "identifier",
+        ],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "public_field_definition",
+        name_field: "name",
+        name_kinds: &[
+            "property_identifier",
+            "private_property_identifier",
+            "identifier",
+        ],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+    WrappedFunction {
+        node_kind: "property_definition",
+        name_field: "name",
+        name_kinds: &[
+            "property_identifier",
+            "private_property_identifier",
+            "identifier",
+        ],
+        body_field: "value",
+        body_kinds: CALLABLE_KINDS,
+    },
+];
 
 /// Registry of every language the structural engine understands.
 pub fn registry() -> Vec<LangConfig> {
@@ -99,11 +262,16 @@ pub fn registry() -> Vec<LangConfig> {
         },
         LangConfig {
             name: "python",
-            extensions: &["py"],
+            extensions: &["py", "pyi"],
             language: tree_sitter_python::LANGUAGE.into(),
-            function_kinds: &[FunctionKind {
-                node_kind: "function_definition",
-            }],
+            function_kinds: &[
+                FunctionKind {
+                    node_kind: "function_definition",
+                },
+                FunctionKind {
+                    node_kind: "decorated_definition",
+                },
+            ],
             wrapped_functions: &[],
         },
         LangConfig {
@@ -117,12 +285,18 @@ pub fn registry() -> Vec<LangConfig> {
                 FunctionKind {
                     node_kind: "method_declaration",
                 },
+                FunctionKind {
+                    node_kind: "method_elem",
+                },
+                FunctionKind {
+                    node_kind: "method_spec",
+                },
             ],
             wrapped_functions: &[],
         },
         LangConfig {
             name: "javascript",
-            extensions: &["js", "mjs", "cjs", "jsx"],
+            extensions: &["js", "mjs", "cjs"],
             language: tree_sitter_javascript::LANGUAGE.into(),
             function_kinds: &[
                 FunctionKind {
@@ -135,29 +309,21 @@ pub fn registry() -> Vec<LangConfig> {
                     node_kind: "method_definition",
                 },
             ],
-            wrapped_functions: &[
-                WrappedFunction {
-                    node_kind: "variable_declarator",
-                    name_field: "name",
-                    name_kinds: &["identifier"],
-                    body_field: "value",
-                    body_kinds: CALLABLE_KINDS,
-                },
-                WrappedFunction {
-                    node_kind: "assignment_expression",
-                    name_field: "left",
-                    name_kinds: &["identifier"],
-                    body_field: "right",
-                    body_kinds: CALLABLE_KINDS,
-                },
-                WrappedFunction {
-                    node_kind: "field_definition",
-                    name_field: "property",
-                    name_kinds: &["property_identifier", "private_property_identifier"],
-                    body_field: "value",
-                    body_kinds: CALLABLE_KINDS,
-                },
-            ],
+            wrapped_functions: JS_TS_WRAPPED_FUNCTIONS,
+        },
+        LangConfig {
+            name: "typescript",
+            extensions: &["ts", "mts", "cts"],
+            language: tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            function_kinds: TS_FUNCTION_KINDS,
+            wrapped_functions: JS_TS_WRAPPED_FUNCTIONS,
+        },
+        LangConfig {
+            name: "tsx",
+            extensions: &["tsx", "jsx"],
+            language: tree_sitter_typescript::LANGUAGE_TSX.into(),
+            function_kinds: TS_FUNCTION_KINDS,
+            wrapped_functions: JS_TS_WRAPPED_FUNCTIONS,
         },
     ]
 }
@@ -171,10 +337,15 @@ mod tests {
         let langs = registry();
         assert!(langs.iter().any(|l| l.supports("src/lib.rs")));
         assert!(langs.iter().any(|l| l.supports("app.py")));
+        assert!(langs.iter().any(|l| l.supports("types.pyi")));
         assert!(langs.iter().any(|l| l.supports("server.go")));
         assert!(langs.iter().any(|l| l.supports("index.js")));
         assert!(langs.iter().any(|l| l.supports("index.mjs")));
         assert!(langs.iter().any(|l| l.supports("index.cjs")));
+        assert!(langs.iter().any(|l| l.supports("index.ts")));
+        assert!(langs.iter().any(|l| l.supports("index.mts")));
+        assert!(langs.iter().any(|l| l.supports("index.cts")));
+        assert!(langs.iter().any(|l| l.supports("component.tsx")));
         assert!(langs.iter().any(|l| l.supports("component.jsx")));
 
         let supported = |path: &str| langs.iter().any(|l| l.supports(path));

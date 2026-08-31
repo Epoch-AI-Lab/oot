@@ -12,24 +12,42 @@ use std::path::Path;
 ///
 /// This is policy, not cryptography. Actual encryption is delegated to
 /// git-crypt or a hosted key service. Oot owns the rule and the gate.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct VisibilityPolicy {
     /// Path fragments that are private. A touched path matching any entry
     /// raises a visibility dispute.
+    #[serde(default = "default_private_paths")]
     pub private_paths: Vec<String>,
     /// If set, the change is held under embargo until this date (e.g. `YYYY-MM-DD`).
+    #[serde(default)]
     pub embargo_until: Option<String>,
     /// Branch names that must stay private. Referencing these raises a visibility dispute.
+    #[serde(default)]
     pub private_branches: Vec<String>,
+}
+
+fn default_private_paths() -> Vec<String> {
+    vec!["secrets/".into(), ".env".into()]
 }
 
 impl Default for VisibilityPolicy {
     fn default() -> Self {
         VisibilityPolicy {
-            private_paths: vec!["secrets/".into(), ".env".into()],
+            private_paths: default_private_paths(),
             embargo_until: None,
             private_branches: vec![],
         }
+    }
+}
+
+fn matches_pattern(candidate: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some((prefix, suffix)) = pattern.split_once('*') {
+        candidate.starts_with(prefix) && candidate[prefix.len()..].ends_with(suffix)
+    } else {
+        candidate == pattern
     }
 }
 
@@ -41,12 +59,51 @@ impl VisibilityPolicy {
         Ok(p)
     }
 
+    /// Whether a branch name matches any declared private branch pattern.
+    pub fn branch_is_private(&self, branch: &str) -> bool {
+        self.private_branches.iter().any(|pb| {
+            let pb = pb.trim_start_matches('/');
+            matches_pattern(branch, pb)
+                || branch == pb
+                || branch.starts_with(&format!("{pb}/"))
+                || branch.ends_with(&format!("/{pb}"))
+                || branch.contains(&format!("/{pb}/"))
+        })
+    }
+
     /// Whether a touched path matches any private-path fragment.
     /// The single matching semantic shared by adjudication and export filtering.
     pub fn path_is_private(&self, path: &str) -> bool {
-        self.private_paths
-            .iter()
-            .any(|p| path.contains(p.trim_start_matches('/')))
+        let clean_path = path.trim_start_matches('/');
+        let filename = clean_path
+            .rsplit_once('/')
+            .map(|(_, name)| name)
+            .unwrap_or(clean_path);
+        self.private_paths.iter().any(|pattern| {
+            let pat = pattern.trim_start_matches('/');
+            if pat.is_empty() {
+                return false;
+            }
+            if pat.contains('*') {
+                return matches_pattern(clean_path, pat) || matches_pattern(filename, pat);
+            }
+            if pat.ends_with('/') {
+                let dir_pat = pat.trim_end_matches('/');
+                clean_path == dir_pat
+                    || clean_path.starts_with(pat)
+                    || clean_path.contains(&format!("/{pat}"))
+            } else {
+                clean_path == pat
+                    || clean_path.starts_with(&format!("{pat}/"))
+                    || clean_path.ends_with(&format!("/{pat}"))
+                    || clean_path.contains(&format!("/{pat}/"))
+                    || filename == pat
+                    || (pat.starts_with('.')
+                        && (filename.starts_with(&format!("{pat}."))
+                            || filename.starts_with(&format!("{pat}_"))
+                            || filename == pat))
+            }
+        })
     }
 
     /// Evaluate visibility rules against a change.
@@ -101,23 +158,28 @@ impl VisibilityPolicy {
         // Check private branches
         for branch in &self.private_branches {
             let branch_clean = branch.trim();
-            if !branch_clean.is_empty()
-                && (change.name.contains(branch_clean)
-                    || change.head_ref.contains(branch_clean)
-                    || change.base_ref.contains(branch_clean))
-            {
-                out.push(Dispute {
-                    id: format!("V{:03}", n),
-                    location: change.name.clone(),
-                    kind: Kind::Visibility,
-                    severity: Severity::High,
-                    detail: format!(
-                        "private branch {} referenced by {}",
-                        branch_clean,
-                        change.authors.join("/")
-                    ),
-                });
-                n += 1;
+            if !branch_clean.is_empty() {
+                let pb = branch_clean.trim_start_matches('/');
+                let matched = matches_pattern(&change.name, pb)
+                    || matches_pattern(&change.head_ref, pb)
+                    || matches_pattern(&change.base_ref, pb)
+                    || change.name.contains(pb)
+                    || change.head_ref.contains(pb)
+                    || change.base_ref.contains(pb);
+                if matched {
+                    out.push(Dispute {
+                        id: format!("V{:03}", n),
+                        location: format!("branch:{}", branch_clean),
+                        kind: Kind::Visibility,
+                        severity: Severity::High,
+                        detail: format!(
+                            "private branch {} referenced by {}",
+                            branch_clean,
+                            change.authors.join("/")
+                        ),
+                    });
+                    n += 1;
+                }
             }
         }
 
@@ -130,6 +192,36 @@ impl VisibilityPolicy {
             .as_ref()
             .map(|date| format!("patch held for maintainers until {}", date))
     }
+
+    /// Whether the repository or change is currently under an active embargo.
+    pub fn is_under_embargo(&self) -> bool {
+        if let Some(date) = &self.embargo_until {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let days = now / 86400;
+            let (cur_y, cur_m, cur_d) = days_to_ymd(days);
+            let today = format!("{:04}-{:02}-{:02}", cur_y, cur_m, cur_d);
+            date.trim() >= today.as_str()
+        } else {
+            false
+        }
+    }
+}
+
+fn days_to_ymd(days: u64) -> (i64, u32, u32) {
+    let z = days as i64 + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = (z - era * 146097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 #[cfg(test)]

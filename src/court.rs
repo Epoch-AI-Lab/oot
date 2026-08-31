@@ -97,13 +97,14 @@ pub fn adjudicate_change(
     let mut disputes = engine.diff_snapshots(&change.base, &change.head)?;
     disputes.extend(vis_disputes);
 
+    let is_embargoed = visibility_policy.is_under_embargo();
     let (disputes, intent, verdict) = finalize_adjudication(
         disputes,
         &change.base.files,
         &change.head.files,
         intent.clone(),
         cloaked,
-        visibility_policy.embargo_until.is_some(),
+        is_embargoed,
         meaning_policy,
     );
 
@@ -116,7 +117,11 @@ pub fn adjudicate_change(
         intent,
         authors: change.authors.clone(),
         verdict,
-        embargo: visibility_policy.embargo_note(),
+        embargo: if is_embargoed {
+            visibility_policy.embargo_note()
+        } else {
+            None
+        },
     };
 
     Ok(PersistedDocket {
@@ -195,8 +200,10 @@ pub fn policy_key(meaning: &MeaningPolicy, visibility: &VisibilityPolicy) -> Str
 }
 
 fn push_list(out: &mut String, items: &[String]) {
-    for item in items {
-        out.push_str(item);
+    let mut sorted = items.to_vec();
+    sorted.sort();
+    for item in sorted {
+        out.push_str(&item);
         out.push('\u{1f}');
     }
 }

@@ -206,3 +206,25 @@ fn test_visibility_policy_detects_deleted_private_paths() {
     assert_eq!(disputes[0].location, "secrets/api_token.txt");
     assert_eq!(disputes[0].kind, Kind::Visibility);
 }
+
+#[test]
+fn test_visibility_policy_dotfile_root_and_nested_exact_matching() {
+    let policy = VisibilityPolicy {
+        private_paths: vec![".env".into(), "secrets/".into()],
+        embargo_until: None,
+        private_branches: vec!["private/*".into()],
+    };
+
+    // Root-level and nested .env variants MUST be private
+    assert!(policy.path_is_private(".env"));
+    assert!(policy.path_is_private(".env.local"));
+    assert!(policy.path_is_private(".env.production"));
+    assert!(policy.path_is_private("config/.env.staging"));
+    assert!(policy.path_is_private("secrets/key.pem"));
+
+    // Similar names that are NOT .env variants or secrets directory MUST NOT be private
+    assert!(!policy.path_is_private(".environment.rs"));
+    assert!(!policy.path_is_private("config/.envoy.yaml"));
+    assert!(!policy.path_is_private("src/keyboard.rs"));
+    assert!(!policy.path_is_private("src/secrets_manager.rs"));
+}
