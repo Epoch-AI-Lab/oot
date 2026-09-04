@@ -31,6 +31,18 @@ const EXPORT_LOG: &str = "export-log.jsonl";
 /// Git's well-known empty tree; used to diff root commits against nothing.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
+/// An acquired advisory lock on the store. Released when dropped.
+#[derive(Debug)]
+pub struct StoreLock {
+    path: PathBuf,
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// Author or committer identity plus the exact timestamp needed to
 /// reproduce a byte-identical Git commit on export.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +135,42 @@ impl Store {
         );
     }
 
+    /// Acquire an exclusive advisory lock on the store.
+    pub fn lock(&self) -> Result<StoreLock> {
+        let lock_path = self.root.join("lock");
+        let start = std::time::Instant::now();
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+            {
+                Ok(file) => {
+                    use std::io::Write;
+                    let _ = writeln!(&file, "{}", std::process::id());
+                    return Ok(StoreLock { path: lock_path });
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Break stale lock if older than 10 seconds
+                    if let Ok(meta) = std::fs::metadata(&lock_path) {
+                        if let Ok(mtime) = meta.modified() {
+                            if let Ok(elapsed) = mtime.elapsed() {
+                                if elapsed > std::time::Duration::from_secs(10) {
+                                    let _ = std::fs::remove_file(&lock_path);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                        bail!("timed out waiting for store lock on {:?}", lock_path);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
     /// Path of the `.oot` directory itself.
     pub fn path(&self) -> &Path {
         &self.root

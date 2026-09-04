@@ -418,6 +418,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Commands::Record { message, branch } => {
             let root = std::env::current_dir()?;
             let store = Store::open(&root)?;
+            let _lock = store.lock()?;
             let branch = resolve_branch(&store, branch)?;
 
             let (author, committer) = resolve_identity(&root)?;
