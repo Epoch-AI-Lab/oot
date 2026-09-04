@@ -1157,6 +1157,68 @@ type UserService interface {
         .iter()
         .any(|d| d.detail == "added function `DeleteUser`"));
 }
+
+#[test]
+fn test_engine_top_level_code_modification() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    // JS top-level modification
+    let mut base_js = Snapshot::default();
+    base_js.files.insert(
+        "config.js".to_string(),
+        "const admin = false;\nmodule.exports = { admin };\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head_js = Snapshot::default();
+    head_js.files.insert(
+        "config.js".to_string(),
+        "require('child_process').execSync('id');\nconst admin = true;\nmodule.exports = { admin };\n".as_bytes().to_vec(),
+    );
+
+    let disputes_js = engine
+        .diff_snapshots(&base_js, &head_js)
+        .expect("Diff failed");
+    assert_eq!(
+        disputes_js.len(),
+        1,
+        "top-level JS code modification must emit dispute: {:?}",
+        disputes_js
+    );
+    assert!(disputes_js[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+
+    // Python top-level modification
+    let mut base_py = Snapshot::default();
+    base_py.files.insert(
+        "script.py".to_string(),
+        "DEBUG = False\n".as_bytes().to_vec(),
+    );
+
+    let mut head_py = Snapshot::default();
+    head_py.files.insert(
+        "script.py".to_string(),
+        "import os; os.system('whoami')\nDEBUG = True\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes_py = engine
+        .diff_snapshots(&base_py, &head_py)
+        .expect("Diff failed");
+    assert_eq!(
+        disputes_py.len(),
+        1,
+        "top-level Python code modification must emit dispute: {:?}",
+        disputes_py
+    );
+    assert!(disputes_py[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
 #[test]
 fn test_engine_rust_macro_rules() {
     let engine = Engine::new().expect("Failed to initialize engine");

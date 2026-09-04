@@ -50,6 +50,7 @@ impl Engine {
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
+                    let disputes_before = disputes.len();
                     let base_fns = extract_functions(
                         parse_source(&mut parser, &config.language, &b).as_ref(),
                         &b,
@@ -130,6 +131,19 @@ impl Engine {
                             path,
                             0,
                             format!("removed function `{}`", name),
+                            Severity::Review,
+                        ));
+                    }
+
+                    // If file source changed but no function-level dispute was generated
+                    // (e.g. top-level module code, non-function statements), emit a dispute.
+                    if disputes.len() == disputes_before && b != h {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            1,
+                            "file content modified (top-level or non-function definitions)"
+                                .to_string(),
                             Severity::Review,
                         ));
                     }
@@ -1063,7 +1077,7 @@ mod tests {
 
         let disputes = eng.diff_snapshots(&base, &head).unwrap();
         assert!(
-            disputes.is_empty(),
+            !disputes.iter().any(|d| d.detail.contains("`handle`")),
             "member-expression assignment should not be treated as a named function"
         );
     }
