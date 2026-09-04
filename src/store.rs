@@ -108,6 +108,7 @@ impl Store {
         std::fs::create_dir_all(oot.join(MAP_DIR))?;
         std::fs::create_dir_all(oot.join(REFS_DIR))?;
         std::fs::create_dir_all(oot.join("export"))?;
+        std::fs::write(oot.join("HEAD"), "ref: refs/heads/main\n")?;
         run(Command::new("git")
             .args(["init", "--bare", "--quiet"])
             .arg(oot.join(OBJECTS_DIR))
@@ -170,6 +171,31 @@ impl Store {
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    /// Read the current active branch from `.oot/HEAD`.
+    pub fn get_head_branch(&self) -> Result<Option<String>> {
+        let head_path = self.root.join("HEAD");
+        if !head_path.exists() {
+            return Ok(None);
+        }
+        let content = std::fs::read_to_string(head_path)?;
+        let trimmed = content.trim();
+        if let Some(rest) = trimmed.strip_prefix("ref: refs/heads/") {
+            Ok(Some(rest.to_string()))
+        } else if !trimmed.is_empty() {
+            Ok(Some(trimmed.to_string()))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Set the current active branch in `.oot/HEAD`.
+    pub fn set_head_branch(&self, branch: &str) -> Result<()> {
+        let head_path = self.root.join("HEAD");
+        let content = format!("ref: refs/heads/{branch}\n");
+        std::fs::write(head_path, content)?;
+        Ok(())
     }
     /// Path of the `.oot` directory itself.
     pub fn path(&self) -> &Path {
@@ -346,6 +372,11 @@ impl Store {
             return Ok(None);
         }
         Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
+    }
+
+    /// Whether the store contains a ref for `branch`.
+    pub fn has_ref(&self, branch: &str) -> Result<bool> {
+        self.head_id(branch).map(|opt| opt.is_some())
     }
 
     /// Every blob under `tree`: (path, blob sha, executable). Reads straight

@@ -451,6 +451,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let id = store.put_record(&record)?;
             store.index_push(&id)?;
             store.set_ref(&branch, &id)?;
+            let _ = store.set_head_branch(&branch);
 
             println!(
                 "recorded {id} on {branch} as {kind}: {} file(s)",

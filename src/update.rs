@@ -269,6 +269,12 @@ pub fn run(
         write_file_atomic(&full, &root, contents, executable)?;
     }
 
+    if !is_change_target {
+        if let Ok(b) = crate::resolve_branch(&store, branch) {
+            let _ = store.set_head_branch(&b);
+        }
+    }
+
     println!("updated to {target_desc}");
     Ok(std::process::ExitCode::SUCCESS)
 }
