@@ -50,7 +50,6 @@ impl Engine {
 
             match (base_src, head_src) {
                 (Some(b), Some(h)) => {
-                    let disputes_before = disputes.len();
                     let base_fns = extract_functions(
                         parse_source(&mut parser, &config.language, &b).as_ref(),
                         &b,
@@ -135,9 +134,14 @@ impl Engine {
                         ));
                     }
 
-                    // If file source changed but no function-level dispute was generated
-                    // (e.g. top-level module code, non-function statements), emit a dispute.
-                    if disputes.len() == disputes_before && b != h {
+                    // Top-level module code or non-function statements changed.
+                    // Definition bodies are blanked before comparing, so a
+                    // top-level injection hiding beside a function edit still
+                    // gets its own dispute, while whitespace-only churn and
+                    // pure function-body edits stay silent here.
+                    let top_changed = squash_ws(&without_defs(&b, &base_fns))
+                        != squash_ws(&without_defs(&h, &head_fns));
+                    if top_changed {
                         disputes.push(meaning(
                             &mut n,
                             path,
@@ -487,6 +491,24 @@ impl Engine {
                             Severity::Review,
                         ));
                     }
+                    // Incoming top-level changes with no function footprint
+                    // must not slip through: same fallback as the 2-way path,
+                    // scoped to what theirs changed against base. Ours is the
+                    // trusted target side, so ours-only drift stays silent,
+                    // and identical changes on both sides count as converged.
+                    if t_src != b_src && o_src != t_src {
+                        let top_changed = squash_ws(&without_defs(&b_src, &b_fns))
+                            != squash_ws(&without_defs(&t_src, &t_fns));
+                        if top_changed {
+                            disputes.push(meaning(
+                                &mut n,
+                                path,
+                                1,
+                                "incoming branch modified file content (top-level or non-function definitions)".to_string(),
+                                Severity::Review,
+                            ));
+                        }
+                    }
                 }
                 // File deleted in target, modified in incoming
                 (Some(_), None, Some(_)) => {
@@ -535,12 +557,13 @@ impl Engine {
     }
 }
 
-/// One extracted definition: source text, 1-based row, and a rename
-/// signature (the body with its own name blanked out).
+/// One extracted definition: source text, 1-based start and end rows,
+/// and a rename signature (the body with its own name blanked out).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FnDef {
     src: String,
     row: usize,
+    end_row: usize,
     signature: String,
 }
 
@@ -549,6 +572,32 @@ struct FnDef {
 /// each keeps its own entry and diffing runs a matching pass per group
 /// instead of collapsing to the first occurrence.
 type FunctionMap = HashMap<String, Vec<FnDef>>;
+
+/// The file with every extracted definition's lines blanked out,
+/// leaving top-level module code behind. Line ranges absorb wrapper
+/// syntax (`export`, `const X =`, trailing `;`) that the bare node
+/// spans do not cover.
+fn without_defs(src: &str, fns: &FunctionMap) -> String {
+    let mut ranges: Vec<(usize, usize)> =
+        fns.values().flatten().map(|d| (d.row, d.end_row)).collect();
+    ranges.sort();
+    ranges.dedup();
+    src.lines()
+        .enumerate()
+        .filter(|(i, _)| {
+            // sources carry 1-based rows, the enum index is 0-based
+            let ln = i + 1;
+            !ranges.iter().any(|(s, e)| ln >= *s && ln <= *e)
+        })
+        .map(|(_, l)| l)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Strip all whitespace for churn-insensitive comparison.
+fn squash_ws(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
 
 /// Align two def lists for one name: identical source text pairs first
 /// (each def consumed once, silently — those are unchanged), then remaining
@@ -822,6 +871,7 @@ fn insert(
     };
     let src = src.to_string();
     let row = body.start_position().row + 1;
+    let end_row = body.end_position().row + 1;
     // Signature: the body with its own name blanked, so two functions
     // that differ only by what they are called compare equal and pair
     // as a rename.
@@ -851,6 +901,7 @@ fn insert(
     map.entry(key).or_default().push(FnDef {
         src,
         row,
+        end_row,
         signature,
     });
     true
@@ -1342,6 +1393,7 @@ mod tests {
             FnDef {
                 src: String::new(),
                 row: 1,
+                end_row: 1,
                 signature: sig.to_string(),
             },
         )
@@ -1353,6 +1405,7 @@ mod tests {
             FnDef {
                 src: String::new(),
                 row,
+                end_row: row,
                 signature: sig.to_string(),
             },
         )
