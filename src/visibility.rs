@@ -228,9 +228,7 @@ pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
     if s.is_empty() {
         return None;
     }
-    let sep = s
-        .chars()
-        .find(|c| *c == '-' || *c == '/' || *c == '.')?;
+    let sep = s.chars().find(|c| *c == '-' || *c == '/' || *c == '.')?;
     if !s
         .chars()
         .filter(|c| *c == '-' || *c == '/' || *c == '.')
