@@ -210,6 +210,34 @@ impl VisibilityPolicy {
     }
 }
 
+/// Parse calendar date string in common standard formats (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY).
+pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(['-', '/', '.']).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let p0: i64 = parts[0].parse().ok()?;
+    let p1: u32 = parts[1].parse().ok()?;
+    let p2: i64 = parts[2].parse().ok()?;
+
+    let (y, m, d) = if p0 >= 1000 {
+        (p0, p1, p2 as u32)
+    } else if p2 >= 1000 {
+        (p2, p1, p0 as u32)
+    } else {
+        return None;
+    };
+
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y <= 0 {
+        return None;
+    }
+    Some((y, m, d))
+}
+
 fn days_to_ymd(days: u64) -> (i64, u32, u32) {
     let z = days as i64 + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
