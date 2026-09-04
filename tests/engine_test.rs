@@ -1157,3 +1157,32 @@ type UserService interface {
         .iter()
         .any(|d| d.detail == "added function `DeleteUser`"));
 }
+#[test]
+fn test_engine_rust_macro_rules() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/macros.rs".to_string(),
+        "macro_rules! log_msg {\n    ($msg:expr) => { println!(\"log: {}\", $msg); };\n}\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/macros.rs".to_string(),
+        "macro_rules! log_msg {\n    ($msg:expr) => { eprintln!(\"error: {}\", $msg); };\n}\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "Rust macro modification must emit dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0].detail.contains("`log_msg`"));
+}

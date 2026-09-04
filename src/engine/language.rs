@@ -255,9 +255,14 @@ pub fn registry() -> Vec<LangConfig> {
             name: "rust",
             extensions: &["rs"],
             language: tree_sitter_rust::LANGUAGE.into(),
-            function_kinds: &[FunctionKind {
-                node_kind: "function_item",
-            }],
+            function_kinds: &[
+                FunctionKind {
+                    node_kind: "function_item",
+                },
+                FunctionKind {
+                    node_kind: "macro_definition",
+                },
+            ],
             wrapped_functions: &[],
         },
         LangConfig {
