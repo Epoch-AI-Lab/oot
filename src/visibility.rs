@@ -56,6 +56,13 @@ impl VisibilityPolicy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let p: VisibilityPolicy = toml::from_str(&text)?;
+        if let Some(date_str) = &p.embargo_until {
+            if parse_date_ymd(date_str).is_none() {
+                anyhow::bail!(
+                    "invalid embargo_until date format: '{date_str}' (expected YYYY-MM-DD)"
+                );
+            }
+        }
         Ok(p)
     }
 
@@ -196,14 +203,17 @@ impl VisibilityPolicy {
     /// Whether the repository or change is currently under an active embargo.
     pub fn is_under_embargo(&self) -> bool {
         if let Some(date) = &self.embargo_until {
+            let Some((target_y, target_m, target_d)) = parse_date_ymd(date) else {
+                // If malformed, fail closed
+                return true;
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let days = now / 86400;
             let (cur_y, cur_m, cur_d) = days_to_ymd(days);
-            let today = format!("{:04}-{:02}-{:02}", cur_y, cur_m, cur_d);
-            date.trim() >= today.as_str()
+            (target_y, target_m, target_d) >= (cur_y, cur_m, cur_d)
         } else {
             false
         }

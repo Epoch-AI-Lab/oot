@@ -228,3 +228,58 @@ fn test_visibility_policy_dotfile_root_and_nested_exact_matching() {
     assert!(!policy.path_is_private("src/keyboard.rs"));
     assert!(!policy.path_is_private("src/secrets_manager.rs"));
 }
+
+#[test]
+fn test_embargo_date_formats_and_validation() {
+    let policy_iso = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099-01-01".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_iso.is_under_embargo(),
+        "future ISO date must be under embargo"
+    );
+
+    let policy_dd_mm_yyyy = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("01-01-2099".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_dd_mm_yyyy.is_under_embargo(),
+        "future DD-MM-YYYY date must be under embargo"
+    );
+
+    let policy_slash = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099/12/31".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_slash.is_under_embargo(),
+        "future slash date must be under embargo"
+    );
+
+    let policy_past = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("1999-01-01".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        !policy_past.is_under_embargo(),
+        "past date must not be under embargo"
+    );
+
+    // Invalid format loading must fail
+    let tmp = std::env::temp_dir().join(format!("oot-bad-date-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let bad_toml = tmp.join("bad.toml");
+    std::fs::write(&bad_toml, "embargo_until = \"not-a-date\"\n").unwrap();
+    assert!(
+        VisibilityPolicy::load(&bad_toml).is_err(),
+        "invalid date in TOML must fail to load"
+    );
+    let _ = std::fs::remove_dir_all(&tmp);
+}
