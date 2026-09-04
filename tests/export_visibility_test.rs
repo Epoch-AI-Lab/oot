@@ -277,3 +277,62 @@ fn test_filtered_export_skips_empty_rebuilt_commits() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_filtered_export_prevents_renamed_private_file_leak() {
+    let tmp = std::env::temp_dir().join(format!("oot-rename-leak-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    build_fixture(&src);
+    // Commit 2: introduce secret in secrets/pass.txt
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/pass.txt"), "supersecretpassword\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    // Commit 3: rename secrets/pass.txt to leaked_pass.txt
+    git(&src, &["mv", "secrets/pass.txt", "leaked_pass.txt"]);
+    git(&src, &["commit", "-m", "move secret outside private path"]);
+
+    // Commit 4: modify public file
+    std::fs::write(src.join("README.md"), "v2 with updates\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "public docs update"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\"secrets/\"]\nprivate_branches = []\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+
+    // Verify exported repository does not have leaked_pass.txt in working tree or HEAD commit
+    assert!(
+        !out.join("leaked_pass.txt").exists(),
+        "leaked_pass.txt must not exist in working tree"
+    );
+    let ls = git(&out, &["ls-tree", "-r", "--name-only", "HEAD"]);
+    assert!(
+        !ls.contains("leaked_pass.txt"),
+        "leaked_pass.txt must not exist in HEAD tree: {ls}"
+    );
+    assert!(
+        !ls.contains("secrets/pass.txt"),
+        "secrets/pass.txt must not exist in HEAD tree: {ls}"
+    );
+    assert!(
+        ls.contains("README.md"),
+        "README.md should exist in HEAD tree: {ls}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

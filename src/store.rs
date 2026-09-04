@@ -30,6 +30,8 @@ const REFS_DIR: &str = "refs";
 const EXPORT_LOG: &str = "export-log.jsonl";
 /// Git's well-known empty tree; used to diff root commits against nothing.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+/// Git's well-known empty blob SHA.
+const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 
 /// An acquired advisory lock on the store. Released when dropped.
 #[derive(Debug)]
@@ -197,6 +199,36 @@ impl Store {
         std::fs::write(head_path, content)?;
         Ok(())
     }
+
+    /// Collect all `(path, blob_sha)` pairs in `tree` recursively from the odb.
+    pub fn collect_tree_blobs(&self, tree: &str, prefix: &str) -> Result<Vec<(String, String)>> {
+        if tree == EMPTY_TREE {
+            return Ok(Vec::new());
+        }
+        let listed = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["ls-tree", "-r", "-z", tree])
+            .output()
+            .context("failed to list tree objects in store")?;
+        if !listed.status.success() {
+            bail!("git ls-tree failed for {tree}");
+        }
+        let mut out = Vec::new();
+        for entry in listed.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+            let record = String::from_utf8_lossy(entry);
+            let (meta, path) = match record.split_once('\t') {
+                Some(p) => p,
+                None => continue,
+            };
+            let parts: Vec<&str> = meta.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "blob" {
+                out.push((format!("{prefix}{path}"), parts[2].to_string()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Path of the `.oot` directory itself.
     pub fn path(&self) -> &Path {
         &self.root
@@ -722,8 +754,10 @@ impl Store {
         };
         self.reset_export_cache_if_policy_changed(&filter_key)?;
 
-        // Taint pass: decide once, up front, which changes touch private paths.
+        // Taint pass: decide once, up front, which changes touch private paths,
+        // and collect all private blob SHAs to prevent multi-step rename leaks.
         let mut withheld: HashMap<String, String> = HashMap::new();
+        let mut private_blobs: HashSet<String> = HashSet::new();
         if filtering {
             let pol = policy.expect("checked above");
             for id in self.index()? {
@@ -734,7 +768,33 @@ impl Store {
                     .filter(|p| pol.path_is_private(p))
                     .collect();
                 if !hits.is_empty() {
-                    withheld.insert(id, format!("private path match: {}", hits.join(", ")));
+                    withheld.insert(
+                        id.clone(),
+                        format!("private path match: {}", hits.join(", ")),
+                    );
+                }
+                for (path, blob_sha) in self.collect_tree_blobs(&record.tree, "")? {
+                    if pol.path_is_private(&path) && blob_sha != EMPTY_BLOB {
+                        private_blobs.insert(blob_sha);
+                    }
+                }
+            }
+            for id in self.index()? {
+                if withheld.contains_key(&id) {
+                    let record = self.get_change(&id)?;
+                    for (_path, blob_sha) in self.collect_tree_blobs(&record.tree, "")? {
+                        let existed_in_clean_parents = record.parents.iter().any(|p| {
+                            !withheld.contains_key(p)
+                                && self
+                                    .get_change(p)
+                                    .ok()
+                                    .and_then(|pr| self.collect_tree_blobs(&pr.tree, "").ok())
+                                    .is_some_and(|blobs| blobs.iter().any(|(_, b)| b == &blob_sha))
+                        });
+                        if !existed_in_clean_parents && blob_sha != EMPTY_BLOB {
+                            private_blobs.insert(blob_sha);
+                        }
+                    }
                 }
             }
         }
@@ -749,7 +809,8 @@ impl Store {
             let record = self.get_change(&id)?;
             if let Some(sha) = self.exported_sha(&id)? {
                 if filtering {
-                    let tree = self.strip_tree(&record.tree, policy.unwrap(), "")?;
+                    let tree =
+                        self.strip_tree(&record.tree, policy.unwrap(), &private_blobs, "")?;
                     tree_of.insert(sha.clone(), tree);
                 }
                 sha_of.insert(id.clone(), sha.clone());
@@ -770,7 +831,7 @@ impl Store {
 
             // Stripped tree for filtered exports, original tree otherwise.
             let stripped_tree = if filtering {
-                self.strip_tree(&record.tree, policy.unwrap(), "")?
+                self.strip_tree(&record.tree, policy.unwrap(), &private_blobs, "")?
             } else {
                 record.tree.clone()
             };
@@ -958,10 +1019,16 @@ impl Store {
     }
 
     /// Rebuild `tree` minus every path matching the policy's private
-    /// fragments, recursively. Pure plumbing (`ls-tree` + `mktree`) against
-    /// the store's bare odb — no index or worktree involved. Deterministic:
-    /// identical inputs yield the original sha untouched.
-    fn strip_tree(&self, tree: &str, policy: &VisibilityPolicy, prefix: &str) -> Result<String> {
+    /// fragments or tainted private blob SHAs, recursively. Pure plumbing
+    /// (`ls-tree` + `mktree`) against the store's bare odb — no index or
+    /// worktree involved. Deterministic: identical inputs yield the original sha untouched.
+    fn strip_tree(
+        &self,
+        tree: &str,
+        policy: &VisibilityPolicy,
+        private_blobs: &HashSet<String>,
+        prefix: &str,
+    ) -> Result<String> {
         let listed = Command::new("git")
             .args(["--git-dir"])
             .arg(self.git_dir())
@@ -997,14 +1064,14 @@ impl Store {
                     lines.push(record.to_string());
                 }
                 "blob" => {
-                    if policy.path_is_private(&path) {
+                    if policy.path_is_private(&path) || private_blobs.contains(&sha) {
                         changed = true;
                         continue;
                     }
                     lines.push(record.to_string());
                 }
                 "tree" => {
-                    let sub = self.strip_tree(&sha, policy, &format!("{path}/"))?;
+                    let sub = self.strip_tree(&sha, policy, private_blobs, &format!("{path}/"))?;
                     if sub != sha {
                         changed = true;
                     }
