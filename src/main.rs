@@ -639,10 +639,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 }
             }
 
-            // Point HEAD at the first exported branch so `git log` works immediately.
+            // Point HEAD at the first exported branch so `git log` works immediately,
+            // and populate the working tree files so the exported repo is ready to inspect.
             if let Some(first_branch) = first_exported_branch {
                 let first = format!("refs/heads/{first_branch}");
                 run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
+                let _ = run_git(&["checkout", "-f", "HEAD"], &out_path);
             } else {
                 println!(
                     "warning: all branches were withheld by policy; no refs exported to {out}"
