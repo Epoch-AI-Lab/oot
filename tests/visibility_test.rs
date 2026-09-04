@@ -275,11 +275,35 @@ fn test_embargo_date_formats_and_validation() {
     let tmp = std::env::temp_dir().join(format!("oot-bad-date-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).unwrap();
-    let bad_toml = tmp.join("bad.toml");
-    std::fs::write(&bad_toml, "embargo_until = \"not-a-date\"\n").unwrap();
-    assert!(
-        VisibilityPolicy::load(&bad_toml).is_err(),
-        "invalid date in TOML must fail to load"
-    );
+    for bad in [
+        "not-a-date",
+        "2099-02-30",
+        "2099-13-01",
+        "2099-12/31",
+        "01-01-2099-extra",
+    ] {
+        let bad_toml = tmp.join("bad.toml");
+        std::fs::write(&bad_toml, format!("embargo_until = \"{bad}\"\n")).unwrap();
+        assert!(
+            VisibilityPolicy::load(&bad_toml).is_err(),
+            "invalid date '{bad}' in TOML must fail to load"
+        );
+    }
     let _ = std::fs::remove_dir_all(&tmp);
+
+    // Leap day exists in 2096 but not in 2099.
+    assert!(VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2096-02-29".into()),
+        private_branches: vec![],
+    }
+    .is_under_embargo());
+    // Nonexistent Feb 29 cannot be constructed, so a hand-built policy
+    // with it must fail closed, never open.
+    assert!(VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099-02-29".into()),
+        private_branches: vec![],
+    }
+    .is_under_embargo());
 }

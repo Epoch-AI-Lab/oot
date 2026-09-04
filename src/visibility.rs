@@ -221,12 +221,24 @@ impl VisibilityPolicy {
 }
 
 /// Parse calendar date string in common standard formats (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY).
+/// All separators must be the same character, and the day must exist on
+/// the calendar (month lengths plus leap years). Anything else is rejected.
 pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = s.split(['-', '/', '.']).collect();
+    let sep = s
+        .chars()
+        .find(|c| *c == '-' || *c == '/' || *c == '.')?;
+    if !s
+        .chars()
+        .filter(|c| *c == '-' || *c == '/' || *c == '.')
+        .all(|c| c == sep)
+    {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(sep).collect();
     if parts.len() != 3 {
         return None;
     }
@@ -242,7 +254,18 @@ pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
         return None;
     };
 
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) || y <= 0 {
+    if y <= 0 || !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if d < 1 || d > max_day {
         return None;
     }
     Some((y, m, d))
