@@ -19,11 +19,11 @@ fn test_visibility_policy_deserialization_from_fixture() {
         VisibilityPolicy::load(fixture_path).expect("Failed to load fixtures/visibility.toml");
 
     assert_eq!(policy.private_paths, vec!["secrets/", ".env"]);
-    assert_eq!(policy.embargo_until.as_deref(), Some("2026-09-01"));
+    assert_eq!(policy.embargo_until.as_deref(), Some("2027-09-01"));
     assert!(policy.private_branches.is_empty());
     assert_eq!(
         policy.embargo_note().as_deref(),
-        Some("patch held for maintainers until 2026-09-01")
+        Some("patch held for maintainers until 2027-09-01")
     );
 }
 

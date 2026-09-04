@@ -52,7 +52,7 @@ $ ./target/release/oot adjudicate --change feature/auth-refactor \
   dispute-02: private path secrets/.env touched by @you (secrets/.env)    [visibility]
 
   verdict:    ▶ CLOAKED . 1 requires review, cloaked
-  embargo:    patch held for maintainers until 2026-09-01
+  embargo:    patch held for maintainers until 2027-09-01
 
   [a]ccept · [r]eject · [d]ocket
 ```
