@@ -527,9 +527,17 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Commands::Log { branch } => {
             let store = Store::open(".")?;
             let branch = resolve_branch(&store, branch)?;
-            let head_id = store
-                .head_id(&branch)?
-                .ok_or_else(|| anyhow::anyhow!("branch '{branch}' has no changes"))?;
+            let head_id = match store.head_id(&branch)? {
+                Some(id) => id,
+                None => {
+                    if store.refs()?.is_empty() {
+                        println!("branch '{branch}': empty store, nothing recorded yet");
+                        return Ok(std::process::ExitCode::SUCCESS);
+                    } else {
+                        anyhow::bail!("branch '{branch}' has no changes");
+                    }
+                }
+            };
 
             // Reachable set from the head...
             let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
