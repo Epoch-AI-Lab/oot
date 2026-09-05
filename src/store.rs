@@ -726,20 +726,35 @@ impl Store {
         Ok(tags)
     }
 
-    /// Peel a source tag to its target commit sha (annotated or lightweight).
+    /// Peel a source tag to its target commit sha. The full ref path plus
+    /// `^{commit}` resolves annotated tags through to the commit, keeps a
+    /// tag named like a branch from misresolving, and fails on non-commit
+    /// targets instead of poisoning the commit map.
     pub fn peel_tag(&self, source_repo: &Path, tag: &str) -> Result<String> {
+        let reference = format!("refs/tags/{tag}^{{commit}}");
         let output = Command::new("git")
-            .args(["rev-list", "-n", "1", tag])
+            .args(["rev-parse", "--verify", "--end-of-options", &reference])
             .current_dir(source_repo)
             .output()
             .context("failed to peel tag in source repository")?;
         if !output.status.success() {
             bail!(
-                "failed to resolve tag '{tag}': {}",
+                "failed to resolve tag '{tag}' to a commit: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Whether `tag` is a safe refname for `refs/tags/<tag>`.
+    pub fn valid_tag_ref(tag: &str) -> bool {
+        if tag.is_empty() {
+            return false;
+        }
+        Command::new("git")
+            .args(["check-ref-format", &format!("refs/tags/{tag}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     /// Record the head change id for a tag. Names share the branch

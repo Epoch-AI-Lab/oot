@@ -416,8 +416,20 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
 
             // Tags resolve against the commits just imported: annotated tags
             // peel to their target commit, tag objects are not preserved.
+            // One bad tag must not sink the import, so every per-tag step
+            // skips with a warning instead of bailing.
             for tag in store.fetch_tags(source.repo_root())? {
-                let sha = store.peel_tag(source.repo_root(), &tag)?;
+                if !Store::valid_tag_ref(&tag) {
+                    eprintln!("tag {tag}: invalid refname, skipped");
+                    continue;
+                }
+                let sha = match store.peel_tag(source.repo_root(), &tag) {
+                    Ok(sha) => sha,
+                    Err(e) => {
+                        eprintln!("tag {tag}: skipped ({e:#})");
+                        continue;
+                    }
+                };
                 match store.change_for_commit(&sha)? {
                     Some(id) => {
                         store.set_tag(&tag, &id)?;
@@ -658,14 +670,28 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             // target was withheld walks up to the nearest kept ancestor, and
             // one with no kept history at all is omitted with a log entry.
             for (tag, head_id) in store.tags()? {
-                match store.branch_head_sha(&head_id)? {
-                    Some(sha) => {
-                        store.point_tag(&out_path, &tag, &sha)?;
-                        println!("tag {tag} -> {sha}");
-                    }
-                    None => {
+                // One corrupt tag must not sink the export: per-tag failures
+                // land in the audit log like any other omission.
+                if !Store::valid_tag_ref(&tag) {
+                    store.log_tag_omitted(&tag, &head_id)?;
+                    println!("tag {tag} omitted (invalid refname)");
+                    continue;
+                }
+                match store.branch_head_sha(&head_id) {
+                    Ok(Some(sha)) => match store.point_tag(&out_path, &tag, &sha) {
+                        Ok(()) => println!("tag {tag} -> {sha}"),
+                        Err(e) => {
+                            store.log_tag_omitted(&tag, &head_id)?;
+                            println!("tag {tag} omitted ({e:#})");
+                        }
+                    },
+                    Ok(None) => {
                         store.log_tag_omitted(&tag, &head_id)?;
                         println!("tag {tag} omitted (entire history withheld)");
+                    }
+                    Err(e) => {
+                        store.log_tag_omitted(&tag, &head_id)?;
+                        println!("tag {tag} omitted ({e:#})");
                     }
                 }
             }

@@ -168,11 +168,63 @@ fn test_tags_omitted_when_all_history_withheld() {
     );
 
     let refs = git(&out, &["for-each-ref", "--format=%(refname)", "refs/tags"]);
-    assert!(!refs.contains("doomed"), "withheld tag leaked: {refs}");
+    assert!(refs.is_empty(), "withheld tag leaked: {refs}");
+    let probe = Command::new("git")
+        .arg("-C")
+        .arg(&out)
+        .args(["rev-parse", "--verify", "--quiet", "refs/tags/doomed"])
+        .output()
+        .unwrap();
+    assert!(!probe.status.success(), "withheld tag resolves");
 
     let log = std::fs::read_to_string(proj.join(".oot").join("export-log.jsonl")).unwrap();
     assert!(
         log.contains("tag-omitted") && log.contains("doomed"),
         "omission must be audited: {log}"
     );
+}
+
+/// A tag pointing at a blob (not a commit) is skipped with a warning, the
+/// rest of the import succeeds, and re-importing is idempotent.
+#[test]
+fn test_tags_skip_non_commit_targets_and_reimport() {
+    let tmp = std::env::temp_dir().join(format!("oot-tags-sk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("a.txt"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "first"]);
+    git(&src, &["tag", "good"]);
+    let blob = git(&src, &["hash-object", "-w", "a.txt"]);
+    git(&src, &["tag", "notacommit", &blob]);
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    assert!(
+        msg.contains("tag good: imported"),
+        "good tag missing: {msg}"
+    );
+    assert!(
+        msg.contains("notacommit") && msg.contains("skipped"),
+        "blob tag should skip with a warning: {msg}"
+    );
+
+    // Second import over the same store succeeds and changes nothing.
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "reimport failed: {msg}");
+
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+    let refs = git(
+        &out,
+        &["for-each-ref", "--format=%(refname:short)", "refs/tags"],
+    );
+    assert_eq!(refs, "good", "only the commit tag should export: {refs}");
 }
