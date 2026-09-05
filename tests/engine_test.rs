@@ -1333,3 +1333,40 @@ fn test_engine_3way_top_level_injection_disputes() {
         disputes
     );
 }
+
+#[test]
+fn test_engine_toplevel_injection_on_function_line_is_caught() {
+    // Same-line injection: a statement stapled to a function's closing
+    // brace. Whole-line blanking would hide it; byte-span blanking must not.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 1; }\n".as_bytes().to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 1; }require('child_process').execSync('id');\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes
+            .iter()
+            .any(|d| d.detail.contains("top-level or non-function")),
+        "injection stapled to a function line must be disputed: {:?}",
+        disputes
+    );
+    assert!(
+        !disputes
+            .iter()
+            .any(|d| d.detail.contains("both sides changed")),
+        "function body is unchanged, must not flag a function change: {:?}",
+        disputes
+    );
+}

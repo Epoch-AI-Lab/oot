@@ -557,13 +557,15 @@ impl Engine {
     }
 }
 
-/// One extracted definition: source text, 1-based start and end rows,
-/// and a rename signature (the body with its own name blanked out).
+/// One extracted definition: source text, 1-based start row, and the
+/// byte span (`start_byte`..`end_byte`) of the definition in its file,
+/// plus a rename signature (the body with its own name blanked out).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FnDef {
     src: String,
     row: usize,
-    end_row: usize,
+    start_byte: usize,
+    end_byte: usize,
     signature: String,
 }
 
@@ -573,25 +575,29 @@ struct FnDef {
 /// instead of collapsing to the first occurrence.
 type FunctionMap = HashMap<String, Vec<FnDef>>;
 
-/// The file with every extracted definition's lines blanked out,
-/// leaving top-level module code behind. Line ranges absorb wrapper
-/// syntax (`export`, `const X =`, trailing `;`) that the bare node
-/// spans do not cover.
+/// The file with every extracted definition's byte span removed,
+/// leaving top-level module code behind. Defs are blanked by their
+/// exact source span rather than whole lines, so a statement stapled to
+/// the same line as a closing brace survives and still gets disputed.
+/// Byte spans come from the same tree-sitter buffer the source was
+/// parsed from, so they align to UTF-8 char boundaries.
 fn without_defs(src: &str, fns: &FunctionMap) -> String {
-    let mut ranges: Vec<(usize, usize)> =
-        fns.values().flatten().map(|d| (d.row, d.end_row)).collect();
-    ranges.sort();
-    ranges.dedup();
-    src.lines()
+    let bytes = src.as_bytes();
+    let mut marked = vec![false; bytes.len()];
+    for def in fns.values().flatten() {
+        let start = def.start_byte.min(bytes.len());
+        let end = def.end_byte.min(bytes.len()).max(start);
+        for slot in marked.iter_mut().take(end).skip(start) {
+            *slot = true;
+        }
+    }
+    let kept: Vec<u8> = bytes
+        .iter()
         .enumerate()
-        .filter(|(i, _)| {
-            // sources carry 1-based rows, the enum index is 0-based
-            let ln = i + 1;
-            !ranges.iter().any(|(s, e)| ln >= *s && ln <= *e)
-        })
-        .map(|(_, l)| l)
-        .collect::<Vec<_>>()
-        .join("\n")
+        .filter(|(i, _)| !marked[*i])
+        .map(|(_, b)| *b)
+        .collect();
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// Strip all whitespace for churn-insensitive comparison.
@@ -871,7 +877,38 @@ fn insert(
     };
     let src = src.to_string();
     let row = body.start_position().row + 1;
-    let end_row = body.end_position().row + 1;
+    // Blanking span: climb through single-statement wrappers so an added
+    // `const f = ...;` leaves no `const ;` crumbs that fake a top-level
+    // dispute. Multi-declarator parents (`const a=.., b=..`) stay put so a
+    // sibling edit cannot hide. Same-line injections are separate statement
+    // nodes, so they still survive blanking and get disputed.
+    let mut span_node = body;
+    while let Some(parent) = span_node.parent() {
+        match parent.kind() {
+            "lexical_declaration" | "variable_declaration" => {
+                let mut declarators = 0;
+                for i in 0..parent.child_count() {
+                    if parent
+                        .child(i)
+                        .is_some_and(|c| c.kind() == "variable_declarator")
+                    {
+                        declarators += 1;
+                    }
+                }
+                if declarators == 1 {
+                    span_node = parent;
+                } else {
+                    break;
+                }
+            }
+            "export_statement" | "expression_statement" => {
+                span_node = parent;
+            }
+            _ => break,
+        }
+    }
+    let start_byte = span_node.start_byte();
+    let end_byte = span_node.end_byte();
     // Signature: the body with its own name blanked, so two functions
     // that differ only by what they are called compare equal and pair
     // as a rename.
@@ -901,7 +938,8 @@ fn insert(
     map.entry(key).or_default().push(FnDef {
         src,
         row,
-        end_row,
+        start_byte,
+        end_byte,
         signature,
     });
     true
@@ -1393,7 +1431,8 @@ mod tests {
             FnDef {
                 src: String::new(),
                 row: 1,
-                end_row: 1,
+                start_byte: 0,
+                end_byte: 0,
                 signature: sig.to_string(),
             },
         )
@@ -1405,7 +1444,8 @@ mod tests {
             FnDef {
                 src: String::new(),
                 row,
-                end_row: row,
+                start_byte: 0,
+                end_byte: 0,
                 signature: sig.to_string(),
             },
         )
