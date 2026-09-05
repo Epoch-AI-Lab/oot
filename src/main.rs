@@ -413,6 +413,21 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 store.set_ref(branch, &head_id)?;
                 println!("branch {branch}: {} change(s) imported", commits.len());
             }
+
+            // Tags resolve against the commits just imported: annotated tags
+            // peel to their target commit, tag objects are not preserved.
+            for tag in store.fetch_tags(source.repo_root())? {
+                let sha = store.peel_tag(source.repo_root(), &tag)?;
+                match store.change_for_commit(&sha)? {
+                    Some(id) => {
+                        store.set_tag(&tag, &id)?;
+                        println!("tag {tag}: imported");
+                    }
+                    None => {
+                        eprintln!("tag {tag}: target commit not imported, skipped");
+                    }
+                }
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Record { message, branch } => {
@@ -639,6 +654,22 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 }
             }
 
+            // Tags follow their target change through filtering: a tag whose
+            // target was withheld walks up to the nearest kept ancestor, and
+            // one with no kept history at all is omitted with a log entry.
+            for (tag, head_id) in store.tags()? {
+                match store.branch_head_sha(&head_id)? {
+                    Some(sha) => {
+                        store.point_tag(&out_path, &tag, &sha)?;
+                        println!("tag {tag} -> {sha}");
+                    }
+                    None => {
+                        store.log_tag_omitted(&tag, &head_id)?;
+                        println!("tag {tag} omitted (entire history withheld)");
+                    }
+                }
+            }
+
             // Point HEAD at the first exported branch so `git log` works immediately,
             // and populate the working tree files so the exported repo is ready to inspect.
             if let Some(first_branch) = first_exported_branch {
@@ -652,7 +683,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
 
             println!(
-                "exported to {out}\nnext: cd {out} && git remote add origin <url> && git push -u origin --all"
+                "exported to {out}\nnext: cd {out} && git remote add origin <url> && git push -u origin --all && git push --tags"
             );
             Ok(std::process::ExitCode::SUCCESS)
         }
