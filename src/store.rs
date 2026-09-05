@@ -27,6 +27,7 @@ const OBJECTS_DIR: &str = "objects.git";
 const CHANGES_DIR: &str = "changes";
 const MAP_DIR: &str = "map";
 const REFS_DIR: &str = "refs";
+const TAGS_DIR: &str = "tags";
 const EXPORT_LOG: &str = "export-log.jsonl";
 /// Git's well-known empty tree; used to diff root commits against nothing.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -109,6 +110,7 @@ impl Store {
         std::fs::create_dir_all(oot.join(CHANGES_DIR))?;
         std::fs::create_dir_all(oot.join(MAP_DIR))?;
         std::fs::create_dir_all(oot.join(REFS_DIR))?;
+        std::fs::create_dir_all(oot.join(TAGS_DIR))?;
         std::fs::create_dir_all(oot.join("export"))?;
         std::fs::write(oot.join("HEAD"), "ref: refs/heads/main\n")?;
         run(Command::new("git")
@@ -692,6 +694,126 @@ impl Store {
         Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
     }
 
+    /// Fetch all tags from a source repository into the store's odb and
+    /// return their short names. Annotated tags peel to their target commit
+    /// on import; tag objects and messages are not preserved, export writes
+    /// lightweight refs. Branch objects must already be fetched.
+    pub fn fetch_tags(&self, source_repo: &Path) -> Result<Vec<String>> {
+        let output = Command::new("git")
+            .args(["for-each-ref", "--format=%(refname:short)", "refs/tags"])
+            .current_dir(source_repo)
+            .output()
+            .context("failed to list tags in source repository")?;
+        if !output.status.success() {
+            bail!("not a valid git repository: {}", source_repo.display());
+        }
+        let tags: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect();
+
+        if !tags.is_empty() {
+            run(Command::new("git")
+                .args(["--git-dir"])
+                .arg(self.git_dir())
+                .args(["fetch", "--quiet"])
+                .arg(source_repo)
+                .args(["+refs/tags/*:refs/oot/source-tags/*"]))?;
+        }
+
+        Ok(tags)
+    }
+
+    /// Peel a source tag to its target commit sha. The full ref path plus
+    /// `^{commit}` resolves annotated tags through to the commit, keeps a
+    /// tag named like a branch from misresolving, and fails on non-commit
+    /// targets instead of poisoning the commit map.
+    pub fn peel_tag(&self, source_repo: &Path, tag: &str) -> Result<String> {
+        let reference = format!("refs/tags/{tag}^{{commit}}");
+        let output = Command::new("git")
+            .args(["rev-parse", "--verify", "--end-of-options", &reference])
+            .current_dir(source_repo)
+            .output()
+            .context("failed to peel tag in source repository")?;
+        if !output.status.success() {
+            bail!(
+                "failed to resolve tag '{tag}' to a commit: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// Whether `tag` is a safe refname for `refs/tags/<tag>`.
+    pub fn valid_tag_ref(tag: &str) -> bool {
+        if tag.is_empty() {
+            return false;
+        }
+        Command::new("git")
+            .args(["check-ref-format", &format!("refs/tags/{tag}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Record the head change id for a tag. Names share the branch
+    /// percent-encoding so `v1/rc1` survives as one file.
+    pub fn set_tag(&self, tag: &str, id: &str) -> Result<()> {
+        std::fs::create_dir_all(self.root.join(TAGS_DIR))?;
+        let safe = encode_branch(tag);
+        std::fs::write(self.root.join(TAGS_DIR).join(safe), id)?;
+        Ok(())
+    }
+
+    /// Read all recorded tags as (tag, head change id).
+    pub fn tags(&self) -> Result<Vec<(String, String)>> {
+        let dir = self.root.join(TAGS_DIR);
+        if !dir.exists() {
+            return Ok(Vec::new());
+        }
+        let mut out = Vec::new();
+        for entry in std::fs::read_dir(&dir)? {
+            let entry = entry?;
+            if !entry.path().is_file() {
+                continue;
+            }
+            let raw = entry.file_name().to_string_lossy().to_string();
+            let name = decode_branch(&raw);
+            let id = std::fs::read_to_string(entry.path())?.trim().to_string();
+            out.push((name, id));
+        }
+        out.sort();
+        Ok(out)
+    }
+
+    /// Record that a tag was omitted from an export because its target
+    /// history was entirely withheld.
+    pub fn log_tag_omitted(&self, tag: &str, head_id: &str) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "tag-omitted",
+            "tag": tag,
+            "change": head_id,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Update a tag ref in the exported repository to point at `sha`.
+    pub fn point_tag(&self, out_repo: &Path, tag: &str, sha: &str) -> Result<()> {
+        run(Command::new("git")
+            .args(["--git-dir"])
+            .arg(out_repo.join(".git"))
+            .args(["update-ref", &format!("refs/tags/{tag}"), sha]))?;
+        Ok(())
+    }
+
     /// Replay every indexed change into `out_repo` (which must be an
     /// initialized git repository) as real commits. The store's odb is
     /// attached via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, so trees and blobs are
@@ -1251,8 +1373,9 @@ impl Store {
         Ok(Some(std::fs::read_to_string(f)?.trim().to_string()))
     }
 
-    /// Discover all change IDs reachable from the given roots and all branch refs.
-    /// Fails loudly if any reachable change record cannot be read.
+    /// Discover all change IDs reachable from the given roots and all
+    /// branch and tag refs. Fails loudly if any reachable change record
+    /// cannot be read.
     pub fn reachable_changes(&self, extra_roots: &[String]) -> Result<HashSet<String>> {
         let mut reachable = HashSet::new();
         let mut queue = std::collections::VecDeque::new();
@@ -1264,6 +1387,9 @@ impl Store {
         }
 
         for (_, head_id) in self.refs()? {
+            queue.push_back(head_id);
+        }
+        for (_, head_id) in self.tags()? {
             queue.push_back(head_id);
         }
 
