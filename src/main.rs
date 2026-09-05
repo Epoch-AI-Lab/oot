@@ -912,8 +912,8 @@ pub(crate) fn collect_worktree(
 
     // Ignore rules: inside a git worktree whose root matches ours, git
     // decides (full semantics). Pure-Oot projects fall back to a minimal
-    // matcher over the root .gitignore — enough for names, directories,
-    // and * globs; negations are not supported.
+    // matcher over the root .gitignore — names, directories, * globs,
+    // and ! negations with last-match-wins.
     let (same_git_root, ignore_rules) = build_ignore_state(root);
     files.retain(|f| !is_path_ignored(root, &f.path, same_git_root, &ignore_rules));
     Ok(files)
@@ -946,7 +946,7 @@ pub(crate) fn build_ignore_state(root: &std::path::Path) -> (bool, Vec<String>) 
             .unwrap_or_default()
             .lines()
             .map(|l| l.trim().to_string())
-            .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with('!'))
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
             .collect()
     };
     (same_git_root, ignore_rules)
@@ -983,22 +983,47 @@ pub(crate) fn filtered_tree(
 
 /// Best-effort .gitignore subset for projects without git: exact names,
 /// `dir/` prefixes, and `*` wildcards, matched per git's basename rule.
+/// Negations (`!pattern`) re-include, last match wins like git. File-level
+/// negations (`*.log` plus `!keep.log`) match `git check-ignore` exactly.
+/// One known superset: git refuses to re-include anything under an excluded
+/// dir (`build/` plus `!build/keep/x` stays ignored), we honor the negation
+/// anyway since pure-Oot matches paths flatly with no dir pruning.
+/// Escaped `\!` stays a literal `!` name.
 fn simple_ignored(rel: &str, rules: &[String]) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    rules.iter().any(|rule| {
-        let anchored = rule.contains('/');
-        let rule = rule.trim_end_matches('/');
-        if anchored && !rule.is_empty() {
-            wildcard_match(rule, rel)
-                || rel
-                    .strip_prefix(rule)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        } else if rule.contains('*') {
-            wildcard_match(rule, base)
-        } else {
-            base == rule || rel.split('/').any(|part| part == rule)
+    let mut ignored = false;
+    for raw in rules {
+        let (negated, rule) = match raw.strip_prefix('!') {
+            Some(rest) if !raw.starts_with("\\!") => (true, rest),
+            _ => (false, raw.strip_prefix("\\!").unwrap_or(raw)),
+        };
+        if rule.is_empty() {
+            continue;
         }
-    })
+        if rule_matches(rel, base, rule) {
+            ignored = !negated;
+        }
+    }
+    ignored
+}
+
+/// One positive gitignore pattern against a path, no negation handling.
+fn rule_matches(rel: &str, base: &str, rule: &str) -> bool {
+    let anchored = rule.contains('/');
+    let rule = rule.trim_end_matches('/');
+    if rule.is_empty() {
+        return false;
+    }
+    if anchored {
+        wildcard_match(rule, rel)
+            || rel
+                .strip_prefix(rule)
+                .is_some_and(|rest| rest.starts_with('/'))
+    } else if rule.contains('*') {
+        wildcard_match(rule, base)
+    } else {
+        base == rule || rel.split('/').any(|part| part == rule)
+    }
 }
 
 /// Glob matching with `*` only (no `?`, no character classes).
@@ -1106,6 +1131,39 @@ mod tests {
         // Clean paths stay.
         assert!(!simple_ignored("src/main.rs", &rules));
         assert!(!simple_ignored("notjunk.log", &rules));
+    }
+
+    #[test]
+    fn test_simple_ignored_negation_last_match_wins() {
+        let rules: Vec<String> = ["*.log", "!keep.log"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(simple_ignored("junk.log", &rules));
+        assert!(simple_ignored("deep/nested/junk.log", &rules));
+        assert!(!simple_ignored("keep.log", &rules));
+        assert!(!simple_ignored("deep/nested/keep.log", &rules));
+
+        // Later positive rule re-ignores.
+        let rules: Vec<String> = ["*.log", "!keep.log", "keep.log"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(simple_ignored("keep.log", &rules));
+
+        // Directory prefix with negation. Pure-Oot honors this; real git
+        // would keep it ignored (refuses re-inclusion under excluded dirs).
+        let rules: Vec<String> = ["build/", "!build/keep/output.o"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(simple_ignored("build/output.o", &rules));
+        assert!(!simple_ignored("build/keep/output.o", &rules));
+        assert!(!simple_ignored("src/main.rs", &rules));
+
+        // Bare ! is not a rule.
+        let rules: Vec<String> = ["*.log", "!"].iter().map(|s| s.to_string()).collect();
+        assert!(simple_ignored("a.log", &rules));
     }
 
     #[test]
