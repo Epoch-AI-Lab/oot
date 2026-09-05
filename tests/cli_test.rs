@@ -42,7 +42,7 @@ fn test_cli_adjudicate_fixtures_repo() {
     assert!(stdout.contains("dispute-01: both sides changed `login` (src/lib.rs:1)    [meaning]"));
     assert!(stdout.contains("dispute-02: private path secrets/.env touched by @kriday/@agent-7 (secrets/.env)    [visibility]"));
     assert!(stdout.contains("verdict:    ▶ CLOAKED . 1 requires review, cloaked"));
-    assert!(stdout.contains("embargo:    patch held for maintainers until 2026-09-01"));
+    assert!(stdout.contains("embargo:    patch held for maintainers until 2027-09-01"));
 }
 
 #[test]

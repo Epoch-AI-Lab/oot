@@ -1157,3 +1157,216 @@ type UserService interface {
         .iter()
         .any(|d| d.detail == "added function `DeleteUser`"));
 }
+
+#[test]
+fn test_engine_top_level_code_modification() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    // JS top-level modification
+    let mut base_js = Snapshot::default();
+    base_js.files.insert(
+        "config.js".to_string(),
+        "const admin = false;\nmodule.exports = { admin };\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head_js = Snapshot::default();
+    head_js.files.insert(
+        "config.js".to_string(),
+        "require('child_process').execSync('id');\nconst admin = true;\nmodule.exports = { admin };\n".as_bytes().to_vec(),
+    );
+
+    let disputes_js = engine
+        .diff_snapshots(&base_js, &head_js)
+        .expect("Diff failed");
+    assert_eq!(
+        disputes_js.len(),
+        1,
+        "top-level JS code modification must emit dispute: {:?}",
+        disputes_js
+    );
+    assert!(disputes_js[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+
+    // Python top-level modification
+    let mut base_py = Snapshot::default();
+    base_py.files.insert(
+        "script.py".to_string(),
+        "DEBUG = False\n".as_bytes().to_vec(),
+    );
+
+    let mut head_py = Snapshot::default();
+    head_py.files.insert(
+        "script.py".to_string(),
+        "import os; os.system('whoami')\nDEBUG = True\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes_py = engine
+        .diff_snapshots(&base_py, &head_py)
+        .expect("Diff failed");
+    assert_eq!(
+        disputes_py.len(),
+        1,
+        "top-level Python code modification must emit dispute: {:?}",
+        disputes_py
+    );
+    assert!(disputes_py[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
+#[test]
+fn test_engine_rust_macro_rules() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/macros.rs".to_string(),
+        "macro_rules! log_msg {\n    ($msg:expr) => { println!(\"log: {}\", $msg); };\n}\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/macros.rs".to_string(),
+        "macro_rules! log_msg {\n    ($msg:expr) => { eprintln!(\"error: {}\", $msg); };\n}\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "Rust macro modification must emit dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0].detail.contains("`log_msg`"));
+}
+
+#[test]
+fn test_engine_whitespace_only_change_is_silent() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const admin = false;\n".as_bytes().to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "const admin = false;  \n\n".as_bytes().to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes.is_empty(),
+        "whitespace-only churn must not dispute: {:?}",
+        disputes
+    );
+}
+
+#[test]
+fn test_engine_function_edit_plus_injection_flags_both() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 1; }\nconst admin = false;\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 2; }\nconst admin = true;\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(disputes.len(), 2, "expected fn + top-level: {:?}", disputes);
+    assert!(disputes.iter().any(|d| d.detail.contains("`foo`")));
+    assert!(disputes
+        .iter()
+        .any(|d| d.detail.contains("top-level or non-function")));
+}
+
+#[test]
+fn test_engine_3way_top_level_injection_disputes() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let base_src = "const admin = false;\n";
+    let ours_src = base_src;
+    let theirs_src = "require('child_process').execSync('id');\nconst admin = true;\n";
+
+    let snap = |s: &str| {
+        let mut x = Snapshot::default();
+        x.files
+            .insert("config.js".to_string(), s.as_bytes().to_vec());
+        x
+    };
+
+    let disputes = engine
+        .diff_3way(&snap(base_src), &snap(ours_src), &snap(theirs_src))
+        .expect("Diff failed");
+
+    assert_eq!(disputes.len(), 1, "incoming injection: {:?}", disputes);
+    assert!(disputes[0].detail.contains("top-level or non-function"));
+
+    // Convergent top-level change on both sides stays silent.
+    let disputes = engine
+        .diff_3way(&snap(base_src), &snap(theirs_src), &snap(theirs_src))
+        .expect("Diff failed");
+    assert!(
+        disputes.is_empty(),
+        "convergent change must not dispute: {:?}",
+        disputes
+    );
+}
+
+#[test]
+fn test_engine_toplevel_injection_on_function_line_is_caught() {
+    // Same-line injection: a statement stapled to a function's closing
+    // brace. Whole-line blanking would hide it; byte-span blanking must not.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 1; }\n".as_bytes().to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "app.js".to_string(),
+        "function foo() { return 1; }require('child_process').execSync('id');\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes
+            .iter()
+            .any(|d| d.detail.contains("top-level or non-function")),
+        "injection stapled to a function line must be disputed: {:?}",
+        disputes
+    );
+    assert!(
+        !disputes
+            .iter()
+            .any(|d| d.detail.contains("both sides changed")),
+        "function body is unchanged, must not flag a function change: {:?}",
+        disputes
+    );
+}

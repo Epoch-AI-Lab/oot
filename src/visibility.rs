@@ -56,6 +56,13 @@ impl VisibilityPolicy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let p: VisibilityPolicy = toml::from_str(&text)?;
+        if let Some(date_str) = &p.embargo_until {
+            if parse_date_ymd(date_str).is_none() {
+                anyhow::bail!(
+                    "invalid embargo_until date format: '{date_str}' (expected YYYY-MM-DD)"
+                );
+            }
+        }
         Ok(p)
     }
 
@@ -196,18 +203,70 @@ impl VisibilityPolicy {
     /// Whether the repository or change is currently under an active embargo.
     pub fn is_under_embargo(&self) -> bool {
         if let Some(date) = &self.embargo_until {
+            let Some((target_y, target_m, target_d)) = parse_date_ymd(date) else {
+                // If malformed, fail closed
+                return true;
+            };
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let days = now / 86400;
             let (cur_y, cur_m, cur_d) = days_to_ymd(days);
-            let today = format!("{:04}-{:02}-{:02}", cur_y, cur_m, cur_d);
-            date.trim() >= today.as_str()
+            (target_y, target_m, target_d) >= (cur_y, cur_m, cur_d)
         } else {
             false
         }
     }
+}
+
+/// Parse calendar date string in common standard formats (YYYY-MM-DD, YYYY/MM/DD, YYYY.MM.DD, DD-MM-YYYY, DD/MM/YYYY, DD.MM.YYYY).
+/// All separators must be the same character, and the day must exist on
+/// the calendar (month lengths plus leap years). Anything else is rejected.
+pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let sep = s.chars().find(|c| *c == '-' || *c == '/' || *c == '.')?;
+    if !s
+        .chars()
+        .filter(|c| *c == '-' || *c == '/' || *c == '.')
+        .all(|c| c == sep)
+    {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(sep).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let p0: i64 = parts[0].parse().ok()?;
+    let p1: u32 = parts[1].parse().ok()?;
+    let p2: i64 = parts[2].parse().ok()?;
+
+    let (y, m, d) = if p0 >= 1000 {
+        (p0, p1, p2 as u32)
+    } else if p2 >= 1000 {
+        (p2, p1, p0 as u32)
+    } else {
+        return None;
+    };
+
+    if y <= 0 || !(1..=12).contains(&m) {
+        return None;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let max_day = match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if d < 1 || d > max_day {
+        return None;
+    }
+    Some((y, m, d))
 }
 
 fn days_to_ymd(days: u64) -> (i64, u32, u32) {

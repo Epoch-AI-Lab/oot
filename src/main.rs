@@ -418,6 +418,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Commands::Record { message, branch } => {
             let root = std::env::current_dir()?;
             let store = Store::open(&root)?;
+            let _lock = store.lock()?;
             let branch = resolve_branch(&store, branch)?;
 
             let (author, committer) = resolve_identity(&root)?;
@@ -450,6 +451,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let id = store.put_record(&record)?;
             store.index_push(&id)?;
             store.set_ref(&branch, &id)?;
+            let _ = store.set_head_branch(&branch);
 
             println!(
                 "recorded {id} on {branch} as {kind}: {} file(s)",
@@ -525,9 +527,17 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         Commands::Log { branch } => {
             let store = Store::open(".")?;
             let branch = resolve_branch(&store, branch)?;
-            let head_id = store
-                .head_id(&branch)?
-                .ok_or_else(|| anyhow::anyhow!("branch '{branch}' has no changes"))?;
+            let head_id = match store.head_id(&branch)? {
+                Some(id) => id,
+                None => {
+                    if store.refs()?.is_empty() {
+                        println!("branch '{branch}': empty store, nothing recorded yet");
+                        return Ok(std::process::ExitCode::SUCCESS);
+                    } else {
+                        anyhow::bail!("branch '{branch}' has no changes");
+                    }
+                }
+            };
 
             // Reachable set from the head...
             let mut reachable: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -629,10 +639,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 }
             }
 
-            // Point HEAD at the first exported branch so `git log` works immediately.
+            // Point HEAD at the first exported branch so `git log` works immediately,
+            // and populate the working tree files so the exported repo is ready to inspect.
             if let Some(first_branch) = first_exported_branch {
                 let first = format!("refs/heads/{first_branch}");
                 run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
+                let _ = run_git(&["checkout", "-f", "HEAD"], &out_path);
             } else {
                 println!(
                     "warning: all branches were withheld by policy; no refs exported to {out}"

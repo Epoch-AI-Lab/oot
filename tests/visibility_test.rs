@@ -19,11 +19,11 @@ fn test_visibility_policy_deserialization_from_fixture() {
         VisibilityPolicy::load(fixture_path).expect("Failed to load fixtures/visibility.toml");
 
     assert_eq!(policy.private_paths, vec!["secrets/", ".env"]);
-    assert_eq!(policy.embargo_until.as_deref(), Some("2026-09-01"));
+    assert_eq!(policy.embargo_until.as_deref(), Some("2027-09-01"));
     assert!(policy.private_branches.is_empty());
     assert_eq!(
         policy.embargo_note().as_deref(),
-        Some("patch held for maintainers until 2026-09-01")
+        Some("patch held for maintainers until 2027-09-01")
     );
 }
 
@@ -227,4 +227,83 @@ fn test_visibility_policy_dotfile_root_and_nested_exact_matching() {
     assert!(!policy.path_is_private("config/.envoy.yaml"));
     assert!(!policy.path_is_private("src/keyboard.rs"));
     assert!(!policy.path_is_private("src/secrets_manager.rs"));
+}
+
+#[test]
+fn test_embargo_date_formats_and_validation() {
+    let policy_iso = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099-01-01".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_iso.is_under_embargo(),
+        "future ISO date must be under embargo"
+    );
+
+    let policy_dd_mm_yyyy = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("01-01-2099".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_dd_mm_yyyy.is_under_embargo(),
+        "future DD-MM-YYYY date must be under embargo"
+    );
+
+    let policy_slash = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099/12/31".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        policy_slash.is_under_embargo(),
+        "future slash date must be under embargo"
+    );
+
+    let policy_past = VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("1999-01-01".into()),
+        private_branches: vec![],
+    };
+    assert!(
+        !policy_past.is_under_embargo(),
+        "past date must not be under embargo"
+    );
+
+    // Invalid format loading must fail
+    let tmp = std::env::temp_dir().join(format!("oot-bad-date-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    for bad in [
+        "not-a-date",
+        "2099-02-30",
+        "2099-13-01",
+        "2099-12/31",
+        "01-01-2099-extra",
+    ] {
+        let bad_toml = tmp.join("bad.toml");
+        std::fs::write(&bad_toml, format!("embargo_until = \"{bad}\"\n")).unwrap();
+        assert!(
+            VisibilityPolicy::load(&bad_toml).is_err(),
+            "invalid date '{bad}' in TOML must fail to load"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Leap day exists in 2096 but not in 2099.
+    assert!(VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2096-02-29".into()),
+        private_branches: vec![],
+    }
+    .is_under_embargo());
+    // Nonexistent Feb 29 cannot be constructed, so a hand-built policy
+    // with it must fail closed, never open.
+    assert!(VisibilityPolicy {
+        private_paths: vec![],
+        embargo_until: Some("2099-02-29".into()),
+        private_branches: vec![],
+    }
+    .is_under_embargo());
 }
