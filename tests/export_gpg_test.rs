@@ -342,16 +342,87 @@ fn test_resign_key_leaves_unsigned_rebuilds_alone() {
     let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
     assert!(ok, "unsigned rebuilds must not touch the key: {msg}");
 
-    let exported_head = git(&out, &["rev-parse", "main"]);
-    let head_cat = git(&out, &["cat-file", "commit", &exported_head]);
-    assert!(
-        !head_cat.contains("gpgsig"),
-        "unsigned original must stay unsigned"
-    );
+    // Every exported commit stays unsigned: the key replaces old sigs only.
+    let shas = git(&out, &["log", "--format=%H", "main"]);
+    assert!(!shas.is_empty(), "export must produce commits");
+    for sha in shas.lines() {
+        let cat = git(&out, &["cat-file", "commit", sha]);
+        assert!(
+            !cat.contains("gpgsig"),
+            "unsigned original {sha} must stay unsigned"
+        );
+    }
     let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
     assert!(
         !log.contains("resigned"),
         "nothing was signed, nothing to log: {log}"
+    );
+    assert!(
+        !log.contains("sig-dropped"),
+        "nothing had a sig, nothing dropped: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_whitespace_resign_key_behaves_as_unset() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-blankkey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "root"]);
+
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/.env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    // Signed commit past the secret: rebuild drops the sig, blank key
+    // behaves as unset instead of failing on a garbage key id.
+    std::fs::write(src.join("README.md"), "# Public Project v2\n").unwrap();
+    git(&src, &["add", "."]);
+    let third_tree = git(&src, &["write-tree"]);
+    let third_sha = git(&src, &["rev-parse", "HEAD"]);
+    let signed_third = forge_signed(
+        &src,
+        &third_tree,
+        Some(&third_sha),
+        "iQDummyThird",
+        "signed third",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_third]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\"secrets/\"]\nprivate_branches = []\nresign_key_id = \"   \"\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "blank key must behave as unset: {msg}");
+
+    let exported_head = git(&out, &["rev-parse", "main"]);
+    let head_cat = git(&out, &["cat-file", "commit", &exported_head]);
+    assert!(
+        !head_cat.contains("gpgsig"),
+        "rebuilt commit must ship unsigned"
+    );
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(log.contains("sig-dropped"), "missing drop event: {log}");
+    assert!(
+        log.contains(&signed_third),
+        "drop event must name the original sha: {log}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

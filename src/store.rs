@@ -865,12 +865,17 @@ impl Store {
         // can silently mix decisions from two regimes.
         let filter_key = match policy {
             Some(p) if filtering => {
+                let resign = p
+                    .resign_key_id
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default();
                 format!(
                     "{}\u{1f}{}\u{1f}{}\u{1f}{}",
                     p.private_paths.join(","),
                     p.private_branches.join(","),
                     p.embargo_until.as_deref().unwrap_or_default(),
-                    p.resign_key_id.as_deref().unwrap_or_default()
+                    resign
                 )
             }
             _ => String::new(),
@@ -1460,9 +1465,11 @@ impl Store {
     }
 
     /// Whether the original commit object carries a gpgsig header.
-    /// Covers both `gpgsig` and `gpgsig-sha256`. Import never records this,
-    /// so ask the object database directly. Fails loudly when the object
-    /// cannot be read: silent false means a dropped sig goes unlogged.
+    /// Covers both `gpgsig` and `gpgsig-sha256`. Header lines only: stop at
+    /// the first blank line so a message starting with `gpgsig ` never fakes
+    /// a signature. Import never records this, so ask the object database
+    /// directly. Fails loudly when the object cannot be read: silent false
+    /// means a dropped sig goes unlogged.
     fn commit_had_sig(&self, sha: &str) -> Result<bool> {
         let out = Command::new("git")
             .args(["--git-dir"])
@@ -1476,8 +1483,10 @@ impl Store {
                 String::from_utf8_lossy(&out.stderr).trim()
             );
         }
-        Ok(String::from_utf8_lossy(&out.stdout)
+        let text = String::from_utf8_lossy(&out.stdout);
+        Ok(text
             .lines()
+            .take_while(|l| !l.is_empty())
             .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 ")))
     }
 
@@ -2315,6 +2324,68 @@ mod tests {
             signed.contains("-SKEYID"),
             "key must reach commit-tree: {signed}"
         );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_commit_had_sig_only_reads_headers() {
+        let tmp = std::env::temp_dir().join(format!("oot-sig-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+
+        let write_commit = |raw: &str| -> String {
+            let mut child = std::process::Command::new("git")
+                .args(["--git-dir"])
+                .arg(store.git_dir())
+                .args(["hash-object", "-t", "commit", "-w", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            use std::io::Write;
+            child
+                .stdin
+                .take()
+                .expect("hash-object has stdin")
+                .write_all(raw.as_bytes())
+                .unwrap();
+            let done = child.wait_with_output().unwrap();
+            assert!(done.status.success());
+            String::from_utf8(done.stdout).unwrap().trim().to_string()
+        };
+
+        // Signed header, unsigned body mentioning gpgsig: still signed.
+        let signed = write_commit(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor K <k@oot.dev> 0 +0000\ncommitter K <k@oot.dev> 0 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n iQDummy\n =sig\n -----END PGP SIGNATURE-----\n\nplain body\n",
+        );
+        assert!(store.commit_had_sig(&signed).unwrap());
+
+        // sha256 variant counts too.
+        let signed256 = write_commit(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor K <k@oot.dev> 0 +0000\ncommitter K <k@oot.dev> 0 +0000\ngpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n iQDummy\n =sig\n -----END PGP SIGNATURE-----\n\nplain body\n",
+        );
+        assert!(store.commit_had_sig(&signed256).unwrap());
+
+        // Body line starting with gpgsig must not fake a signature.
+        let fake = write_commit(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor K <k@oot.dev> 0 +0000\ncommitter K <k@oot.dev> 0 +0000\n\ngpgsig not a real header\n",
+        );
+        assert!(!store.commit_had_sig(&fake).unwrap());
+
+        // Plain unsigned commit.
+        let plain_commit = write_commit(
+            "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor K <k@oot.dev> 0 +0000\ncommitter K <k@oot.dev> 0 +0000\n\nhello\n",
+        );
+        assert!(!store.commit_had_sig(&plain_commit).unwrap());
+
+        // Missing object fails loud, never silent false.
+        assert!(store
+            .commit_had_sig("deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+            .is_err());
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
