@@ -15,6 +15,14 @@ pub struct MeaningPolicy {
     /// Severity names (lowercase, e.g. `"review"`, `"high"`) that require human review.
     #[serde(default = "default_review_on")]
     pub review_on: Vec<String>,
+    /// Minimum rename similarity (0-100) that pairs a removal with an
+    /// addition as a rename. 100 is squash-equal, 80 allows param renames.
+    #[serde(default = "default_rename_min_score")]
+    pub rename_min_score: u8,
+}
+
+fn default_rename_min_score() -> u8 {
+    100
 }
 
 fn default_block_on() -> Vec<String> {
@@ -30,6 +38,7 @@ impl Default for MeaningPolicy {
         MeaningPolicy {
             block_on: default_block_on(),
             review_on: default_review_on(),
+            rename_min_score: default_rename_min_score(),
         }
     }
 }

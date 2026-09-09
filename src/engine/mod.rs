@@ -14,6 +14,7 @@ pub mod language;
 /// Structural difference engine for code snapshots.
 pub struct Engine {
     languages: Vec<LangConfig>,
+    rename_min_score: u8,
 }
 
 impl Engine {
@@ -22,12 +23,27 @@ impl Engine {
     pub fn new() -> anyhow::Result<Self> {
         Ok(Engine {
             languages: registry(),
+            rename_min_score: 100,
         })
+    }
+
+    /// Smallest rename similarity (0-100) that still pairs a removal with
+    /// an addition as a rename. Values above 100 clamp down to 100.
+    pub fn with_rename_min_score(mut self, min_score: u8) -> Self {
+        self.rename_min_score = min_score.min(100);
+        self
     }
 
     /// The grammar configuration for `path`, if Oot can diff that language.
     fn config_for(&self, path: &str) -> Option<&LangConfig> {
         self.languages.iter().find(|c| c.supports(path))
+    }
+
+    /// Pairing gate: similar enough to count as a rename under this
+    /// engine's threshold. A zero floor still needs some similarity.
+    fn is_rename(&self, candidate: &str, original: &str) -> bool {
+        let score = rename_score(candidate, original);
+        score > 0 && score >= self.rename_min_score
     }
 
     /// Compare two snapshots and report Meaning disputes: functions that
@@ -98,7 +114,7 @@ impl Engine {
                     let mut leftover_removed: Vec<&str> = Vec::new();
                     for (old_name, old_def) in &pending_removed {
                         let found = pending_added.iter().enumerate().find(|(i, (_, new_def))| {
-                            !consumed[*i] && new_def.signature == old_def.signature
+                            !consumed[*i] && self.is_rename(&new_def.signature, &old_def.signature)
                         });
                         if let Some((i, (new_name, new_def))) = found {
                             consumed[i] = true;
@@ -402,6 +418,7 @@ impl Engine {
                         &added_ours,
                         &removed_theirs,
                         &added_theirs,
+                        self.rename_min_score,
                     );
                     let mut claimed_theirs: Vec<(&str, usize)> = Vec::new();
                     let mut claimed_base: HashSet<&str> = HashSet::new();
@@ -453,7 +470,7 @@ impl Engine {
                     let mut leftover_removed: Vec<String> = Vec::new();
                     for (old_name, old_def) in &pending_removed {
                         let found = pending_added.iter().enumerate().find(|(i, (_, new_def))| {
-                            !consumed[*i] && new_def.signature == old_def.signature
+                            !consumed[*i] && self.is_rename(&new_def.signature, &old_def.signature)
                         });
                         if let Some((i, (new_name, new_def))) = found {
                             consumed[i] = true;
@@ -587,9 +604,7 @@ fn without_defs(src: &str, fns: &FunctionMap) -> String {
     for def in fns.values().flatten() {
         let start = def.start_byte.min(bytes.len());
         let end = def.end_byte.min(bytes.len()).max(start);
-        for slot in marked.iter_mut().take(end).skip(start) {
-            *slot = true;
-        }
+        marked[start..end].fill(true);
     }
     let kept: Vec<u8> = bytes
         .iter()
@@ -635,16 +650,7 @@ fn align_defs(base: &[FnDef], head: &[FnDef]) -> (Vec<(usize, usize)>, Vec<usize
 
 /// Whether every def in `a` also appears in `b` (multiplicity-aware).
 fn contained_in(a: &[FnDef], b: &[FnDef]) -> bool {
-    let mut rest: Vec<&str> = b.iter().map(|d| d.src.as_str()).collect();
-    for d in a {
-        match rest.iter().position(|s| *s == d.src) {
-            Some(i) => {
-                rest.swap_remove(i);
-            }
-            None => return false,
-        }
-    }
-    true
+    strip_common(a, b).is_empty()
 }
 
 /// The defs of `a` that have no identical counterpart in `b`.
@@ -652,21 +658,112 @@ fn strip_common<'a>(a: &'a [FnDef], b: &[FnDef]) -> Vec<&'a FnDef> {
     let mut rest: Vec<&str> = b.iter().map(|d| d.src.as_str()).collect();
     let mut leftover = Vec::new();
     for d in a {
-        match rest.iter().position(|s| *s == d.src) {
-            Some(i) => {
-                rest.swap_remove(i);
-            }
-            None => leftover.push(d),
+        if let Some(i) = rest.iter().position(|s| *s == d.src) {
+            rest.swap_remove(i);
+        } else {
+            leftover.push(d);
         }
     }
     leftover
 }
 
-/// Rename compatibility between a removed def's signature and an added
-/// def's signature: `Some` on exact equality today. A future similarity
-/// metric widens this to graded scores without touching the pairing logic.
-fn rename_score(candidate: &str, original: &str) -> Option<()> {
-    (candidate == original).then_some(())
+/// How alike two function texts are: 100 = same ignoring spaces,
+/// 80 = same after forgetting param names, else 0.
+fn rename_score(candidate: &str, original: &str) -> u8 {
+    if squash_ws(candidate) == squash_ws(original) {
+        100
+    } else if strip_param_names(candidate) == strip_param_names(original) {
+        80
+    } else {
+        0
+    }
+}
+
+/// Same text with param names erased, plus whether any names existed.
+/// A typed piece (`name: Type`, `name = 1`) keeps its type part, a bare
+/// name (`a`) goes away fully. Empty stays empty.
+fn strip_param_names(sig: &str) -> (String, bool) {
+    let squashed = squash_ws(sig);
+    let Some(open) = squashed.find('(') else {
+        return (squashed, false);
+    };
+    // Find the `)` that closes the first `(`.
+    let mut depth = 0;
+    let mut close = None;
+    for (i, c) in squashed[open..].char_indices() {
+        if c == '(' {
+            depth += 1;
+        } else if c == ')' {
+            depth -= 1;
+        }
+        if depth == 0 {
+            close = Some(open + i);
+            break;
+        }
+    }
+    let Some(close) = close else {
+        return (squashed, false);
+    };
+    let params = &squashed[open + 1..close];
+    let mut out = String::with_capacity(squashed.len());
+    out.push_str(&squashed[..=open]);
+    let mut had_names = false;
+    let mut segment = String::new();
+    let mut seg_depth = 0;
+    for c in params.chars() {
+        match c {
+            '(' => {
+                seg_depth += 1;
+                segment.push(c);
+            }
+            ')' => {
+                seg_depth -= 1;
+                segment.push(c);
+            }
+            ',' if seg_depth == 0 => {
+                let (s, h) = strip_segment(&segment);
+                out.push_str(&s);
+                out.push(',');
+                had_names |= h;
+                segment.clear();
+            }
+            _ => segment.push(c),
+        }
+    }
+    let (s, h) = strip_segment(&segment);
+    out.push_str(&s);
+    had_names |= h;
+    out.push_str(&squashed[close..]);
+    (out, had_names)
+}
+
+/// One param with its name erased. A name at the end counts as
+/// followed by `,` since the real `,` or `)` was cut off.
+fn strip_segment(segment: &str) -> (String, bool) {
+    let typed = segment.contains(':') || segment.contains('=');
+    let mut out = String::with_capacity(segment.len());
+    let mut had_names = false;
+    let mut chars = segment.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_alphanumeric() || c == '_' {
+            let mut ident = String::from(c);
+            while chars
+                .peek()
+                .is_some_and(|n| n.is_alphanumeric() || *n == '_')
+            {
+                ident.push(chars.next().unwrap_or_default());
+            }
+            let follows = chars.peek().copied().unwrap_or(',');
+            if follows == ':' || follows == '=' || (!typed && (follows == ',' || follows == ')')) {
+                had_names = true;
+            } else {
+                out.push_str(&ident);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    (out, had_names)
 }
 
 /// One side's rename evidence: a base def identified by `(name, index
@@ -689,20 +786,23 @@ struct DivergentRename {
     theirs_row: usize,
 }
 
-/// Greedily pair each removed def with the first unconsumed added def whose
-/// signature matches exactly under a different name. Entries are consumed
-/// once on both sides, so duplicates pair one-to-one.
+/// Greedily pair each removed def with the first unconsumed added def
+/// similar enough to count as a rename under a different name. Entries
+/// are consumed once on both sides, so duplicates pair one-to-one.
 fn pair_side_renames(
     removed: &[(String, usize, FnDef)],
     added: &[(String, FnDef)],
+    min_score: u8,
 ) -> Vec<SidePair> {
     let mut used = vec![false; added.len()];
     let mut pairs = Vec::new();
     for (old_name, old_idx, old_def) in removed {
         let found = added.iter().enumerate().find(|(i, (new_name, new_def))| {
-            !used[*i]
-                && new_name != old_name
-                && rename_score(&new_def.signature, &old_def.signature).is_some()
+            if used[*i] || new_name == old_name {
+                return false;
+            }
+            let score = rename_score(&new_def.signature, &old_def.signature);
+            score > 0 && score >= min_score
         });
         if let Some((i, (new_name, new_def))) = found {
             used[i] = true;
@@ -726,9 +826,10 @@ fn find_divergent_renames(
     added_ours: &[(String, FnDef)],
     removed_theirs: &[(String, usize, FnDef)],
     added_theirs: &[(String, FnDef)],
+    min_score: u8,
 ) -> Vec<DivergentRename> {
-    let ours_pairs = pair_side_renames(removed_ours, added_ours);
-    let theirs_pairs = pair_side_renames(removed_theirs, added_theirs);
+    let ours_pairs = pair_side_renames(removed_ours, added_ours, min_score);
+    let theirs_pairs = pair_side_renames(removed_theirs, added_theirs, min_score);
     let mut divergent = Vec::new();
     for tp in &theirs_pairs {
         if let Some(op) = ours_pairs.iter().find(|op| {
@@ -793,11 +894,8 @@ fn file_function_summary(tree: Option<&Tree>, source: &str, config: &LangConfig)
     let count: usize = fns.values().map(Vec::len).sum();
     let preview: Vec<String> = names.iter().take(3).map(|s| s.to_string()).collect();
     let noun = if count == 1 { "function" } else { "functions" };
-    if names.len() > 3 {
-        format!("{} {}: {}, …", count, noun, preview.join(", "))
-    } else {
-        format!("{} {}: {}", count, noun, preview.join(", "))
-    }
+    let extra = if names.len() > 3 { ", …" } else { "" };
+    format!("{} {}: {}{}", count, noun, preview.join(", "), extra)
 }
 
 /// Extract tracked functions as `name -> [(source text, 1-based row, rename
@@ -1452,16 +1550,30 @@ mod tests {
     }
 
     #[test]
-    fn test_rename_score_is_exact_only() {
-        assert!(rename_score("fn () {}", "fn () {}").is_some());
-        assert!(rename_score("fn () {}", "fn (x) {}").is_none());
+    fn test_rename_score_tiers() {
+        // Real signatures carry the name blanked out, so only the
+        // body and params decide the score.
+        assert_eq!(rename_score("fn \0() {}", "fn \0() {}"), 100);
+        assert_eq!(rename_score("fn \0 () {}", "fn \0() {}"), 100);
+        assert_eq!(
+            rename_score("fn \0(a: i32) { x }", "fn \0(b: i32) { x }"),
+            80
+        );
+        assert_eq!(rename_score("def \0(name):", "def \0(user):"), 80);
+        assert_eq!(rename_score("def \0(a, b=1):", "def \0(c, b=1):"), 80);
+        assert_eq!(
+            rename_score("fn \0(a: i32) { x }", "fn \0(b: String) { x }"),
+            0
+        );
+        assert_eq!(rename_score("fn \0() { x }", "fn \0(x) { x }"), 0);
+        assert_eq!(rename_score("fn \0(a) { x }", "fn \0(a) { y }"), 0);
     }
 
     #[test]
     fn test_pair_side_consumes_each_added_once() {
         let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigA")];
         let added = vec![ad("x", 3, "sigA")];
-        let pairs = pair_side_renames(&removed, &added);
+        let pairs = pair_side_renames(&removed, &added, 100);
         assert_eq!(pairs.len(), 1, "one added def cannot serve two removals");
         assert_eq!(pairs[0].old_idx, 0);
         assert_eq!(pairs[0].new_name, "x");
@@ -1471,10 +1583,21 @@ mod tests {
     fn test_pair_side_matches_duplicates_one_to_one() {
         let removed = vec![rm("f", 0, "sigA"), rm("f", 1, "sigB")];
         let added = vec![ad("y", 5, "sigB"), ad("x", 3, "sigA")];
-        let pairs = pair_side_renames(&removed, &added);
+        let pairs = pair_side_renames(&removed, &added, 100);
         assert_eq!(pairs.len(), 2);
         assert!(pairs.iter().any(|p| p.old_idx == 0 && p.new_name == "x"));
         assert!(pairs.iter().any(|p| p.old_idx == 1 && p.new_name == "y"));
+    }
+
+    #[test]
+    fn test_pair_side_gates_param_rename_on_threshold() {
+        let removed = vec![rm("f", 0, "fn \0(a: i32) { x }")];
+        let added = vec![ad("g", 3, "fn \0(b: i32) { x }")];
+        assert!(
+            pair_side_renames(&removed, &added, 100).is_empty(),
+            "param rename stays unpaired at the strict default"
+        );
+        assert_eq!(pair_side_renames(&removed, &added, 80).len(), 1);
     }
 
     #[test]
@@ -1483,7 +1606,7 @@ mod tests {
         // regular changed/gone alignment.
         let removed = vec![rm("f", 0, "sigA")];
         let added = vec![ad("f", 3, "sigA")];
-        assert!(pair_side_renames(&removed, &added).is_empty());
+        assert!(pair_side_renames(&removed, &added, 100).is_empty());
     }
 
     #[test]
@@ -1499,12 +1622,14 @@ mod tests {
             &added_ours,
             &removed_theirs,
             &added_theirs_convergent,
+            100,
         )
         .is_empty());
 
         // Theirs deleted without renaming: no join.
         assert!(
-            find_divergent_renames(&removed_ours, &added_ours, &removed_theirs, &[],).is_empty()
+            find_divergent_renames(&removed_ours, &added_ours, &removed_theirs, &[], 100,)
+                .is_empty()
         );
 
         // Divergent: ours f -> g, theirs f -> k.
@@ -1515,6 +1640,7 @@ mod tests {
                 &added_ours,
                 &removed_theirs,
                 &added_theirs_divergent,
+                100,
             ),
             vec![DivergentRename {
                 base_name: "f".into(),

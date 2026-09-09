@@ -190,6 +190,8 @@ pub fn policy_key(meaning: &MeaningPolicy, visibility: &VisibilityPolicy) -> Str
     push_list(&mut canon, &meaning.block_on);
     canon.push_str(";review_on=");
     push_list(&mut canon, &meaning.review_on);
+    canon.push_str(";rename_min=");
+    canon.push_str(&meaning.rename_min_score.to_string());
     canon.push_str(";private_paths=");
     push_list(&mut canon, &visibility.private_paths);
     canon.push_str(";private_branches=");
