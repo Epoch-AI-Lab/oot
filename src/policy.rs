@@ -48,6 +48,12 @@ impl MeaningPolicy {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
         let p: MeaningPolicy = toml::from_str(&text)?;
+        if p.rename_min_score > 100 {
+            anyhow::bail!(
+                "invalid rename_min_score: '{}' (expected 0-100)",
+                p.rename_min_score
+            );
+        }
         Ok(p)
     }
 

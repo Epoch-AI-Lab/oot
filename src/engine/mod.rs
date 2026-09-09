@@ -668,7 +668,8 @@ fn strip_common<'a>(a: &'a [FnDef], b: &[FnDef]) -> Vec<&'a FnDef> {
 }
 
 /// How alike two function texts are: 100 = same ignoring spaces,
-/// 80 = same after forgetting param names, else 0.
+/// 80 = same after forgetting param names, else 0. Bodies must match
+/// word for word, even where the body repeats a renamed param.
 fn rename_score(candidate: &str, original: &str) -> u8 {
     if squash_ws(candidate) == squash_ws(original) {
         100
@@ -738,12 +739,17 @@ fn strip_param_names(sig: &str) -> (String, bool) {
 }
 
 /// One param with its name erased. A name at the end counts as
-/// followed by `,` since the real `,` or `)` was cut off.
+/// followed by `,` since the real `,` or `)` was cut off. Without a
+/// type or default every word is a name, so all of them go.
 fn strip_segment(segment: &str) -> (String, bool) {
     let typed = segment.contains(':') || segment.contains('=');
     let mut out = String::with_capacity(segment.len());
     let mut had_names = false;
     let mut chars = segment.chars().peekable();
+    // A `'` directly before a name opens a lifetime (`&'a str`),
+    // which is a name like any param. A quote elsewhere (a `'x'`
+    // default) leaves the value alone.
+    let mut lifetime = false;
     while let Some(c) = chars.next() {
         if c.is_alphanumeric() || c == '_' {
             let mut ident = String::from(c);
@@ -754,12 +760,17 @@ fn strip_segment(segment: &str) -> (String, bool) {
                 ident.push(chars.next().unwrap_or_default());
             }
             let follows = chars.peek().copied().unwrap_or(',');
-            if follows == ':' || follows == '=' || (!typed && (follows == ',' || follows == ')')) {
+            if !typed || follows == ':' || follows == '=' || lifetime {
                 had_names = true;
             } else {
                 out.push_str(&ident);
             }
+            lifetime = false;
         } else {
+            lifetime = c == '\''
+                && chars
+                    .peek()
+                    .is_some_and(|n| n.is_alphanumeric() || *n == '_');
             out.push(c);
         }
     }
@@ -1046,6 +1057,48 @@ fn insert(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_param_rename_pairs_only_under_loose_threshold() {
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "src/lib.rs".into(),
+            "pub fn alpha(a: i32) -> i32 { 42 }\n".into(),
+        );
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "src/lib.rs".into(),
+            "pub fn beta(b: i32) -> i32 { 42 }\n".into(),
+        );
+
+        let strict = Engine::new().unwrap();
+        let details: Vec<String> = strict
+            .diff_snapshots(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
+        assert!(
+            details.iter().any(|d| d.contains("added function `beta`"))
+                && details
+                    .iter()
+                    .any(|d| d.contains("removed function `alpha`")),
+            "strict default must not pair a param rename, got {details:?}"
+        );
+
+        let loose = Engine::new().unwrap().with_rename_min_score(80);
+        let details: Vec<String> = loose
+            .diff_snapshots(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
+        assert_eq!(
+            details,
+            vec!["renamed function `alpha` to `beta`"],
+            "threshold 80 must pair it as one rename"
+        );
+    }
 
     #[test]
     fn test_engine_diff_functions() {
@@ -1567,6 +1620,18 @@ mod tests {
         );
         assert_eq!(rename_score("fn \0() { x }", "fn \0(x) { x }"), 0);
         assert_eq!(rename_score("fn \0(a) { x }", "fn \0(a) { y }"), 0);
+        assert_eq!(
+            rename_score("function \0({a, b}) { x }", "function \0({c, d}) { x }"),
+            80
+        );
+        assert_eq!(
+            rename_score("fn \0(a: Foo<A, B>) { x }", "fn \0(c: Foo<A, B>) { x }"),
+            80
+        );
+        assert_eq!(
+            rename_score("fn \0(x: &'a str) { y }", "fn \0(x: &'b str) { y }"),
+            80
+        );
     }
 
     #[test]
