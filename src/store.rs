@@ -866,15 +866,23 @@ impl Store {
         let filter_key = match policy {
             Some(p) if filtering => {
                 format!(
-                    "{}\u{1f}{}\u{1f}{}",
+                    "{}\u{1f}{}\u{1f}{}\u{1f}{}",
                     p.private_paths.join(","),
                     p.private_branches.join(","),
-                    p.embargo_until.as_deref().unwrap_or_default()
+                    p.embargo_until.as_deref().unwrap_or_default(),
+                    p.resign_key_id.as_deref().unwrap_or_default()
                 )
             }
             _ => String::new(),
         };
         self.reset_export_cache_if_policy_changed(&filter_key)?;
+        let sign_key: Option<String> = if filtering {
+            policy
+                .and_then(|p| p.resign_key_id.clone())
+                .filter(|k| !k.is_empty())
+        } else {
+            None
+        };
 
         // Taint pass: decide once, up front, which changes touch private paths,
         // and collect all private blob SHAs to prevent multi-step rename leaks.
@@ -926,6 +934,10 @@ impl Store {
         // Exported sha -> rebuilt tree sha (filtered mode only).
         let mut tree_of: HashMap<String, String> = HashMap::new();
         let mut exported = Vec::new();
+        let mut kept = 0u64;
+        let mut rebuilt = 0u64;
+        let mut sigs_dropped = 0u64;
+        let mut resigned = 0u64;
 
         for id in self.index()? {
             let record = self.get_change(&id)?;
@@ -1005,6 +1017,7 @@ impl Store {
                     source_sha_of.insert(id.clone(), orig.clone());
                     if filtering {
                         tree_of.insert(orig.clone(), stripped_tree);
+                        kept += 1;
                     }
                     exported.push((id.clone(), orig.clone()));
                     continue;
@@ -1012,16 +1025,54 @@ impl Store {
             }
 
             // Reconstruction path: rebuild commit with remapped parents.
-            let mut cmd = self.commit_tree_cmd(&stripped_tree, &record);
+            // A rebuild drops the old sig since it covered the old bytes.
+            let mut cmd = self.commit_tree_cmd(&stripped_tree, &record, sign_key.as_deref());
             for p in &parent_shas {
                 cmd.args(["-p", p]);
             }
-            let sha = self.finish_commit(cmd, &record.message, &id)?;
+            let sha =
+                self.finish_commit(cmd, &record.message, &id)
+                    .map_err(|e| match &sign_key {
+                        Some(k) => {
+                            anyhow::anyhow!("re-sign with key '{k}' failed for change {id}: {e:#}")
+                        }
+                        None => e,
+                    })?;
             if filtering {
                 tree_of.insert(sha.clone(), stripped_tree);
+                let had_sig = match &record.source_sha {
+                    Some(orig) => self.commit_had_sig(orig)?,
+                    None => false,
+                };
+                match (&sign_key, had_sig) {
+                    (Some(k), true) => {
+                        resigned += 1;
+                        self.log_sig_event(
+                            "resigned",
+                            &id,
+                            record.source_sha.as_deref(),
+                            &format!("rebuilt commit re-signed with key '{k}'"),
+                        )?;
+                    }
+                    (None, true) => {
+                        sigs_dropped += 1;
+                        self.log_sig_event(
+                            "sig-dropped",
+                            &id,
+                            record.source_sha.as_deref(),
+                            "rebuilt commit ships unsigned, original sig covered old bytes",
+                        )?;
+                    }
+                    _ => rebuilt += 1,
+                }
             }
             sha_of.insert(id.clone(), sha.clone());
             exported.push((id.clone(), sha));
+        }
+        if filtering {
+            println!(
+                "export: {kept} kept, {rebuilt} rebuilt unsigned, {sigs_dropped} lost sigs, {resigned} re-signed"
+            );
         }
         Ok(exported)
     }
@@ -1248,33 +1299,41 @@ impl Store {
     /// A `git commit-tree` invocation preset with this record's identity and
     /// timestamps; callers append `-p <sha>` per parent and pipe the message.
     /// Writes into the store's odb so cached shas resolve in every export.
-    fn commit_tree_cmd(&self, tree: &str, record: &ChangeRecord) -> Command {
+    fn commit_tree_cmd(
+        &self,
+        tree: &str,
+        record: &ChangeRecord,
+        sign_key: Option<&str>,
+    ) -> Command {
         let mut cmd = Command::new("git");
         cmd.args(["--git-dir"])
             .arg(self.git_dir())
             .arg("commit-tree")
-            .arg(tree)
-            .env(
-                "GIT_AUTHOR_NAME",
-                record.author.name.replace('\n', " ").replace('\r', ""),
-            )
-            .env(
-                "GIT_AUTHOR_EMAIL",
-                record.author.email.replace('\n', " ").replace('\r', ""),
-            )
-            .env("GIT_AUTHOR_DATE", record.author.date_env())
-            .env(
-                "GIT_COMMITTER_NAME",
-                record.committer.name.replace('\n', " ").replace('\r', ""),
-            )
-            .env(
-                "GIT_COMMITTER_EMAIL",
-                record.committer.email.replace('\n', " ").replace('\r', ""),
-            )
-            .env("GIT_COMMITTER_DATE", record.committer.date_env())
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .arg(tree);
+        if let Some(key) = sign_key {
+            cmd.arg(format!("-S{key}"));
+        }
+        cmd.env(
+            "GIT_AUTHOR_NAME",
+            record.author.name.replace('\n', " ").replace('\r', ""),
+        )
+        .env(
+            "GIT_AUTHOR_EMAIL",
+            record.author.email.replace('\n', " ").replace('\r', ""),
+        )
+        .env("GIT_AUTHOR_DATE", record.author.date_env())
+        .env(
+            "GIT_COMMITTER_NAME",
+            record.committer.name.replace('\n', " ").replace('\r', ""),
+        )
+        .env(
+            "GIT_COMMITTER_EMAIL",
+            record.committer.email.replace('\n', " ").replace('\r', ""),
+        )
+        .env("GIT_COMMITTER_DATE", record.committer.date_env())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
         cmd
     }
 
@@ -1308,6 +1367,31 @@ impl Store {
         let entry = serde_json::json!({
             "epoch": now_epoch(),
             "event": "withheld-change",
+            "change": id,
+            "source_sha": source_sha,
+            "reason": reason,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Record a rebuilt commit's signature fate in `.oot/export-log.jsonl`:
+    /// either the old sig was dropped or a maintainer key re-signed it.
+    fn log_sig_event(
+        &self,
+        event: &str,
+        id: &str,
+        source_sha: Option<&str>,
+        reason: &str,
+    ) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": event,
             "change": id,
             "source_sha": source_sha,
             "reason": reason,
@@ -1362,6 +1446,23 @@ impl Store {
             .context("failed to probe the store's object database")?
             .status
             .success())
+    }
+
+    /// Whether the original commit object carries a gpgsig header.
+    /// Import never records this, so ask the object database directly.
+    fn commit_had_sig(&self, sha: &str) -> Result<bool> {
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["cat-file", "commit", sha])
+            .output()
+            .context("failed to read commit object")?;
+        if !out.status.success() {
+            return Ok(false);
+        }
+        Ok(String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.starts_with("gpgsig ")))
     }
 
     /// The exported commit sha for a change id, if this store has exported before.
@@ -2164,6 +2265,40 @@ mod tests {
         let missing = store.resolve_change("bbbb").unwrap_err().to_string();
         assert!(missing.contains("no change matching 'bbbb'"), "{missing}");
 
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_commit_tree_cmd_sign_flag() {
+        let tmp = std::env::temp_dir().join(format!("oot-sign-flag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+        let ident = Identity {
+            name: "K".into(),
+            email: "k@oot.dev".into(),
+            time: 0,
+            offset: "+0000".into(),
+        };
+        let record = ChangeRecord {
+            parents: vec![],
+            tree: "abc".into(),
+            author: ident.clone(),
+            committer: ident,
+            message: "m\n".into(),
+            source_sha: None,
+        };
+        let plain = format!("{:?}", store.commit_tree_cmd("abc", &record, None));
+        assert!(
+            !plain.contains("-S"),
+            "unsigned build must not sign: {plain}"
+        );
+        let signed = format!("{:?}", store.commit_tree_cmd("abc", &record, Some("KEYID")));
+        assert!(
+            signed.contains("-SKEYID"),
+            "key must reach commit-tree: {signed}"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 

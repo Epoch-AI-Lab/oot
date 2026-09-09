@@ -87,7 +87,7 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 - [x] `oot adjudicate --change` + `oot docket`: judge stored changes directly, sidecar dockets + audit log
 - [x] `oot gc` / `oot prune`: sweep unreferenced changes, dockets, mappings, and pack/prune the bare Git ODB with grace periods
 - [x] Export to git: byte-identical round-trip (merges, binaries, unicode, non-UTC), sigs survive when not rebuilt
-- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, log to `.oot/export-log.jsonl`
+- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, rebuilt commits ship unsigned unless `resign_key_id` re-signs them, log to `.oot/export-log.jsonl`
 
 Same-named defs in one file (two `render` methods) are tracked separately: we match identical bodies first, then pair the rest, so only the real change is reported.
 

@@ -185,3 +185,164 @@ fn test_filtered_export_preserves_gpg_signatures_on_clean_commits() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+fn forge_signed(
+    repo: &Path,
+    tree: &str,
+    parent: Option<&str>,
+    stamp: &str,
+    message: &str,
+) -> String {
+    let mut raw = format!("tree {tree}\n");
+    if let Some(p) = parent {
+        raw.push_str(&format!("parent {p}\n"));
+    }
+    raw.push_str(&format!(
+        "author Kriday <k@oot.dev> 1700000200 +0530\n\
+         committer Kriday <k@oot.dev> 1700000200 +0530\n\
+         gpgsig -----BEGIN PGP SIGNATURE-----\n \
+         {stamp}\n \
+         =sig\n \
+         -----END PGP SIGNATURE-----\n\
+         \n\
+         {message}\n"
+    ));
+    let raw_path = repo.join("forged.commit");
+    std::fs::write(&raw_path, &raw).unwrap();
+    let forged = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(["hash-object", "-t", "commit", "-w", "forged.commit"])
+        .output()
+        .unwrap();
+    assert!(forged.status.success());
+    std::fs::remove_file(&raw_path).unwrap();
+    String::from_utf8_lossy(&forged.stdout).trim().to_string()
+}
+
+#[test]
+fn test_rebuilt_commit_drops_sig_and_logs_it() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-sigdrop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+
+    // Signed root and second commits on public files.
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    let root_tree = git(&src, &["write-tree"]);
+    let signed_root = forge_signed(&src, &root_tree, None, "iQDummyRoot", "signed root");
+    git(&src, &["update-ref", "refs/heads/main", &signed_root]);
+
+    std::fs::create_dir_all(src.join("src")).unwrap();
+    std::fs::write(src.join("src/lib.rs"), "pub fn add() -> i32 { 1 }\n").unwrap();
+    git(&src, &["add", "."]);
+    let second_tree = git(&src, &["write-tree"]);
+    let signed_second = forge_signed(
+        &src,
+        &second_tree,
+        Some(&signed_root),
+        "iQDummySecond",
+        "signed second",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_second]);
+
+    // Third commit introduces the secret and is withheld whole.
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/.env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    // Fourth commit is signed but lands past the secret, so export rebuilds it.
+    std::fs::write(src.join("src/lib.rs"), "pub fn add() -> i32 { 2 }\n").unwrap();
+    git(&src, &["add", "."]);
+    let fourth_tree = git(&src, &["write-tree"]);
+    let third_sha = git(&src, &["rev-parse", "HEAD"]);
+    let signed_fourth = forge_signed(
+        &src,
+        &fourth_tree,
+        Some(&third_sha),
+        "iQDummyFourth",
+        "signed fourth",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_fourth]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\"secrets/\"]\nprivate_branches = []\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+
+    // The rebuilt head must not carry the old sig: it covers old bytes.
+    let exported_head = git(&out, &["rev-parse", "main"]);
+    assert_ne!(exported_head, signed_fourth);
+    let head_cat = git(&out, &["cat-file", "commit", &exported_head]);
+    assert!(
+        !head_cat.contains("gpgsig"),
+        "rebuilt commit must ship unsigned"
+    );
+
+    // The audit log names the dropped sig and the original sha.
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(log.contains("sig-dropped"), "missing drop event: {log}");
+    assert!(
+        log.contains(&signed_fourth),
+        "drop event must name the original sha: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_resign_with_bad_key_fails_loudly() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-badkey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "root"]);
+
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/.env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    std::fs::write(src.join("README.md"), "# Public Project v2\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "update readme"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\"secrets/\"]\nprivate_branches = []\nresign_key_id = \"no-such-key-oot-test\"\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(!ok, "export with a bad key must fail");
+    assert!(
+        msg.contains("no-such-key-oot-test"),
+        "error must name the bad key: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

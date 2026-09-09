@@ -16,4 +16,8 @@ private_paths = [".env", "secrets/", ".pem"]
 # No embargo schedule for this repo yet; add `embargo_until = "YYYY-MM-DD"`
 # to hold all changes until that date.
 
+# Rebuilt commits ship unsigned; set `resign_key_id` to a maintainer GPG
+# key id to re-sign them on filtered export. Clean commits keep their own sigs.
+# resign_key_id = "maintainer@example.com"
+
 private_branches = []

@@ -24,6 +24,11 @@ pub struct VisibilityPolicy {
     /// Branch names that must stay private. Referencing these raises a visibility dispute.
     #[serde(default)]
     pub private_branches: Vec<String>,
+    /// GPG key id used to re-sign rebuilt commits on filtered export.
+    /// Empty means rebuilt commits ship unsigned. Only matters when
+    /// filtering rebuilds history, clean commits keep their own sigs.
+    #[serde(default)]
+    pub resign_key_id: Option<String>,
 }
 
 fn default_private_paths() -> Vec<String> {
@@ -36,6 +41,7 @@ impl Default for VisibilityPolicy {
             private_paths: default_private_paths(),
             embargo_until: None,
             private_branches: vec![],
+            resign_key_id: None,
         }
     }
 }
@@ -294,6 +300,7 @@ mod tests {
             private_paths: vec!["secrets/".into(), ".env".into()],
             embargo_until: Some("2026-10-01".into()),
             private_branches: vec!["internal-audit".into()],
+            resign_key_id: None,
         };
 
         let mut head = Snapshot::default();

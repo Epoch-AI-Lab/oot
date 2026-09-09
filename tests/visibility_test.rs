@@ -33,6 +33,7 @@ fn test_visibility_policy_private_paths_detection() {
         private_paths: vec!["secrets/".into(), ".env".into(), "credentials.json".into()],
         embargo_until: None,
         private_branches: vec![],
+        resign_key_id: None,
     };
 
     let mut head = Snapshot::default();
@@ -75,6 +76,7 @@ fn test_visibility_policy_private_branch_matching() {
         private_paths: vec![],
         embargo_until: None,
         private_branches: vec!["confidential-fix".into(), "security-audit".into()],
+        resign_key_id: None,
     };
 
     // Change matching private branch in change name
@@ -149,6 +151,7 @@ fn test_visibility_policy_slash_stripping_and_matching() {
         private_paths: vec!["/internal/keys/".into(), "/cert.pem".into()],
         embargo_until: None,
         private_branches: vec![],
+        resign_key_id: None,
     };
 
     let mut head = Snapshot::default();
@@ -177,6 +180,7 @@ fn test_visibility_policy_detects_deleted_private_paths() {
         private_paths: vec!["secrets/".into(), ".env".into()],
         embargo_until: None,
         private_branches: vec![],
+        resign_key_id: None,
     };
 
     let mut base = Snapshot::default();
@@ -213,6 +217,7 @@ fn test_visibility_policy_dotfile_root_and_nested_exact_matching() {
         private_paths: vec![".env".into(), "secrets/".into()],
         embargo_until: None,
         private_branches: vec!["private/*".into()],
+        resign_key_id: None,
     };
 
     // Root-level and nested .env variants MUST be private
@@ -235,6 +240,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("2099-01-01".into()),
         private_branches: vec![],
+        resign_key_id: None,
     };
     assert!(
         policy_iso.is_under_embargo(),
@@ -245,6 +251,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("01-01-2099".into()),
         private_branches: vec![],
+        resign_key_id: None,
     };
     assert!(
         policy_dd_mm_yyyy.is_under_embargo(),
@@ -255,6 +262,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("2099/12/31".into()),
         private_branches: vec![],
+        resign_key_id: None,
     };
     assert!(
         policy_slash.is_under_embargo(),
@@ -265,6 +273,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("1999-01-01".into()),
         private_branches: vec![],
+        resign_key_id: None,
     };
     assert!(
         !policy_past.is_under_embargo(),
@@ -296,6 +305,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("2096-02-29".into()),
         private_branches: vec![],
+        resign_key_id: None,
     }
     .is_under_embargo());
     // Nonexistent Feb 29 cannot be constructed, so a hand-built policy
@@ -304,6 +314,7 @@ fn test_embargo_date_formats_and_validation() {
         private_paths: vec![],
         embargo_until: Some("2099-02-29".into()),
         private_branches: vec![],
+        resign_key_id: None,
     }
     .is_under_embargo());
 }
