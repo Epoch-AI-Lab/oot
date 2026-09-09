@@ -305,8 +305,8 @@ fn test_rebuilt_commit_drops_sig_and_logs_it() {
 }
 
 #[test]
-fn test_resign_with_bad_key_fails_loudly() {
-    let tmp = std::env::temp_dir().join(format!("oot-gpg-badkey-{}", std::process::id()));
+fn test_resign_key_leaves_unsigned_rebuilds_alone() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-nosign-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     let src = tmp.join("src");
     let proj = tmp.join("proj");
@@ -324,9 +324,78 @@ fn test_resign_with_bad_key_fails_loudly() {
     git(&src, &["add", "."]);
     git(&src, &["commit", "-m", "add secret"]);
 
+    // Unsigned commit past the secret: rebuild must stay unsigned even
+    // with a key set. Keys replace old sigs, they never add new ones.
     std::fs::write(src.join("README.md"), "# Public Project v2\n").unwrap();
     git(&src, &["add", "."]);
     git(&src, &["commit", "-m", "update readme"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\"secrets/\"]\nprivate_branches = []\nresign_key_id = \"no-such-key-oot-test\"\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "unsigned rebuilds must not touch the key: {msg}");
+
+    let exported_head = git(&out, &["rev-parse", "main"]);
+    let head_cat = git(&out, &["cat-file", "commit", &exported_head]);
+    assert!(
+        !head_cat.contains("gpgsig"),
+        "unsigned original must stay unsigned"
+    );
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(
+        !log.contains("resigned"),
+        "nothing was signed, nothing to log: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_resign_with_bad_key_fails_loudly() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-badkey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+
+    // Root is signed so the rebuild path actually tries the key.
+    // A bad key must fail on the signed rebuild, not silently pass.
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    let root_tree = git(&src, &["write-tree"]);
+    let signed_root = forge_signed(&src, &root_tree, None, "iQDummyRoot", "signed root");
+    git(&src, &["update-ref", "refs/heads/main", &signed_root]);
+
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/.env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    // Third commit is signed but lands past the secret, so export rebuilds
+    // it and must attempt the re-sign.
+    std::fs::write(src.join("README.md"), "# Public Project v2\n").unwrap();
+    git(&src, &["add", "."]);
+    let third_tree = git(&src, &["write-tree"]);
+    let third_sha = git(&src, &["rev-parse", "HEAD"]);
+    let signed_third = forge_signed(
+        &src,
+        &third_tree,
+        Some(&third_sha),
+        "iQDummyThird",
+        "signed third",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_third]);
 
     std::fs::write(
         proj.join("visibility.toml"),

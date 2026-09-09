@@ -879,6 +879,7 @@ impl Store {
         let sign_key: Option<String> = if filtering {
             policy
                 .and_then(|p| p.resign_key_id.clone())
+                .map(|k| k.trim().to_string())
                 .filter(|k| !k.is_empty())
         } else {
             None
@@ -1026,13 +1027,27 @@ impl Store {
 
             // Reconstruction path: rebuild commit with remapped parents.
             // A rebuild drops the old sig since it covered the old bytes.
-            let mut cmd = self.commit_tree_cmd(&stripped_tree, &record, sign_key.as_deref());
+            // Only re-sign when the original carried a sig: a key set means
+            // replace old sigs, never add new ones to unsigned commits.
+            let had_sig = if filtering {
+                match &record.source_sha {
+                    Some(orig) => self.commit_had_sig(orig)?,
+                    None => false,
+                }
+            } else {
+                false
+            };
+            let active_key: Option<&str> = match (&sign_key, had_sig) {
+                (Some(k), true) => Some(k.as_str()),
+                _ => None,
+            };
+            let mut cmd = self.commit_tree_cmd(&stripped_tree, &record, active_key);
             for p in &parent_shas {
                 cmd.args(["-p", p]);
             }
             let sha =
                 self.finish_commit(cmd, &record.message, &id)
-                    .map_err(|e| match &sign_key {
+                    .map_err(|e| match active_key {
                         Some(k) => {
                             anyhow::anyhow!("re-sign with key '{k}' failed for change {id}: {e:#}")
                         }
@@ -1040,11 +1055,7 @@ impl Store {
                     })?;
             if filtering {
                 tree_of.insert(sha.clone(), stripped_tree);
-                let had_sig = match &record.source_sha {
-                    Some(orig) => self.commit_had_sig(orig)?,
-                    None => false,
-                };
-                match (&sign_key, had_sig) {
+                match (active_key, had_sig) {
                     (Some(k), true) => {
                         resigned += 1;
                         self.log_sig_event(
@@ -1449,7 +1460,9 @@ impl Store {
     }
 
     /// Whether the original commit object carries a gpgsig header.
-    /// Import never records this, so ask the object database directly.
+    /// Covers both `gpgsig` and `gpgsig-sha256`. Import never records this,
+    /// so ask the object database directly. Fails loudly when the object
+    /// cannot be read: silent false means a dropped sig goes unlogged.
     fn commit_had_sig(&self, sha: &str) -> Result<bool> {
         let out = Command::new("git")
             .args(["--git-dir"])
@@ -1458,11 +1471,14 @@ impl Store {
             .output()
             .context("failed to read commit object")?;
         if !out.status.success() {
-            return Ok(false);
+            anyhow::bail!(
+                "failed to read commit object {sha}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         Ok(String::from_utf8_lossy(&out.stdout)
             .lines()
-            .any(|l| l.starts_with("gpgsig ")))
+            .any(|l| l.starts_with("gpgsig ") || l.starts_with("gpgsig-sha256 ")))
     }
 
     /// The exported commit sha for a change id, if this store has exported before.
