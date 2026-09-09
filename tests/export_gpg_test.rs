@@ -47,6 +47,79 @@ fn oot(args: &[&str], cwd: &Path) -> (bool, String) {
     )
 }
 
+fn oot_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).current_dir(cwd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let o = cmd.output().expect("oot binary should run");
+    (
+        o.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+    )
+}
+
+/// Make a throwaway GPG home with one signing key. Returns the home dir
+/// and the key fingerprint. Fast (about 0.1s), no passphrase.
+fn make_test_key() -> (std::path::PathBuf, String) {
+    let home = std::env::temp_dir().join(format!("oot-gpg-home-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "oot-test@example.com",
+            "ed25519",
+            "sign",
+            "0",
+        ])
+        .output()
+        .expect("gpg should run");
+    assert!(
+        out.status.success(),
+        "gpg keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args(["--list-secret-keys", "--with-colons"])
+        .output()
+        .expect("gpg should run");
+    let text = String::from_utf8_lossy(&list.stdout);
+    let fpr = text
+        .lines()
+        .skip_while(|l| !l.starts_with("sec"))
+        .skip(1)
+        .find_map(|l| {
+            let mut parts = l.split(':');
+            if l.starts_with("fpr") {
+                parts.nth(9)
+            } else {
+                None
+            }
+        })
+        .expect("keygen must yield a fingerprint")
+        .to_string();
+    assert!(!fpr.is_empty(), "empty fingerprint");
+    (home, fpr)
+}
+
 #[test]
 fn test_filtered_export_preserves_gpg_signatures_on_clean_commits() {
     let tmp = std::env::temp_dir().join(format!("oot-gpg-filter-{}", std::process::id()));
@@ -485,4 +558,102 @@ fn test_resign_with_bad_key_fails_loudly() {
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_resign_with_real_key_signs_rebuilt_commit() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-resign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    // Throwaway key, about 0.1s to make, no passphrase.
+    let (gpg_home, key_id) = make_test_key();
+    let gpg_home_str = gpg_home.to_str().unwrap().to_string();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+
+    // Signed root stays on the clean prefix and keeps its own sig.
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    let root_tree = git(&src, &["write-tree"]);
+    let signed_root = forge_signed(&src, &root_tree, None, "iQDummyRoot", "signed root");
+    git(&src, &["update-ref", "refs/heads/main", &signed_root]);
+
+    std::fs::create_dir_all(src.join("secrets")).unwrap();
+    std::fs::write(src.join("secrets/.env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add secret"]);
+
+    // Signed commit past the secret: export must rebuild and re-sign it.
+    std::fs::write(src.join("README.md"), "# Public Project v2\n").unwrap();
+    git(&src, &["add", "."]);
+    let third_tree = git(&src, &["write-tree"]);
+    let third_sha = git(&src, &["rev-parse", "HEAD"]);
+    let signed_third = forge_signed(
+        &src,
+        &third_tree,
+        Some(&third_sha),
+        "iQDummyThird",
+        "signed third",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_third]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\"secrets/\"]\nprivate_branches = []\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    // commit-tree inherits GNUPGHOME so -S finds the throwaway key.
+    // No passphrase needed: loopback with an empty password.
+    let export_args = ["export", "--out", out.to_str().unwrap()];
+    let (ok, msg) = oot_with_env(
+        &export_args,
+        &proj,
+        &[
+            ("GNUPGHOME", gpg_home_str.as_str()),
+            ("GPG_TTY", ""),
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+        ],
+    );
+    assert!(ok, "export with a real key must succeed: {msg}");
+
+    // Rebuilt head carries a fresh sig, not the forged old one.
+    let exported_head = git(&out, &["rev-parse", "main"]);
+    assert_ne!(exported_head, signed_third);
+    let head_cat = git(&out, &["cat-file", "commit", &exported_head]);
+    assert!(
+        head_cat.contains("gpgsig"),
+        "rebuilt commit must carry the new sig"
+    );
+    assert!(
+        !head_cat.contains("iQDummyThird"),
+        "old forged sig must be gone"
+    );
+
+    // Log ties the re-sign to the original sha in one entry.
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    let mut found = false;
+    for line in log.lines() {
+        if line.contains("\"event\":\"resigned\"")
+            && line.contains(&signed_third)
+            && line.contains(&key_id)
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "missing resigned event for {signed_third}: {log}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(&gpg_home);
 }
