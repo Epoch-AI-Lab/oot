@@ -203,7 +203,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
                 None => VisibilityPolicy::default(),
             };
-            let eng = Engine::new()?;
+            let eng = Engine::new()?.with_rename_min_score(meaning_policy.rename_min_score);
 
             // Store-backed adjudication: `--change <id|prefix>` engages only
             // when an Oot store opens here and no other adjudication mode was
