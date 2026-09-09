@@ -1093,6 +1093,123 @@ impl Store {
         Ok(exported)
     }
 
+    /// Build a maintainer-only embargo bundle: full history with nothing
+    /// withheld, plus dockets, export log, and a MANIFEST naming who gets it.
+    /// Oot writes the plain bundle. Sealing and sending belong to git-crypt
+    /// or a key service, never to Oot.
+    pub fn embargo_bundle(
+        &self,
+        out_dir: &Path,
+        policy: &VisibilityPolicy,
+    ) -> Result<Vec<(String, String)>> {
+        if !policy.is_under_embargo() {
+            bail!("no active embargo: bundle needs embargo_until in the future");
+        }
+        let recipients: Vec<String> = policy
+            .embargo_recipients
+            .iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if recipients.is_empty() {
+            bail!("embargo bundle refused: embargo_recipients is empty");
+        }
+        if out_dir.exists() {
+            bail!("bundle directory already exists: {}", out_dir.display());
+        }
+        std::fs::create_dir_all(out_dir)?;
+        // Unfiltered replay: full history, private changes included.
+        let repo_dir = out_dir.join("repo");
+        std::fs::create_dir_all(&repo_dir)?;
+        run(Command::new("git").args(["init", "--quiet"]).arg(&repo_dir))?;
+        let exported = self.replay(&repo_dir, None)?;
+        for (branch, head_id) in self.refs()? {
+            match self.branch_head_sha(&head_id)? {
+                Some(sha) => self.point_ref(&repo_dir, &branch, &sha)?,
+                None => self.log_branch_omitted(&branch, &head_id)?,
+            }
+        }
+        for (tag, head_id) in self.tags()? {
+            if !Self::valid_tag_ref(&tag) {
+                self.log_tag_omitted(&tag, &head_id)?;
+                continue;
+            }
+            // One bad tag must not kill a maintainer bundle: same rule as
+            // public export, log it and keep going.
+            match self.branch_head_sha(&head_id) {
+                Ok(Some(sha)) => match self.point_tag(&repo_dir, &tag, &sha) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        self.log_tag_omitted(&tag, &head_id)?;
+                        eprintln!("warning: tag {tag} omitted ({e:#})");
+                    }
+                },
+                Ok(None) => self.log_tag_omitted(&tag, &head_id)?,
+                Err(e) => {
+                    self.log_tag_omitted(&tag, &head_id)?;
+                    eprintln!("warning: tag {tag} omitted ({e:#})");
+                }
+            }
+        }
+        if let Some(first) = self.refs()?.first() {
+            let sym = format!("refs/heads/{}", first.0);
+            run(Command::new("git")
+                .args(["symbolic-ref", "HEAD", &sym])
+                .current_dir(&repo_dir))?;
+            let _ = Command::new("git")
+                .args(["checkout", "-f", "HEAD"])
+                .current_dir(&repo_dir)
+                .output();
+        }
+        // Sidecars travel with the bundle so maintainers can audit it.
+        // Copy after logging: the bundle copy must hold this run's events.
+        // Commit text can name private paths while blobs stay clean.
+        // Taint only watches blobs, so warn and log instead of scrubbing.
+        // Scrubbing would rewrite every hash and kill sigs.
+        for (id, _) in &exported {
+            let record = self.get_change(id)?;
+            if message_names_private_path(&record.message, policy) {
+                self.log_message_leak_warn(id, record.source_sha.as_deref())?;
+                eprintln!("warning: change {id} message names a private path");
+            }
+        }
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "embargo-bundle",
+            "recipients": recipients,
+            "changes": exported.len(),
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        let dockets_src = self.root.join(crate::court::DOCKETS_DIR);
+        if dockets_src.exists() {
+            copy_dir(&dockets_src, &out_dir.join(crate::court::DOCKETS_DIR))?;
+        }
+        for log in [EXPORT_LOG, crate::court::ADJUDICATIONS_LOG] {
+            let src = self.root.join(log);
+            if src.exists() {
+                std::fs::copy(&src, out_dir.join(log))?;
+            }
+        }
+        let manifest = serde_json::json!({
+            "embargo_until": policy.embargo_until,
+            "recipients": recipients,
+            "changes": exported
+                .iter()
+                .map(|(id, sha)| serde_json::json!({"change": id, "sha": sha}))
+                .collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            out_dir.join("MANIFEST.json"),
+            serde_json::to_string_pretty(&manifest)?,
+        )?;
+        Ok(exported)
+    }
+
     /// Wipe cached export mappings when the visibility policy changed since
     /// the last export. The audit log survives: it is append-only history,
     /// not cache.
@@ -1411,6 +1528,23 @@ impl Store {
             "change": id,
             "source_sha": source_sha,
             "reason": reason,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    fn log_message_leak_warn(&self, id: &str, source_sha: Option<&str>) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "message-leak-warn",
+            "change": id,
+            "source_sha": source_sha,
+            "reason": "commit message names a private path, blobs are clean",
         });
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -2081,6 +2215,29 @@ fn run(cmd: &mut Command) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        if entry.path().is_dir() {
+            copy_dir(&entry.path(), &to)?;
+        } else {
+            std::fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+fn message_names_private_path(message: &str, policy: &VisibilityPolicy) -> bool {
+    let lower = message.to_lowercase();
+    policy
+        .private_paths
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .any(|p| lower.contains(&p.trim().to_lowercase()))
 }
 
 #[cfg(test)]

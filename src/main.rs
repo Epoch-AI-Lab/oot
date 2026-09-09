@@ -136,6 +136,22 @@ enum Commands {
         #[arg(long)]
         change: Option<String>,
     },
+    /// Show embargo state: held until date plus recipient count.
+    EmbargoStatus {
+        /// Path to a visibility-policy TOML. Defaults to `./visibility.toml`.
+        #[arg(long)]
+        visibility: Option<String>,
+    },
+    /// Write a maintainer-only bundle: full repo plus dockets plus logs plus
+    /// MANIFEST. Plain output, Oot never sends. Seal it before sharing.
+    EmbargoBundle {
+        /// Directory to create the bundle in. Must not exist yet.
+        #[arg(long)]
+        out: String,
+        /// Path to a visibility-policy TOML. Defaults to `./visibility.toml`.
+        #[arg(long)]
+        visibility: Option<String>,
+    },
     /// Materialize a stored change's tree into the working copy.
     /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
     Update {
@@ -167,6 +183,20 @@ enum Commands {
         #[arg(long)]
         expire: Option<String>,
     },
+}
+
+fn load_policy_arg(visibility: Option<String>) -> anyhow::Result<Option<VisibilityPolicy>> {
+    match visibility {
+        Some(p) => Ok(Some(VisibilityPolicy::load(std::path::Path::new(&p))?)),
+        None => {
+            let candidate = std::path::Path::new("visibility.toml");
+            if candidate.exists() {
+                Ok(Some(VisibilityPolicy::load(candidate)?))
+            } else {
+                Ok(None)
+            }
+        }
+    }
 }
 
 fn main() -> anyhow::Result<std::process::ExitCode> {
@@ -721,6 +751,44 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let change_id = store.resolve_change(&target_id)?;
             let persisted = court::load_docket(&store, &change_id)?;
             print!("{}", persisted.docket.render());
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::EmbargoStatus { visibility } => {
+            let policy = load_policy_arg(visibility)?;
+            match policy.as_ref().and_then(|p| p.embargo_until.clone()) {
+                Some(date) => {
+                    let held = policy.as_ref().is_some_and(|p| p.is_under_embargo());
+                    let count = policy
+                        .as_ref()
+                        .map(|p| {
+                            p.embargo_recipients
+                                .iter()
+                                .filter(|r| !r.trim().is_empty())
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    println!(
+                        "embargo: {} until {date} ({count} recipients)",
+                        if held { "held" } else { "lifted" }
+                    );
+                }
+                None => println!("embargo: none"),
+            }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::EmbargoBundle { out, visibility } => {
+            let policy = load_policy_arg(visibility)?
+                .ok_or_else(|| anyhow::anyhow!("embargo bundle needs ./visibility.toml"))?;
+            let store = Store::open(".")?;
+            if store.refs()?.is_empty() {
+                anyhow::bail!("store has no imported history (run `oot import` first)");
+            }
+            let out_path = std::path::PathBuf::from(&out);
+            let exported = store.embargo_bundle(&out_path, &policy)?;
+            println!(
+                "embargo bundle: {} changes to {out} (plain output, seal before sharing)",
+                exported.len()
+            );
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Update {

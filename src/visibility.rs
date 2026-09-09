@@ -29,6 +29,10 @@ pub struct VisibilityPolicy {
     /// filtering rebuilds history, clean commits keep their own sigs.
     #[serde(default)]
     pub resign_key_id: Option<String>,
+    /// Maintainer key ids allowed to receive an embargo bundle.
+    /// Empty means bundle refuses. Only names who gets it, Oot never sends.
+    #[serde(default)]
+    pub embargo_recipients: Vec<String>,
 }
 
 fn default_private_paths() -> Vec<String> {
@@ -42,6 +46,7 @@ impl Default for VisibilityPolicy {
             embargo_until: None,
             private_branches: vec![],
             resign_key_id: None,
+            embargo_recipients: vec![],
         }
     }
 }
@@ -301,6 +306,7 @@ mod tests {
             embargo_until: Some("2026-10-01".into()),
             private_branches: vec!["internal-audit".into()],
             resign_key_id: None,
+            embargo_recipients: vec!["alice@example.com".into()],
         };
 
         let mut head = Snapshot::default();
