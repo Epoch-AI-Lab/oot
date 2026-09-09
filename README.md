@@ -91,7 +91,7 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 
 Same-named defs in one file (two `render` methods) are tracked separately: we match identical bodies first, then pair the rest, so only the real change is reported.
 
-Cuts for now: nested ignore negation in pure-Oot projects, tags, sigs downstream of rebuilt history, and a few more.
+Cuts for now: annotated tag objects and messages (lightweight tags ship), sigs downstream of rebuilt history, and dir re-inclusion differs from git (we honor `!build/keep/x` under excluded `build/`, git does not).
 
 ## License
 
