@@ -851,7 +851,8 @@ impl Store {
     }
 
     /// Whether a tag object carries a signature. `git tag -s` puts the
-    /// signature in the tag message body; check for the known armor headers.
+    /// signature in the tag message body; check for the known armor headers
+    /// there, not in the headers, so tagger text quoting armor is not a sig.
     fn tag_object_signed(&self, obj: &str) -> Result<bool> {
         let out = Command::new("git")
             .args(["--git-dir"])
@@ -863,9 +864,10 @@ impl Store {
             return Ok(false);
         }
         let body = String::from_utf8_lossy(&out.stdout);
-        Ok(body.contains("-----BEGIN PGP SIGNATURE")
-            || body.contains("-----BEGIN SSH SIGNATURE")
-            || body.contains("-----BEGIN SIGNED MESSAGE"))
+        let message = body.split_once("\n\n").map(|(_, m)| m).unwrap_or(&body);
+        Ok(message.contains("-----BEGIN PGP SIGNATURE")
+            || message.contains("-----BEGIN SSH SIGNATURE")
+            || message.contains("-----BEGIN SIGNED MESSAGE"))
     }
 
     /// Point an exported tag ref at the original tag object itself, so the
@@ -1289,8 +1291,10 @@ impl Store {
             bail!("bundle artifact already exists: {}", out.display());
         }
         let signer = signer_override
-            .map(str::to_string)
-            .or_else(|| policy.resign_key_id.clone())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| policy.resign_key_id.as_deref().map(str::trim).map(str::to_string))
+            .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "embargo seal needs a signer: set resign_key_id in visibility.toml or pass --signer"
@@ -1308,24 +1312,24 @@ impl Store {
         // Resolve every recipient against the local keyring before any
         // plaintext exists. Oot never fetches keys; the operator imports
         // them out of band.
-        let mut unresolved = Vec::new();
+        let mut refused = Vec::new();
         for r in &recipients {
             match gpg_key_state(r)? {
                 GpgKeyState::Found => {}
-                GpgKeyState::Revoked => {
-                    eprintln!("warning: recipient {r} has a revoked key in the keyring")
+                GpgKeyState::Unusable(why) => {
+                    refused.push(format!("{r} ({why} key)"));
                 }
-                GpgKeyState::Missing => unresolved.push(r.clone()),
+                GpgKeyState::Missing => refused.push(format!("{r} (no key in keyring)")),
             }
         }
-        if !unresolved.is_empty() {
+        if !refused.is_empty() {
             self.log_seal_event(
                 "seal-refused",
-                serde_json::json!({ "unresolved": unresolved }),
+                serde_json::json!({ "unresolved": refused }),
             )?;
             bail!(
-                "embargo seal refused: no key for {} in keyring (import with `gpg --import`)",
-                unresolved.join(", ")
+                "embargo seal refused: unusable key for {} (import with `gpg --import`, refresh expired keys)",
+                refused.join(", ")
             );
         }
         if let Some(parent) = out.parent() {
@@ -1337,11 +1341,13 @@ impl Store {
         let mut tar_name = staging.as_os_str().to_os_string();
         tar_name.push(".tar");
         let tar_path = std::path::PathBuf::from(tar_name);
-        let result = self.build_and_seal(&staging, &tar_path, out, policy, &signer, &recipients);
         // The staging dir holds the full unfiltered history and the tar is
-        // plaintext too: both go away no matter how the seal ended.
-        let _ = std::fs::remove_dir_all(&staging);
-        let _ = std::fs::remove_file(&tar_path);
+        // plaintext too: the guard removes both on every exit path — return,
+        // error, or panic — so plaintext never outlives the command.
+        let guard = PlaintextGuard {
+            paths: vec![staging.clone(), tar_path.clone()],
+        };
+        let result = self.build_and_seal(&staging, &tar_path, out, policy, &signer, &recipients);
         let exported = result.inspect_err(|e| {
             let _ = self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
         })?;
@@ -1354,6 +1360,7 @@ impl Store {
                 "artifact": out.display().to_string(),
             }),
         )?;
+        drop(guard);
         Ok(exported)
     }
 
@@ -1373,8 +1380,22 @@ impl Store {
             .arg("-C")
             .arg(staging.parent().unwrap_or_else(|| Path::new(".")))
             .arg(staging.file_name().unwrap_or_default()))?;
+        // The tar is plaintext: match the staging dir's 0700 stance on the
+        // file itself so the window before encryption is local-only.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(tar_path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let mut gpg = Command::new("gpg");
-        gpg.args(["--batch", "--yes", "--encrypt", "--sign"]);
+        gpg.args([
+            "--batch",
+            "--yes",
+            "--trust-model",
+            "always",
+            "--encrypt",
+            "--sign",
+        ]);
         gpg.args(["--local-user", signer]);
         for r in recipients {
             gpg.args(["--recipient", r]);
@@ -1817,9 +1838,19 @@ impl Store {
                         source => {
                             // Rebuilt or lightweight target: a lightweight
                             // ref is all that survives, and a signature on
-                            // the original object dies with it. Say so.
-                            if let Some((obj, _)) = source {
-                                if self.tag_object_signed(&obj)? {
+                            // the original object dies with it. Say so —
+                            // but only when the fetched object belongs to
+                            // this change; a peel elsewhere means the tag
+                            // moved upstream and the ref is stale, not
+                            // that a signature was lost.
+                            let own_target = self
+                                .get_change(&head_id)
+                                .ok()
+                                .and_then(|r| r.source_sha.clone());
+                            if let Some((obj, peel)) = source {
+                                if own_target.as_deref() == Some(peel.as_str())
+                                    && self.tag_object_signed(&obj)?
+                                {
                                     self.log_tag_sig_dropped(&tag, &head_id)?;
                                 }
                             }
@@ -2514,7 +2545,8 @@ fn run(cmd: &mut Command) -> Result<()> {
         .with_context(|| format!("failed to run {}", cmd.get_program().to_string_lossy()))?;
     if !output.status.success() {
         bail!(
-            "git failed: {}",
+            "{} failed: {}",
+            cmd.get_program().to_string_lossy(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
@@ -2536,10 +2568,14 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 }
 
 /// Whether `entry` (email or fingerprint) resolves to a key in the local
-/// gpg keyring. Oot only resolves; it never fetches keys.
+/// gpg keyring. Oot only resolves; it never fetches keys. Unusable keys
+/// (revoked, expired, disabled) refuse here so the seal never gets as far
+/// as building plaintext; unknown trust is fine because the encrypt step
+/// runs with `--trust-model always` — the recipients named in the policy
+/// are the authorization.
 enum GpgKeyState {
     Found,
-    Revoked,
+    Unusable(&'static str),
     Missing,
 }
 
@@ -2556,7 +2592,9 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
         let fields: Vec<&str> = line.split(':').collect();
         if fields.first() == Some(&"pub") && fields.len() > 1 {
             state = match fields[1] {
-                "r" => GpgKeyState::Revoked,
+                "r" => GpgKeyState::Unusable("revoked"),
+                "e" => GpgKeyState::Unusable("expired"),
+                "d" => GpgKeyState::Unusable("disabled"),
                 _ => GpgKeyState::Found,
             };
             if matches!(state, GpgKeyState::Found) {
@@ -2567,10 +2605,37 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
     Ok(state)
 }
 
+/// Removes plaintext artifacts (the staging dir and the intermediate tar)
+/// on every exit path — return, error, or panic — so the unfiltered history
+/// never outlives the command.
+struct PlaintextGuard {
+    paths: Vec<std::path::PathBuf>,
+}
+
+impl Drop for PlaintextGuard {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let result = if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            };
+            if let Err(e) = result {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    eprintln!(
+                        "warning: could not remove plaintext {}: {e}",
+                        path.display()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// The staging dir for a sealed artifact: the artifact path with its
 /// extensions stripped, so extracting the tarball lands in a directory
 /// named like the bundle. `embargo-2099.tar.gpg` -> `embargo-2099/`.
-fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
+pub fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
     let name = out
         .file_stem()
         .and_then(|s| s.to_str())

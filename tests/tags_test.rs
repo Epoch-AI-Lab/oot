@@ -70,9 +70,14 @@ fn git_env(repo: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> String {
 }
 
 /// Make a throwaway GPG home with one signing key. Fast (about 0.1s),
-/// no passphrase.
+/// no passphrase. Unique per call: tests run concurrently in one process.
 fn make_test_key() -> (std::path::PathBuf, String) {
-    let home = std::env::temp_dir().join(format!("oot-tags-gpg-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static KEY_SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = KEY_SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir()
+        .join(format!("oot-tags-gpg-{}", std::process::id()))
+        .join(format!("key-{seq}"));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
     #[cfg(unix)]

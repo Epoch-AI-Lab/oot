@@ -756,6 +756,9 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             let out_path = std::path::PathBuf::from(&out);
             if plain {
+                if signer.is_some() {
+                    anyhow::bail!("--signer only applies to a sealed bundle; --plain writes plaintext");
+                }
                 let exported = store.embargo_bundle(&out_path, &policy)?;
                 println!(
                     "embargo bundle: {} changes to {out} (plain output, seal before sharing)",
@@ -765,10 +768,15 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 let exported =
                     store.embargo_bundle_sealed(&out_path, &policy, signer.as_deref())?;
                 println!("sealed embargo bundle: {} changes to {out}", exported.len());
+                let stem = oot::store::sealed_staging_dir(&out_path)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
                 println!("verify + open (gpg reports the signer):");
                 println!("  gpg --decrypt {out} > bundle.tar");
                 println!("  tar -xf bundle.tar");
-                println!("  cd bundle/repo && git log --oneline");
+                println!("  cd {stem}/repo && git log --oneline");
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
