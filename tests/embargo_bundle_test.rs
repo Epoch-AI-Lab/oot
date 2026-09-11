@@ -89,7 +89,7 @@ fn test_embargo_bundle_holds_what_public_drops() {
     assert!(msg.contains("embargo"), "error must mention embargo: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
         &proj,
     );
     assert!(ok, "bundle failed: {msg}");
@@ -175,7 +175,7 @@ fn test_embargo_bundle_refuses_empty_recipients() {
     assert!(ok, "import failed: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
         &proj,
     );
     assert!(!ok, "empty recipients must fail");
@@ -218,7 +218,7 @@ fn test_embargo_bundle_refuses_without_active_embargo() {
     assert!(msg.contains("lifted"), "status must say lifted: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
         &proj,
     );
     assert!(!ok, "bundle without active embargo must fail");
@@ -235,7 +235,7 @@ fn test_embargo_bundle_refuses_without_active_embargo() {
     )
     .unwrap();
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
         &proj,
     );
     assert!(!ok, "bundle into existing dir must fail");
@@ -278,7 +278,7 @@ fn test_embargo_bundle_survives_invalid_tag() {
     std::fs::write(proj.join(".oot/tags/bad..tag"), head_id.trim()).unwrap();
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
         &proj,
     );
     assert!(ok, "bundle must survive a bad tag: {msg}");
@@ -296,6 +296,287 @@ fn test_embargo_bundle_survives_invalid_tag() {
         bundle.join("repo/README.md").exists(),
         "bundle working tree must be checked out"
     );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Like `oot`, but with extra env (used to seal with a throwaway key).
+fn oot_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).current_dir(cwd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let o = cmd.output().expect("oot binary should run");
+    (
+        o.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+    )
+}
+
+/// Make a throwaway GPG home with one signing key. Fast (about 0.1s),
+/// no passphrase.
+fn make_test_key() -> (std::path::PathBuf, String) {
+    let home = std::env::temp_dir().join(format!("oot-embargo-gpg-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "oot-test@example.com",
+            "ed25519",
+            "sign",
+            "0",
+        ])
+        .output()
+        .expect("gpg should run");
+    assert!(
+        out.status.success(),
+        "gpg keygen failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let list = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args(["--list-secret-keys", "--with-colons"])
+        .output()
+        .expect("gpg should run");
+    let text = String::from_utf8_lossy(&list.stdout);
+    let fpr = text
+        .lines()
+        .find(|l| l.starts_with("fpr:"))
+        .and_then(|l| l.split(':').nth(9))
+        .expect("keygen must yield a fingerprint")
+        .to_string();
+    assert!(!fpr.is_empty(), "empty fingerprint");
+    // The primary is sign-only; sealing needs an encryption subkey.
+    let add = Command::new("gpg")
+        .env("GNUPGHOME", &home)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-add-key",
+            &fpr,
+            "cv25519",
+            "encrypt",
+            "0",
+        ])
+        .output()
+        .expect("gpg should run");
+    assert!(
+        add.status.success(),
+        "gpg add-key failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    (home, fpr)
+}
+
+fn gpg_run(gpg_home: &Path, args: &[&str]) -> (bool, String) {
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", gpg_home)
+        .args(args)
+        .output()
+        .expect("gpg should run");
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// The default bundle is sealed: one gpg artifact, sign+encrypted to the
+/// recipients, with no plaintext left behind. Decrypting yields the same
+/// tree the plain bundle used to write.
+#[test]
+fn test_embargo_bundle_seals_to_gpg_artifact() {
+    let tmp = std::env::temp_dir().join(format!("oot-embargo-seal-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let (gpg_home, key_id) = make_test_key();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    std::fs::write(src.join(".env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "rotate .env secret"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{key_id}\"]\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "sealed bundle failed: {msg}");
+
+    // The artifact exists; no plaintext staging dir or tar survived.
+    assert!(artifact.exists(), "sealed artifact must exist");
+    assert!(!tmp.join("bundle").exists(), "staging dir must be gone");
+    assert!(!tmp.join("bundle.tar").exists(), "plaintext tar must be gone");
+
+    // Decrypt (verifies the signature too) and inspect the tarball.
+    let plain_tar = tmp.join("plain.tar");
+    let (ok, msg) = gpg_run(
+        &gpg_home,
+        &[
+            "--batch",
+            "--yes",
+            "--decrypt",
+            "--output",
+            plain_tar.to_str().unwrap(),
+            artifact.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "decrypt must succeed with a recipient key: {msg}");
+    let listing = Command::new("tar")
+        .args(["-tf"])
+        .arg(&plain_tar)
+        .output()
+        .expect("tar should run");
+    assert!(
+        listing.status.success(),
+        "tar listing failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listing = String::from_utf8_lossy(&listing.stdout).to_string();
+    assert!(listing.contains("MANIFEST.json"), "manifest in tar: {listing}");
+    assert!(listing.contains("repo/"), "repo in tar: {listing}");
+
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(
+        log.contains("embargo-sealed") && log.contains(&key_id),
+        "seal event must be audited with the signer: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A recipient with no key in the keyring refuses the seal before any
+/// plaintext is written.
+#[test]
+fn test_embargo_bundle_seal_refuses_unresolvable_recipient() {
+    let tmp = std::env::temp_dir().join(format!("oot-embargo-nokey-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    // An empty keyring: nothing resolves.
+    let gpg_home = tmp.join("gpg-home");
+    std::fs::create_dir_all(&gpg_home).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"ghost@example.com\"]\nresign_key_id = \"AA00BB11\"\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(!ok, "seal without the recipient key must fail");
+    assert!(
+        msg.contains("no key for") && msg.contains("ghost@example.com"),
+        "error must name the unresolved recipient: {msg}"
+    );
+    assert!(!artifact.exists(), "refused seal must not leave an artifact");
+    assert!(!tmp.join("bundle").exists(), "refused seal must not build plaintext");
+
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(
+        log.contains("seal-refused"),
+        "refusal must be audited: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// No signer configured: the seal refuses before touching gpg.
+#[test]
+fn test_embargo_bundle_seal_needs_signer() {
+    let tmp = std::env::temp_dir().join(format!("oot-embargo-nosign-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"alice@example.com\"]\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+    );
+    assert!(!ok, "seal without a signer must fail");
+    assert!(
+        msg.contains("needs a signer"),
+        "error must say why: {msg}"
+    );
+    assert!(!artifact.exists(), "failed seal must not leave an artifact");
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

@@ -142,15 +142,23 @@ enum Commands {
         #[arg(long)]
         visibility: Option<String>,
     },
-    /// Write a maintainer-only bundle: full repo plus dockets plus logs plus
-    /// MANIFEST. Plain output, Oot never sends. Seal it before sharing.
+    /// Seal a maintainer-only bundle: full repo plus dockets plus MANIFEST,
+    /// tarred and sign+encrypted to the recipients with gpg. Oot never
+    /// sends. Pass --plain to write the unsealed directory instead.
     EmbargoBundle {
-        /// Directory to create the bundle in. Must not exist yet.
+        /// Path for the sealed artifact, e.g. embargo-2099-01-01.tar.gpg.
+        /// Must not exist yet. With --plain, a directory instead.
         #[arg(long)]
         out: String,
         /// Path to a visibility-policy TOML. Defaults to `./visibility.toml`.
         #[arg(long)]
         visibility: Option<String>,
+        /// Write the unsealed bundle directory instead of a gpg artifact.
+        #[arg(long)]
+        plain: bool,
+        /// GPG key id signing the bundle. Defaults to `resign_key_id`.
+        #[arg(long)]
+        signer: Option<String>,
     },
     /// Materialize a stored change's tree into the working copy.
     /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
@@ -734,7 +742,12 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             Ok(std::process::ExitCode::SUCCESS)
         }
-        Commands::EmbargoBundle { out, visibility } => {
+        Commands::EmbargoBundle {
+            out,
+            visibility,
+            plain,
+            signer,
+        } => {
             let policy = load_policy_arg(visibility)?
                 .ok_or_else(|| anyhow::anyhow!("embargo bundle needs ./visibility.toml"))?;
             let store = Store::open(".")?;
@@ -742,11 +755,21 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 anyhow::bail!("store has no imported history (run `oot import` first)");
             }
             let out_path = std::path::PathBuf::from(&out);
-            let exported = store.embargo_bundle(&out_path, &policy)?;
-            println!(
-                "embargo bundle: {} changes to {out} (plain output, seal before sharing)",
-                exported.len()
-            );
+            if plain {
+                let exported = store.embargo_bundle(&out_path, &policy)?;
+                println!(
+                    "embargo bundle: {} changes to {out} (plain output, seal before sharing)",
+                    exported.len()
+                );
+            } else {
+                let exported =
+                    store.embargo_bundle_sealed(&out_path, &policy, signer.as_deref())?;
+                println!("sealed embargo bundle: {} changes to {out}", exported.len());
+                println!("verify + open (gpg reports the signer):");
+                println!("  gpg --decrypt {out} > bundle.tar");
+                println!("  tar -xf bundle.tar");
+                println!("  cd bundle/repo && git log --oneline");
+            }
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Update {

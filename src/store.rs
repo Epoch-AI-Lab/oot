@@ -814,6 +814,92 @@ impl Store {
         Ok(())
     }
 
+    /// The original annotated tag object for `tag`, if import fetched one:
+    /// (object sha, commit it peels to). Lightweight tags have no separate
+    /// object, so they come back as None.
+    fn source_tag_object(&self, tag: &str) -> Result<Option<(String, String)>> {
+        let reference = format!("refs/oot/source-tags/{tag}");
+        let resolve = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["rev-parse", "--verify", "--quiet", &reference])
+            .output()
+            .context("failed to probe the store's tag objects")?;
+        if !resolve.status.success() {
+            return Ok(None);
+        }
+        let obj = String::from_utf8_lossy(&resolve.stdout).trim().to_string();
+        let kind = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["cat-file", "-t", &obj])
+            .output()
+            .context("failed to probe the store's tag objects")?;
+        if !kind.status.success() || String::from_utf8_lossy(&kind.stdout).trim() != "tag" {
+            return Ok(None);
+        }
+        let peel = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["rev-parse", "--verify", "--quiet", &format!("{obj}^{{commit}}")])
+            .output()
+            .context("failed to probe the store's tag objects")?;
+        if !peel.status.success() {
+            return Ok(None);
+        }
+        Ok(Some((obj, String::from_utf8_lossy(&peel.stdout).trim().to_string())))
+    }
+
+    /// Whether a tag object carries a signature. `git tag -s` puts the
+    /// signature in the tag message body; check for the known armor headers.
+    fn tag_object_signed(&self, obj: &str) -> Result<bool> {
+        let out = Command::new("git")
+            .args(["--git-dir"])
+            .arg(self.git_dir())
+            .args(["cat-file", "tag", obj])
+            .output()
+            .context("failed to read the store's tag object")?;
+        if !out.status.success() {
+            return Ok(false);
+        }
+        let body = String::from_utf8_lossy(&out.stdout);
+        Ok(body.contains("-----BEGIN PGP SIGNATURE")
+            || body.contains("-----BEGIN SSH SIGNATURE")
+            || body.contains("-----BEGIN SIGNED MESSAGE"))
+    }
+
+    /// Point an exported tag ref at the original tag object itself, so the
+    /// annotated object (tagger, message, signature) survives the export
+    /// byte-identically. The object resolves in the exported repo because
+    /// replay attaches the store's odb.
+    fn point_tag_object(&self, out_repo: &Path, tag: &str, obj: &str) -> Result<()> {
+        run(Command::new("git")
+            .args(["--git-dir"])
+            .arg(out_repo.join(".git"))
+            .args(["update-ref", &format!("refs/tags/{tag}"), obj]))?;
+        Ok(())
+    }
+
+    /// Record that an exported tag lost its signature because its target
+    /// commit was rebuilt (private-path stripping or parent remap): the
+    /// signature covered the original object bytes and cannot ride along.
+    fn log_tag_sig_dropped(&self, tag: &str, head_id: &str) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "tag-sig-dropped",
+            "tag": tag,
+            "change": head_id,
+            "reason": "tag target was rebuilt; the signature covered the original bytes",
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
     /// Replay every indexed change into `out_repo` (which must be an
     /// initialized git repository) as real commits. The store's odb is
     /// attached via `GIT_ALTERNATE_OBJECT_DIRECTORIES`, so trees and blobs are
@@ -1181,6 +1267,139 @@ impl Store {
             serde_json::to_string_pretty(&manifest)?,
         )?;
         Ok(exported)
+    }
+
+    /// Build the embargo bundle and seal it: the plaintext staging dir is
+    /// tarred, then sign+encrypted to the recipients with gpg. Oot shells
+    /// out to gpg the same way it already shells out to git for resigning;
+    /// the math stays in someone else's binary. The staging dir and the
+    /// intermediate plaintext tar are deleted on every path, success or not:
+    /// plaintext never outlives the command. Oot still never sends — the
+    /// sealed artifact is the courier's cargo.
+    pub fn embargo_bundle_sealed(
+        &self,
+        out: &Path,
+        policy: &VisibilityPolicy,
+        signer_override: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        if !policy.is_under_embargo() {
+            bail!("no active embargo: bundle needs embargo_until in the future");
+        }
+        if out.exists() {
+            bail!("bundle artifact already exists: {}", out.display());
+        }
+        let signer = signer_override
+            .map(str::to_string)
+            .or_else(|| policy.resign_key_id.clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "embargo seal needs a signer: set resign_key_id in visibility.toml or pass --signer"
+                )
+            })?;
+        let recipients: Vec<String> = policy
+            .embargo_recipients
+            .iter()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        if recipients.is_empty() {
+            bail!("embargo bundle refused: embargo_recipients is empty");
+        }
+        // Resolve every recipient against the local keyring before any
+        // plaintext exists. Oot never fetches keys; the operator imports
+        // them out of band.
+        let mut unresolved = Vec::new();
+        for r in &recipients {
+            match gpg_key_state(r)? {
+                GpgKeyState::Found => {}
+                GpgKeyState::Revoked => {
+                    eprintln!("warning: recipient {r} has a revoked key in the keyring")
+                }
+                GpgKeyState::Missing => unresolved.push(r.clone()),
+            }
+        }
+        if !unresolved.is_empty() {
+            self.log_seal_event(
+                "seal-refused",
+                serde_json::json!({ "unresolved": unresolved }),
+            )?;
+            bail!(
+                "embargo seal refused: no key for {} in keyring (import with `gpg --import`)",
+                unresolved.join(", ")
+            );
+        }
+        if let Some(parent) = out.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let staging = sealed_staging_dir(out);
+        let mut tar_name = staging.as_os_str().to_os_string();
+        tar_name.push(".tar");
+        let tar_path = std::path::PathBuf::from(tar_name);
+        let result = self.build_and_seal(&staging, &tar_path, out, policy, &signer, &recipients);
+        // The staging dir holds the full unfiltered history and the tar is
+        // plaintext too: both go away no matter how the seal ended.
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&tar_path);
+        let exported = result.inspect_err(|e| {
+            let _ = self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
+        })?;
+        self.log_seal_event(
+            "embargo-sealed",
+            serde_json::json!({
+                "signer": signer,
+                "recipients": recipients,
+                "changes": exported.len(),
+                "artifact": out.display().to_string(),
+            }),
+        )?;
+        Ok(exported)
+    }
+
+    fn build_and_seal(
+        &self,
+        staging: &Path,
+        tar_path: &Path,
+        out: &Path,
+        policy: &VisibilityPolicy,
+        signer: &str,
+        recipients: &[String],
+    ) -> Result<Vec<(String, String)>> {
+        let exported = self.embargo_bundle(staging, policy)?;
+        run(Command::new("tar")
+            .args(["-cf"])
+            .arg(tar_path)
+            .arg("-C")
+            .arg(staging.parent().unwrap_or_else(|| Path::new(".")))
+            .arg(staging.file_name().unwrap_or_default()))?;
+        let mut gpg = Command::new("gpg");
+        gpg.args(["--batch", "--yes", "--encrypt", "--sign"]);
+        gpg.args(["--local-user", signer]);
+        for r in recipients {
+            gpg.args(["--recipient", r]);
+        }
+        gpg.arg("--output").arg(out).arg(tar_path);
+        run(&mut gpg)?;
+        Ok(exported)
+    }
+
+    /// Record a sealing decision in the export audit log: refusal, failure,
+    /// or the sealed artifact itself.
+    fn log_seal_event(&self, event: &str, extra: serde_json::Value) -> Result<()> {
+        let mut entry = serde_json::json!({ "epoch": now_epoch(), "event": event });
+        if let (Some(obj), Some(extras)) = (entry.as_object_mut(), extra.as_object()) {
+            for (k, v) in extras {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
     }
 
     /// Wipe cached export mappings when the visibility policy changed since
@@ -1581,13 +1800,39 @@ impl Store {
                 continue;
             }
             match self.branch_head_sha(&head_id) {
-                Ok(Some(sha)) => match self.point_tag(repo_dir, &tag, &sha) {
-                    Ok(()) => pointed.tags.push((tag, sha)),
-                    Err(e) => {
-                        self.log_tag_omitted(&tag, &head_id)?;
-                        eprintln!("warning: tag {tag} omitted ({e:#})");
+                Ok(Some(sha)) => {
+                    // Prefer the original annotated tag object: when the
+                    // tagged commit exported byte-identically, the object
+                    // (and its signature) stays valid verbatim.
+                    match self.source_tag_object(&tag)? {
+                        Some((obj, target)) if target == sha => {
+                            match self.point_tag_object(repo_dir, &tag, &obj) {
+                                Ok(()) => pointed.tags.push((tag, sha)),
+                                Err(e) => {
+                                    self.log_tag_omitted(&tag, &head_id)?;
+                                    eprintln!("warning: tag {tag} omitted ({e:#})");
+                                }
+                            }
+                        }
+                        source => {
+                            // Rebuilt or lightweight target: a lightweight
+                            // ref is all that survives, and a signature on
+                            // the original object dies with it. Say so.
+                            if let Some((obj, _)) = source {
+                                if self.tag_object_signed(&obj)? {
+                                    self.log_tag_sig_dropped(&tag, &head_id)?;
+                                }
+                            }
+                            match self.point_tag(repo_dir, &tag, &sha) {
+                                Ok(()) => pointed.tags.push((tag, sha)),
+                                Err(e) => {
+                                    self.log_tag_omitted(&tag, &head_id)?;
+                                    eprintln!("warning: tag {tag} omitted ({e:#})");
+                                }
+                            }
+                        }
                     }
-                },
+                }
                 Ok(None) => {
                     self.log_tag_omitted(&tag, &head_id)?;
                     eprintln!("warning: tag {tag} omitted (entire history withheld)");
@@ -2288,6 +2533,54 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether `entry` (email or fingerprint) resolves to a key in the local
+/// gpg keyring. Oot only resolves; it never fetches keys.
+enum GpgKeyState {
+    Found,
+    Revoked,
+    Missing,
+}
+
+fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
+    let out = Command::new("gpg")
+        .args(["--list-keys", "--with-colons", entry])
+        .output()
+        .map_err(|e| anyhow::anyhow!("failed to run gpg ({e}); install gnupg to seal embargo bundles"))?;
+    if !out.status.success() {
+        return Ok(GpgKeyState::Missing);
+    }
+    let mut state = GpgKeyState::Missing;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let fields: Vec<&str> = line.split(':').collect();
+        if fields.first() == Some(&"pub") && fields.len() > 1 {
+            state = match fields[1] {
+                "r" => GpgKeyState::Revoked,
+                _ => GpgKeyState::Found,
+            };
+            if matches!(state, GpgKeyState::Found) {
+                break;
+            }
+        }
+    }
+    Ok(state)
+}
+
+/// The staging dir for a sealed artifact: the artifact path with its
+/// extensions stripped, so extracting the tarball lands in a directory
+/// named like the bundle. `embargo-2099.tar.gpg` -> `embargo-2099/`.
+fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
+    let name = out
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("embargo-bundle")
+        .trim_end_matches(".tar")
+        .to_string();
+    out.parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf()
+        .join(name)
 }
 
 fn message_names_private_path(message: &str, policy: &VisibilityPolicy) -> bool {
