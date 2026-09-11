@@ -87,12 +87,12 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 - [x] `oot adjudicate --change` + `oot docket`: judge stored changes directly, sidecar dockets + audit log
 - [x] `oot gc` / `oot prune`: sweep unreferenced changes, dockets, mappings, and pack/prune the bare Git ODB with grace periods
 - [x] Export to git: byte-identical round-trip (merges, binaries, unicode, non-UTC), sigs survive when not rebuilt, annotated tag objects (tagger, message, signature) survive when the target exports byte-identically
-- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, rebuilt commits ship unsigned unless `resign_key_id` re-signs them, log to `.oot/export-log.jsonl`
+- [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, rebuilt commits ship unsigned unless `resign_key_id` re-signs them, tags on rebuilt targets are recreated with the original tagger and message (freshly signed when a key is set), log to `.oot/export-log.jsonl`
 - [x] Embargo bundle: `embargo-status` plus `embargo-bundle` seal full history plus dockets plus MANIFEST to named recipients with gpg (sign+encrypt, no plaintext left behind); `--plain` writes the unsealed directory instead. Oot never sends.
 
 Same-named defs in one file (two `render` methods) are tracked separately: we match identical bodies first, then pair the rest, so only the real change is reported.
 
-Cuts for now: tag signatures downstream of rebuilt history (the tag demotes to a lightweight ref and the loss lands in `.oot/export-log.jsonl`), and dir re-inclusion differs from git (we honor `!build/keep/x` under excluded `build/`, git does not).
+Cuts for now: dir re-inclusion differs from git (we honor `!build/keep/x` under excluded `build/`, git does not).
 
 ## License
 
@@ -104,7 +104,6 @@ We havent built this shit yet. It needs real users to be worth the cost, and we 
 
 - **Hosted intent scoring.** A model that checks what a change says vs what it does. Structural engine catches *that* code changed, this catches *what it means*. Needs a server and a model and someone to pay.
 - **Embargo distribution.** The bundle ships sealed now (gpg sign+encrypt to `embargo_recipients`, resolved against the local keyring). Still missing: actually moving the artifact to maintainers — that is a courier, a key service, or auth we have not built.
-- **Signed tag re-sign.** Tag objects now survive export when the target is untouched, and a signed tag on a rebuilt target demotes to a lightweight ref with a `tag-sig-dropped` audit entry. Still missing: re-signing the tag itself (`git tag -s`) on rebuilt targets — needs tagger identity recorded in the store.
 
 ## Try it
 

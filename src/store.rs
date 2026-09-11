@@ -28,6 +28,7 @@ const CHANGES_DIR: &str = "changes";
 const MAP_DIR: &str = "map";
 const REFS_DIR: &str = "refs";
 const TAGS_DIR: &str = "tags";
+const TAGMETA_DIR: &str = "tagmeta";
 const EXPORT_LOG: &str = "export-log.jsonl";
 /// Git's well-known empty tree; used to diff root commits against nothing.
 const EMPTY_TREE: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
@@ -111,6 +112,7 @@ impl Store {
         std::fs::create_dir_all(oot.join(MAP_DIR))?;
         std::fs::create_dir_all(oot.join(REFS_DIR))?;
         std::fs::create_dir_all(oot.join(TAGS_DIR))?;
+        std::fs::create_dir_all(oot.join(TAGMETA_DIR))?;
         std::fs::create_dir_all(oot.join("export"))?;
         std::fs::write(oot.join("HEAD"), "ref: refs/heads/main\n")?;
         run(Command::new("git")
@@ -766,6 +768,86 @@ impl Store {
         Ok(())
     }
 
+    /// Record the original annotated tag's identity — tagger, message,
+    /// whether it carried a signature — so export can recreate the tag at
+    /// a rebuilt target with the same content and a fresh signature.
+    pub fn set_tag_meta(&self, tag: &str, meta: &TagMeta) -> Result<()> {
+        std::fs::create_dir_all(self.root.join(TAGMETA_DIR))?;
+        let safe = encode_branch(tag);
+        let path = self.root.join(TAGMETA_DIR).join(safe);
+        std::fs::write(path, serde_json::to_string(meta)?)?;
+        Ok(())
+    }
+
+    /// Forget a tag's metadata: its replacement is lightweight (or was
+    /// re-imported as lightweight), so old identity must not leak into
+    /// the next export.
+    pub fn clear_tag_meta(&self, tag: &str) -> Result<()> {
+        let path = self.root.join(TAGMETA_DIR).join(encode_branch(tag));
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
+    }
+
+    /// The original annotated tag's identity, if import captured one.
+    pub fn tag_meta(&self, tag: &str) -> Result<Option<TagMeta>> {
+        let path = self.root.join(TAGMETA_DIR).join(encode_branch(tag));
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&raw)?)
+    }
+
+    /// Read an annotated tag's identity straight from the source repo:
+    /// tagger, message, and whether the message carries a signature.
+    /// Lightweight tags have no tag object and come back as None.
+    pub fn capture_tag_meta(&self, source_repo: &Path, tag: &str) -> Result<Option<TagMeta>> {
+        let kind = Command::new("git")
+            .args(["cat-file", "-t", &format!("refs/tags/{tag}")])
+            .current_dir(source_repo)
+            .output()
+            .context("failed to inspect tags in source repository")?;
+        if !kind.status.success()
+            || String::from_utf8_lossy(&kind.stdout).trim() != "tag"
+        {
+            return Ok(None);
+        }
+        let body = Command::new("git")
+            .args(["cat-file", "tag", &format!("refs/tags/{tag}")])
+            .current_dir(source_repo)
+            .output()
+            .context("failed to read tags in source repository")?;
+        if !body.status.success() {
+            return Ok(None);
+        }
+        let text = String::from_utf8_lossy(&body.stdout);
+        let (headers, message) = text.split_once("\n\n").unwrap_or((&text, ""));
+        let tagger = headers
+            .lines()
+            .find(|l| l.starts_with("tagger "))
+            .and_then(|l| {
+                let rest = l.strip_prefix("tagger ")?;
+                let open = rest.find('<')?;
+                let close = rest.find('>')?;
+                let name = rest[..open].trim();
+                let email = rest[open + 1..close].trim();
+                Some((name.to_string(), email.to_string()))
+            });
+        Ok(Some(TagMeta {
+            tagger_name: tagger.as_ref().map(|(n, _)| n.clone()),
+            tagger_email: tagger.as_ref().map(|(_, e)| e.clone()),
+            // A signed tag's signature lives in its message body: keep the
+            // prose, drop the armor, or a recreated tag would carry the
+            // stale signature text (and a fresh one after it) in its message.
+            message: strip_signature_block(message),
+            signed: message_has_signature(message),
+        }))
+    }
+
     /// Read all recorded tags as (tag, head change id).
     pub fn tags(&self) -> Result<Vec<(String, String)>> {
         let dir = self.root.join(TAGS_DIR);
@@ -795,6 +877,58 @@ impl Store {
             "event": "tag-omitted",
             "tag": tag,
             "change": head_id,
+        });
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.root.join(EXPORT_LOG))?;
+        writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Recreate an annotated tag at `sha` in the exported repo with the
+    /// original tagger identity and message. With a signing key it ships
+    /// freshly signed (the original signature covered the original bytes
+    /// and cannot be copied); without one it is unsigned.
+    fn recreate_tag(
+        &self,
+        out_repo: &Path,
+        tag: &str,
+        sha: &str,
+        meta: &TagMeta,
+        sign_key: Option<&str>,
+    ) -> Result<()> {
+        let mut cmd = Command::new("git");
+        if let Some(key) = sign_key {
+            cmd.arg("-c").arg(format!("user.signingkey={key}"));
+        }
+        cmd.args([
+            "tag",
+            if sign_key.is_some() { "-s" } else { "-a" },
+            tag,
+            "-m",
+            &meta.message,
+            sha,
+        ]);
+        if let (Some(name), Some(email)) = (&meta.tagger_name, &meta.tagger_email) {
+            cmd.env("GIT_COMMITTER_NAME", name.replace('\n', " "))
+                .env("GIT_COMMITTER_EMAIL", email.replace('\n', " "));
+        }
+        cmd.current_dir(out_repo);
+        run(&mut cmd)?;
+        Ok(())
+    }
+
+    /// Record that an exported tag's signature was replaced with a fresh
+    /// one because its target commit was rebuilt.
+    fn log_tag_resigned(&self, tag: &str, head_id: &str, key: &str) -> Result<()> {
+        let entry = serde_json::json!({
+            "epoch": now_epoch(),
+            "event": "tag-resigned",
+            "tag": tag,
+            "change": head_id,
+            "key": key,
         });
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
@@ -865,9 +999,7 @@ impl Store {
         }
         let body = String::from_utf8_lossy(&out.stdout);
         let message = body.split_once("\n\n").map(|(_, m)| m).unwrap_or(&body);
-        Ok(message.contains("-----BEGIN PGP SIGNATURE")
-            || message.contains("-----BEGIN SSH SIGNATURE")
-            || message.contains("-----BEGIN SIGNED MESSAGE"))
+        Ok(message_has_signature(message))
     }
 
     /// Point an exported tag ref at the original tag object itself, so the
@@ -1218,7 +1350,12 @@ impl Store {
         std::fs::create_dir_all(&repo_dir)?;
         run(Command::new("git").args(["init", "--quiet"]).arg(&repo_dir))?;
         let exported = self.replay(&repo_dir, None)?;
-        let pointed = self.point_branches_and_tags(&repo_dir, |_| true)?;
+        let tag_sign_key = policy
+            .resign_key_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty());
+        let pointed = self.point_branches_and_tags(&repo_dir, |_| true, tag_sign_key)?;
         if let Some((first, _)) = pointed.branches.first() {
             self.point_head(&repo_dir, first)?;
         }
@@ -1796,6 +1933,7 @@ impl Store {
         &self,
         repo_dir: &Path,
         keep_branch: impl Fn(&str) -> bool,
+        resign_key: Option<&str>,
     ) -> Result<PointedRefs> {
         let mut pointed = PointedRefs::default();
         for (branch, head_id) in self.refs()? {
@@ -1836,29 +1974,63 @@ impl Store {
                             }
                         }
                         source => {
-                            // Rebuilt or lightweight target: a lightweight
-                            // ref is all that survives, and a signature on
-                            // the original object dies with it. Say so —
-                            // but only when the fetched object belongs to
-                            // this change; a peel elsewhere means the tag
-                            // moved upstream and the ref is stale, not
-                            // that a signature was lost.
+                            // Rebuilt or lightweight target: the original
+                            // object cannot ride along, but the tag's
+                            // identity — tagger and message — lives in the
+                            // store from import, so recreate the annotated
+                            // tag at the exported target. With a key it
+                            // ships freshly signed; without one it is
+                            // unsigned and the signature loss is audited.
+                            // A signing failure is a config error and
+                            // fails the export loudly, like a bad
+                            // resign_key_id on a rebuilt commit.
                             let own_target = self
                                 .get_change(&head_id)
                                 .ok()
                                 .and_then(|r| r.source_sha.clone());
-                            if let Some((obj, peel)) = source {
-                                if own_target.as_deref() == Some(peel.as_str())
-                                    && self.tag_object_signed(&obj)?
-                                {
-                                    self.log_tag_sig_dropped(&tag, &head_id)?;
+                            let originally_signed = match &source {
+                                Some((obj, peel)) if own_target.as_deref() == Some(peel.as_str()) => {
+                                    self.tag_object_signed(obj)?
                                 }
-                            }
-                            match self.point_tag(repo_dir, &tag, &sha) {
-                                Ok(()) => pointed.tags.push((tag, sha)),
-                                Err(e) => {
-                                    self.log_tag_omitted(&tag, &head_id)?;
-                                    eprintln!("warning: tag {tag} omitted ({e:#})");
+                                _ => self.tag_meta(&tag)?.is_some_and(|m| m.signed),
+                            };
+                            let meta = self.tag_meta(&tag)?;
+                            let recreatable = meta.as_ref().and_then(|m| {
+                                match (&m.tagger_name, &m.tagger_email) {
+                                    (Some(n), Some(e)) if !n.is_empty() && !e.is_empty() => {
+                                        Some(m)
+                                    }
+                                    _ => None,
+                                }
+                            });
+                            match recreatable {
+                                Some(meta) => {
+                                    self.recreate_tag(repo_dir, &tag, &sha, meta, resign_key)?;
+                                    if resign_key.is_some() {
+                                        self.log_tag_resigned(
+                                            &tag,
+                                            &head_id,
+                                            resign_key.unwrap_or_default(),
+                                        )?;
+                                    } else if originally_signed {
+                                        self.log_tag_sig_dropped(&tag, &head_id)?;
+                                    }
+                                    pointed.tags.push((tag, sha));
+                                }
+                                None => {
+                                    // No stored identity (old stores,
+                                    // lightweight source tags): a
+                                    // lightweight ref is all that survives.
+                                    if originally_signed {
+                                        self.log_tag_sig_dropped(&tag, &head_id)?;
+                                    }
+                                    match self.point_tag(repo_dir, &tag, &sha) {
+                                        Ok(()) => pointed.tags.push((tag, sha)),
+                                        Err(e) => {
+                                            self.log_tag_omitted(&tag, &head_id)?;
+                                            eprintln!("warning: tag {tag} omitted ({e:#})");
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2565,6 +2737,36 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A tag's original identity, captured from the source repo at import.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TagMeta {
+    pub tagger_name: Option<String>,
+    pub tagger_email: Option<String>,
+    pub message: String,
+    pub signed: bool,
+}
+
+/// Whether a message part carries a known signature armor header.
+fn message_has_signature(message: &str) -> bool {
+    message.contains("-----BEGIN PGP SIGNATURE")
+        || message.contains("-----BEGIN SSH SIGNATURE")
+        || message.contains("-----BEGIN SIGNED MESSAGE")
+}
+
+/// Drop a trailing signature block from a tag message, keeping the prose.
+fn strip_signature_block(message: &str) -> String {
+    for start in [
+        "-----BEGIN PGP SIGNATURE-----",
+        "-----BEGIN SSH SIGNATURE-----",
+        "-----BEGIN SIGNED MESSAGE-----",
+    ] {
+        if let Some(i) = message.find(start) {
+            return message[..i].trim_end().to_string();
+        }
+    }
+    message.to_string()
 }
 
 /// Whether `entry` (email or fingerprint) resolves to a key in the local

@@ -1,8 +1,10 @@
 //! Tags round-trip: git tags -> Oot store -> exported git repo.
 //!
 //! Import peels every tag (lightweight or annotated) to its target commit
-//! and records the change id. Export writes lightweight `refs/tags/*` refs,
-//! walking withheld history to the nearest kept ancestor like branches do.
+//! and records the change id. Export reuses the original annotated tag
+//! object when the target is untouched, recreates it (tagger, message,
+//! fresh signature when a key is set) on rebuilt targets, and walks
+//! withheld history to the nearest kept ancestor like branches do.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -67,6 +69,25 @@ fn git_env(repo: &Path, extra_env: &[(&str, &str)], args: &[&str]) -> String {
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Like `oot`, but with extra env (used to sign and verify with a
+/// throwaway keyring).
+fn oot_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> (bool, String) {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).current_dir(cwd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let o = cmd.output().expect("oot binary should run");
+    (
+        o.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        ),
+    )
 }
 
 /// Make a throwaway GPG home with one signing key. Fast (about 0.1s),
@@ -424,17 +445,119 @@ fn test_signed_tag_demotes_with_audit_when_target_rebuilt() {
     let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
     assert!(ok, "export failed: {msg}");
 
-    // Rebuilt target: the tag falls back to the kept ancestor, lightweight,
-    // because the signature covered the original commit's bytes.
+    // Rebuilt target: the tag is recreated annotated at the kept ancestor,
+    // with the original message but no signature (no resign_key_id here).
     let kind = git(&out, &["cat-file", "-t", "refs/tags/leaked"]);
-    assert_eq!(kind, "commit", "rebuilt target must demote the tag");
-    let got = git(&out, &["rev-parse", "refs/tags/leaked"]);
+    assert_eq!(kind, "tag", "rebuilt target must keep the annotated tag");
+    let body = git(&out, &["cat-file", "tag", "refs/tags/leaked"]);
+    assert!(
+        body.contains("secret release"),
+        "tag message must be recreated: {body}"
+    );
+    assert!(
+        !body.contains("-----BEGIN PGP SIGNATURE"),
+        "without a key the tag must ship unsigned: {body}"
+    );
+    let got = git(&out, &["rev-parse", "refs/tags/leaked^{commit}"]);
     assert_eq!(got, base, "tag should follow history to the kept ancestor");
 
     let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
     assert!(
         log.contains("tag-sig-dropped") && log.contains("leaked"),
         "signature loss must be audited: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// A signed annotated tag on a rebuilt target is recreated with a fresh
+/// signature when resign_key_id is set: same tagger and message, new sig,
+/// and the replacement is audited.
+#[test]
+fn test_signed_tag_resigned_on_rebuilt_target_with_key() {
+    let tmp = std::env::temp_dir().join(format!("oot-tags-rezi-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    let (gpg_home, key_id) = make_test_key();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "base\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    let base = git(&src, &["rev-parse", "HEAD"]);
+
+    std::fs::write(src.join(".env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "rotate secret"]);
+    git_env(
+        &src,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+        &[
+            "-c",
+            &format!("user.signingkey={key_id}"),
+            "tag",
+            "-s",
+            "leaked",
+            "-m",
+            "secret release",
+        ],
+    );
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nprivate_branches = []\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot_with_env(
+        &["export", "--out", out.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "export with a real key must succeed: {msg}");
+
+    // The recreated tag carries a fresh signature over the rebuilt bytes.
+    let kind = git(&out, &["cat-file", "-t", "refs/tags/leaked"]);
+    assert_eq!(kind, "tag", "rebuilt target must keep the annotated tag");
+    let body = git(&out, &["cat-file", "tag", "refs/tags/leaked"]);
+    assert!(
+        body.contains("secret release"),
+        "tag message must be recreated: {body}"
+    );
+    assert!(
+        body.contains("-----BEGIN PGP SIGNATURE"),
+        "resign_key_id must produce a fresh signature: {body}"
+    );
+    let got = git(&out, &["rev-parse", "refs/tags/leaked^{commit}"]);
+    assert_eq!(got, base, "tag should follow history to the kept ancestor");
+    // Verify with the same keyring the export signed with.
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&out)
+        .args(["verify-tag", "leaked"])
+        .env("GNUPGHOME", gpg_home.to_str().unwrap())
+        .output()
+        .expect("git should run");
+    assert!(
+        status.status.success(),
+        "fresh signature must verify: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(
+        log.contains("tag-resigned") && log.contains("leaked"),
+        "re-signing must be audited: {log}"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

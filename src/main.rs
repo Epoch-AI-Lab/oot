@@ -471,6 +471,14 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 match store.change_for_commit(&sha)? {
                     Some(id) => {
                         store.set_tag(&tag, &id)?;
+                        // Capture the annotated tag's identity (tagger,
+                        // message, signature) so export can recreate it at
+                        // a rebuilt target. Lightweight tags have nothing
+                        // to capture, and any stale identity must go.
+                        match store.capture_tag_meta(source.repo_root(), &tag)? {
+                            Some(meta) => store.set_tag_meta(&tag, &meta)?,
+                            None => store.clear_tag_meta(&tag)?,
+                        }
                         println!("tag {tag}: imported");
                     }
                     None => {
@@ -679,6 +687,11 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             store.replay(&out_path, policy.as_ref())?;
 
+            let tag_sign_key = policy
+                .as_ref()
+                .and_then(|p| p.resign_key_id.as_deref())
+                .map(str::trim)
+                .filter(|k| !k.is_empty());
             let pointed = store.point_branches_and_tags(&out_path, |branch| {
                 if let Some(p) = &policy {
                     if p.branch_is_private(branch) {
@@ -687,7 +700,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                     }
                 }
                 true
-            })?;
+            }, tag_sign_key)?;
             for (branch, sha) in &pointed.branches {
                 println!("branch {branch} -> {sha}");
             }
