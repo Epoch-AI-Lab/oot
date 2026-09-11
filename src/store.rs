@@ -1118,48 +1118,21 @@ impl Store {
             bail!("bundle directory already exists: {}", out_dir.display());
         }
         std::fs::create_dir_all(out_dir)?;
+        // Plaintext private history goes inside; keep the bundle private on
+        // disk until the user seals it, regardless of the umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
         // Unfiltered replay: full history, private changes included.
         let repo_dir = out_dir.join("repo");
         std::fs::create_dir_all(&repo_dir)?;
         run(Command::new("git").args(["init", "--quiet"]).arg(&repo_dir))?;
         let exported = self.replay(&repo_dir, None)?;
-        for (branch, head_id) in self.refs()? {
-            match self.branch_head_sha(&head_id)? {
-                Some(sha) => self.point_ref(&repo_dir, &branch, &sha)?,
-                None => self.log_branch_omitted(&branch, &head_id)?,
-            }
-        }
-        for (tag, head_id) in self.tags()? {
-            if !Self::valid_tag_ref(&tag) {
-                self.log_tag_omitted(&tag, &head_id)?;
-                continue;
-            }
-            // One bad tag must not kill a maintainer bundle: same rule as
-            // public export, log it and keep going.
-            match self.branch_head_sha(&head_id) {
-                Ok(Some(sha)) => match self.point_tag(&repo_dir, &tag, &sha) {
-                    Ok(()) => {}
-                    Err(e) => {
-                        self.log_tag_omitted(&tag, &head_id)?;
-                        eprintln!("warning: tag {tag} omitted ({e:#})");
-                    }
-                },
-                Ok(None) => self.log_tag_omitted(&tag, &head_id)?,
-                Err(e) => {
-                    self.log_tag_omitted(&tag, &head_id)?;
-                    eprintln!("warning: tag {tag} omitted ({e:#})");
-                }
-            }
-        }
-        if let Some(first) = self.refs()?.first() {
-            let sym = format!("refs/heads/{}", first.0);
-            run(Command::new("git")
-                .args(["symbolic-ref", "HEAD", &sym])
-                .current_dir(&repo_dir))?;
-            let _ = Command::new("git")
-                .args(["checkout", "-f", "HEAD"])
-                .current_dir(&repo_dir)
-                .output();
+        let pointed = self.point_branches_and_tags(&repo_dir, |_| true)?;
+        if let Some((first, _)) = pointed.branches.first() {
+            self.point_head(&repo_dir, first)?;
         }
         // Sidecars travel with the bundle so maintainers can audit it.
         // Copy after logging: the bundle copy must hold this run's events.
@@ -1570,6 +1543,85 @@ impl Store {
             .append(true)
             .open(self.root.join(EXPORT_LOG))?;
         writeln!(f, "{entry}")?;
+        Ok(())
+    }
+
+    /// Point branches and tags at their exported shas in a freshly replayed
+    /// repo. `keep_branch` filters whole branches: public export drops private
+    /// branches, the embargo bundle keeps everything. Omissions land in the
+    /// audit log and on stderr and never abort the run — one bad tag must not
+    /// sink a whole history replay. Returns what was pointed, for reporting
+    /// and HEAD selection.
+    pub fn point_branches_and_tags(
+        &self,
+        repo_dir: &Path,
+        keep_branch: impl Fn(&str) -> bool,
+    ) -> Result<PointedRefs> {
+        let mut pointed = PointedRefs::default();
+        for (branch, head_id) in self.refs()? {
+            if !keep_branch(&branch) {
+                self.log_branch_omitted(&branch, &head_id)?;
+                continue;
+            }
+            match self.branch_head_sha(&head_id)? {
+                Some(sha) => {
+                    self.point_ref(repo_dir, &branch, &sha)?;
+                    pointed.branches.push((branch, sha));
+                }
+                None => {
+                    self.log_branch_omitted(&branch, &head_id)?;
+                    eprintln!("warning: branch {branch} omitted (entire history withheld)");
+                }
+            }
+        }
+        for (tag, head_id) in self.tags()? {
+            if !Self::valid_tag_ref(&tag) {
+                self.log_tag_omitted(&tag, &head_id)?;
+                eprintln!("warning: tag {tag} omitted (invalid refname)");
+                continue;
+            }
+            match self.branch_head_sha(&head_id) {
+                Ok(Some(sha)) => match self.point_tag(repo_dir, &tag, &sha) {
+                    Ok(()) => pointed.tags.push((tag, sha)),
+                    Err(e) => {
+                        self.log_tag_omitted(&tag, &head_id)?;
+                        eprintln!("warning: tag {tag} omitted ({e:#})");
+                    }
+                },
+                Ok(None) => {
+                    self.log_tag_omitted(&tag, &head_id)?;
+                    eprintln!("warning: tag {tag} omitted (entire history withheld)");
+                }
+                Err(e) => {
+                    self.log_tag_omitted(&tag, &head_id)?;
+                    eprintln!("warning: tag {tag} omitted ({e:#})");
+                }
+            }
+        }
+        Ok(pointed)
+    }
+
+    /// Point HEAD at the first exported branch and populate the working tree
+    /// so the exported repo opens ready to inspect. Checkout is best-effort:
+    /// refs and objects are the deliverable, a failed checkout only leaves
+    /// the tree empty, so warn and keep going.
+    pub fn point_head(&self, repo_dir: &Path, first_branch: &str) -> Result<()> {
+        let sym = format!("refs/heads/{first_branch}");
+        run(Command::new("git")
+            .args(["symbolic-ref", "HEAD", &sym])
+            .current_dir(repo_dir))?;
+        match Command::new("git")
+            .args(["checkout", "-f", "HEAD"])
+            .current_dir(repo_dir)
+            .output()
+        {
+            Ok(o) if o.status.success() => {}
+            Ok(o) => eprintln!(
+                "warning: could not populate the exported working tree: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+            Err(e) => eprintln!("warning: could not populate the exported working tree: {e}"),
+        }
         Ok(())
     }
 
@@ -1990,6 +2042,13 @@ pub struct GcStats {
     pub export_pruned: usize,
 }
 
+/// Refs a replay pointed in an exported repo, for reporting and HEAD selection.
+#[derive(Debug, Default)]
+pub struct PointedRefs {
+    pub branches: Vec<(String, String)>,
+    pub tags: Vec<(String, String)>,
+}
+
 /// One commit as read from a source repository, before becoming a record.
 #[derive(Debug, Clone)]
 pub struct RawCommit {
@@ -2237,7 +2296,28 @@ fn message_names_private_path(message: &str, policy: &VisibilityPolicy) -> bool 
         .private_paths
         .iter()
         .filter(|p| !p.trim().is_empty())
-        .any(|p| lower.contains(&p.trim().to_lowercase()))
+        .any(|p| {
+            let needle = p.trim().to_lowercase();
+            // A mention needs a boundary before the path, so `nonsecrets/`
+            // does not trip on `secrets/`. Suffix-like patterns (.pem, /etc)
+            // may sit mid-token: `foo.pem` is a real mention.
+            let suffix_like = needle.starts_with('.') || needle.starts_with('/');
+            let mut from = 0;
+            while let Some(pos) = lower[from..].find(&needle) {
+                let at = from + pos;
+                let boundary = at == 0
+                    || suffix_like
+                    || !lower[..at]
+                        .chars()
+                        .next_back()
+                        .is_some_and(|c| c.is_alphanumeric() || c == '_' || c == '-');
+                if boundary {
+                    return true;
+                }
+                from = at + needle.len();
+            }
+            false
+        })
 }
 
 #[cfg(test)]

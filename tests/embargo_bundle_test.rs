@@ -243,3 +243,59 @@ fn test_embargo_bundle_refuses_without_active_embargo() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// One invalid tag must not sink a maintainer bundle: the bad tag is
+/// omitted with an audit entry, the rest of the bundle ships.
+#[test]
+fn test_embargo_bundle_survives_invalid_tag() {
+    let tmp = std::env::temp_dir().join(format!("oot-embargo-badtag-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let bundle = tmp.join("bundle");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"alice@example.com\"]\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    // Plant a tag with a refname git itself would refuse, pointing at the
+    // imported change, directly into the store's tag records.
+    let head_id =
+        std::fs::read_to_string(proj.join(".oot/refs/main")).expect("branch head change id");
+    std::fs::write(proj.join(".oot/tags/bad..tag"), head_id.trim()).unwrap();
+
+    let (ok, msg) = oot(
+        &["embargo-bundle", "--out", bundle.to_str().unwrap()],
+        &proj,
+    );
+    assert!(ok, "bundle must survive a bad tag: {msg}");
+
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
+    assert!(
+        log.contains("tag-omitted") && log.contains("bad..tag"),
+        "bad tag omission must be audited: {log}"
+    );
+    let tags = git(&bundle.join("repo"), &["for-each-ref", "refs/tags"]);
+    assert!(tags.is_empty(), "bad tag must not land in the bundle: {tags}");
+
+    // The working tree is still populated despite the tag omission.
+    assert!(
+        bundle.join("repo/README.md").exists(),
+        "bundle working tree must be checked out"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

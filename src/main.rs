@@ -671,67 +671,26 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             }
             store.replay(&out_path, policy.as_ref())?;
 
-            let mut first_exported_branch = None;
-
-            for (branch, head_id) in &refs {
+            let pointed = store.point_branches_and_tags(&out_path, |branch| {
                 if let Some(p) = &policy {
                     if p.branch_is_private(branch) {
-                        store.log_branch_omitted(branch, head_id)?;
                         println!("branch {branch} omitted (private branch)");
-                        continue;
+                        return false;
                     }
                 }
-                match store.branch_head_sha(head_id)? {
-                    Some(sha) => {
-                        store.point_ref(&out_path, branch, &sha)?;
-                        if first_exported_branch.is_none() {
-                            first_exported_branch = Some(branch.clone());
-                        }
-                        println!("branch {branch} -> {sha}");
-                    }
-                    None => {
-                        store.log_branch_omitted(branch, head_id)?;
-                        println!("branch {branch} omitted (entire history withheld)");
-                    }
-                }
+                true
+            })?;
+            for (branch, sha) in &pointed.branches {
+                println!("branch {branch} -> {sha}");
             }
-
-            // Tags follow their target change through filtering: a tag whose
-            // target was withheld walks up to the nearest kept ancestor, and
-            // one with no kept history at all is omitted with a log entry.
-            for (tag, head_id) in store.tags()? {
-                // One corrupt tag must not sink the export: per-tag failures
-                // land in the audit log like any other omission.
-                if !Store::valid_tag_ref(&tag) {
-                    store.log_tag_omitted(&tag, &head_id)?;
-                    println!("tag {tag} omitted (invalid refname)");
-                    continue;
-                }
-                match store.branch_head_sha(&head_id) {
-                    Ok(Some(sha)) => match store.point_tag(&out_path, &tag, &sha) {
-                        Ok(()) => println!("tag {tag} -> {sha}"),
-                        Err(e) => {
-                            store.log_tag_omitted(&tag, &head_id)?;
-                            println!("tag {tag} omitted ({e:#})");
-                        }
-                    },
-                    Ok(None) => {
-                        store.log_tag_omitted(&tag, &head_id)?;
-                        println!("tag {tag} omitted (entire history withheld)");
-                    }
-                    Err(e) => {
-                        store.log_tag_omitted(&tag, &head_id)?;
-                        println!("tag {tag} omitted ({e:#})");
-                    }
-                }
+            for (tag, sha) in &pointed.tags {
+                println!("tag {tag} -> {sha}");
             }
 
             // Point HEAD at the first exported branch so `git log` works immediately,
             // and populate the working tree files so the exported repo is ready to inspect.
-            if let Some(first_branch) = first_exported_branch {
-                let first = format!("refs/heads/{first_branch}");
-                run_git(&["symbolic-ref", "HEAD", &first], &out_path)?;
-                let _ = run_git(&["checkout", "-f", "HEAD"], &out_path);
+            if let Some((first_branch, _)) = pointed.branches.first() {
+                store.point_head(&out_path, first_branch)?;
             } else {
                 println!(
                     "warning: all branches were withheld by policy; no refs exported to {out}"
@@ -754,19 +713,18 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::EmbargoStatus { visibility } => {
-            let policy = load_policy_arg(visibility)?;
-            match policy.as_ref().and_then(|p| p.embargo_until.clone()) {
+            let Some(policy) = load_policy_arg(visibility)? else {
+                println!("embargo: no policy (no ./visibility.toml)");
+                return Ok(std::process::ExitCode::SUCCESS);
+            };
+            match policy.embargo_until.clone() {
                 Some(date) => {
-                    let held = policy.as_ref().is_some_and(|p| p.is_under_embargo());
+                    let held = policy.is_under_embargo();
                     let count = policy
-                        .as_ref()
-                        .map(|p| {
-                            p.embargo_recipients
-                                .iter()
-                                .filter(|r| !r.trim().is_empty())
-                                .count()
-                        })
-                        .unwrap_or(0);
+                        .embargo_recipients
+                        .iter()
+                        .filter(|r| !r.trim().is_empty())
+                        .count();
                     println!(
                         "embargo: {} until {date} ({count} recipients)",
                         if held { "held" } else { "lifted" }
