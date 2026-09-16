@@ -89,7 +89,12 @@ fn test_embargo_bundle_holds_what_public_drops() {
     assert!(msg.contains("embargo"), "error must mention embargo: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
+        &[
+            "embargo-bundle",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--plain",
+        ],
         &proj,
     );
     assert!(ok, "bundle failed: {msg}");
@@ -175,7 +180,12 @@ fn test_embargo_bundle_refuses_empty_recipients() {
     assert!(ok, "import failed: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
+        &[
+            "embargo-bundle",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--plain",
+        ],
         &proj,
     );
     assert!(!ok, "empty recipients must fail");
@@ -218,7 +228,12 @@ fn test_embargo_bundle_refuses_without_active_embargo() {
     assert!(msg.contains("lifted"), "status must say lifted: {msg}");
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
+        &[
+            "embargo-bundle",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--plain",
+        ],
         &proj,
     );
     assert!(!ok, "bundle without active embargo must fail");
@@ -235,7 +250,12 @@ fn test_embargo_bundle_refuses_without_active_embargo() {
     )
     .unwrap();
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
+        &[
+            "embargo-bundle",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--plain",
+        ],
         &proj,
     );
     assert!(!ok, "bundle into existing dir must fail");
@@ -278,7 +298,12 @@ fn test_embargo_bundle_survives_invalid_tag() {
     std::fs::write(proj.join(".oot/tags/bad..tag"), head_id.trim()).unwrap();
 
     let (ok, msg) = oot(
-        &["embargo-bundle", "--out", bundle.to_str().unwrap(), "--plain"],
+        &[
+            "embargo-bundle",
+            "--out",
+            bundle.to_str().unwrap(),
+            "--plain",
+        ],
         &proj,
     );
     assert!(ok, "bundle must survive a bad tag: {msg}");
@@ -289,7 +314,10 @@ fn test_embargo_bundle_survives_invalid_tag() {
         "bad tag omission must be audited: {log}"
     );
     let tags = git(&bundle.join("repo"), &["for-each-ref", "refs/tags"]);
-    assert!(tags.is_empty(), "bad tag must not land in the bundle: {tags}");
+    assert!(
+        tags.is_empty(),
+        "bad tag must not land in the bundle: {tags}"
+    );
 
     // The working tree is still populated despite the tag omission.
     assert!(
@@ -456,7 +484,10 @@ fn test_embargo_bundle_seals_to_gpg_artifact() {
     // The artifact exists; no plaintext staging dir or tar survived.
     assert!(artifact.exists(), "sealed artifact must exist");
     assert!(!tmp.join("bundle").exists(), "staging dir must be gone");
-    assert!(!tmp.join("bundle.tar").exists(), "plaintext tar must be gone");
+    assert!(
+        !tmp.join("bundle.tar").exists(),
+        "plaintext tar must be gone"
+    );
 
     // Decrypt (verifies the signature too) and inspect the tarball.
     let plain_tar = tmp.join("plain.tar");
@@ -483,7 +514,10 @@ fn test_embargo_bundle_seals_to_gpg_artifact() {
         String::from_utf8_lossy(&listing.stderr)
     );
     let listing = String::from_utf8_lossy(&listing.stdout).to_string();
-    assert!(listing.contains("MANIFEST.json"), "manifest in tar: {listing}");
+    assert!(
+        listing.contains("MANIFEST.json"),
+        "manifest in tar: {listing}"
+    );
     assert!(listing.contains("repo/"), "repo in tar: {listing}");
 
     // The annotated tag object survives the tarball too.
@@ -501,7 +535,10 @@ fn test_embargo_bundle_seals_to_gpg_artifact() {
         "tar extract failed: {}",
         String::from_utf8_lossy(&extract_out.stderr)
     );
-    let kind = git(&extract.join("bundle/repo"), &["cat-file", "-t", "refs/tags/v1"]);
+    let kind = git(
+        &extract.join("bundle/repo"),
+        &["cat-file", "-t", "refs/tags/v1"],
+    );
     assert_eq!(kind, "tag", "tag object must survive the sealed bundle");
 
     let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
@@ -554,8 +591,14 @@ fn test_embargo_bundle_seal_refuses_unresolvable_recipient() {
         msg.contains("unusable key for") && msg.contains("ghost@example.com"),
         "error must name the unresolved recipient: {msg}"
     );
-    assert!(!artifact.exists(), "refused seal must not leave an artifact");
-    assert!(!tmp.join("bundle").exists(), "refused seal must not build plaintext");
+    assert!(
+        !artifact.exists(),
+        "refused seal must not leave an artifact"
+    );
+    assert!(
+        !tmp.join("bundle").exists(),
+        "refused seal must not build plaintext"
+    );
 
     let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
     assert!(
@@ -597,10 +640,7 @@ fn test_embargo_bundle_seal_needs_signer() {
         &proj,
     );
     assert!(!ok, "seal without a signer must fail");
-    assert!(
-        msg.contains("needs a signer"),
-        "error must say why: {msg}"
-    );
+    assert!(msg.contains("needs a signer"), "error must say why: {msg}");
     assert!(!artifact.exists(), "failed seal must not leave an artifact");
 
     let _ = std::fs::remove_dir_all(&tmp);
@@ -627,13 +667,16 @@ fn test_embargo_bundle_seal_accepts_untrusted_imported_key() {
     let pub_key = tmp.join("recipient.pub");
     let (ok, msg) = gpg_run(
         &recipient_home,
-        &["--armor", "--output", pub_key.to_str().unwrap(), "--export", &key_id],
+        &[
+            "--armor",
+            "--output",
+            pub_key.to_str().unwrap(),
+            "--export",
+            &key_id,
+        ],
     );
     assert!(ok, "export recipient key failed: {msg}");
-    let (ok, msg) = gpg_run(
-        &operator_home,
-        &["--import", pub_key.to_str().unwrap()],
-    );
+    let (ok, msg) = gpg_run(&operator_home, &["--import", pub_key.to_str().unwrap()]);
     assert!(ok, "import recipient key failed: {msg}");
     // The operator signs with their own key, not the recipient's.
     let (ok, msg) = gpg_run(
@@ -773,8 +816,14 @@ fn test_embargo_bundle_seal_refuses_expired_key() {
         msg.contains("unusable key for") && msg.contains("expired"),
         "error must name the expired key: {msg}"
     );
-    assert!(!artifact.exists(), "refused seal must not leave an artifact");
-    assert!(!tmp.join("bundle").exists(), "refused seal must not build plaintext");
+    assert!(
+        !artifact.exists(),
+        "refused seal must not leave an artifact"
+    );
+    assert!(
+        !tmp.join("bundle").exists(),
+        "refused seal must not build plaintext"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

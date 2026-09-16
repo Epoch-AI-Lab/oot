@@ -692,15 +692,19 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 .and_then(|p| p.resign_key_id.as_deref())
                 .map(str::trim)
                 .filter(|k| !k.is_empty());
-            let pointed = store.point_branches_and_tags(&out_path, |branch| {
-                if let Some(p) = &policy {
-                    if p.branch_is_private(branch) {
-                        println!("branch {branch} omitted (private branch)");
-                        return false;
+            let pointed = store.point_branches_and_tags(
+                &out_path,
+                |branch| {
+                    if let Some(p) = &policy {
+                        if p.branch_is_private(branch) {
+                            println!("branch {branch} omitted (private branch)");
+                            return false;
+                        }
                     }
-                }
-                true
-            }, tag_sign_key)?;
+                    true
+                },
+                tag_sign_key,
+            )?;
             for (branch, sha) in &pointed.branches {
                 println!("branch {branch} -> {sha}");
             }
@@ -770,7 +774,9 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let out_path = std::path::PathBuf::from(&out);
             if plain {
                 if signer.is_some() {
-                    anyhow::bail!("--signer only applies to a sealed bundle; --plain writes plaintext");
+                    anyhow::bail!(
+                        "--signer only applies to a sealed bundle; --plain writes plaintext"
+                    );
                 }
                 let exported = store.embargo_bundle(&out_path, &policy)?;
                 println!(

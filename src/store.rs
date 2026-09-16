@@ -811,9 +811,7 @@ impl Store {
             .current_dir(source_repo)
             .output()
             .context("failed to inspect tags in source repository")?;
-        if !kind.status.success()
-            || String::from_utf8_lossy(&kind.stdout).trim() != "tag"
-        {
+        if !kind.status.success() || String::from_utf8_lossy(&kind.stdout).trim() != "tag" {
             return Ok(None);
         }
         let body = Command::new("git")
@@ -975,13 +973,21 @@ impl Store {
         let peel = Command::new("git")
             .args(["--git-dir"])
             .arg(self.git_dir())
-            .args(["rev-parse", "--verify", "--quiet", &format!("{obj}^{{commit}}")])
+            .args([
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("{obj}^{{commit}}"),
+            ])
             .output()
             .context("failed to probe the store's tag objects")?;
         if !peel.status.success() {
             return Ok(None);
         }
-        Ok(Some((obj, String::from_utf8_lossy(&peel.stdout).trim().to_string())))
+        Ok(Some((
+            obj,
+            String::from_utf8_lossy(&peel.stdout).trim().to_string(),
+        )))
     }
 
     /// Whether a tag object carries a signature. `git tag -s` puts the
@@ -1460,10 +1466,7 @@ impl Store {
             }
         }
         if !refused.is_empty() {
-            self.log_seal_event(
-                "seal-refused",
-                serde_json::json!({ "unresolved": refused }),
-            )?;
+            self.log_seal_event("seal-refused", serde_json::json!({ "unresolved": refused }))?;
             bail!(
                 "embargo seal refused: unusable key for {} (import with `gpg --import`, refresh expired keys)",
                 refused.join(", ")
@@ -1486,7 +1489,8 @@ impl Store {
         };
         let result = self.build_and_seal(&staging, &tar_path, out, policy, &signer, &recipients);
         let exported = result.inspect_err(|e| {
-            let _ = self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
+            let _ =
+                self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
         })?;
         self.log_seal_event(
             "embargo-sealed",
@@ -1989,7 +1993,9 @@ impl Store {
                                 .ok()
                                 .and_then(|r| r.source_sha.clone());
                             let originally_signed = match &source {
-                                Some((obj, peel)) if own_target.as_deref() == Some(peel.as_str()) => {
+                                Some((obj, peel))
+                                    if own_target.as_deref() == Some(peel.as_str()) =>
+                                {
                                     self.tag_object_signed(obj)?
                                 }
                                 _ => self.tag_meta(&tag)?.is_some_and(|m| m.signed),
@@ -1997,9 +2003,7 @@ impl Store {
                             let meta = self.tag_meta(&tag)?;
                             let recreatable = meta.as_ref().and_then(|m| {
                                 match (&m.tagger_name, &m.tagger_email) {
-                                    (Some(n), Some(e)) if !n.is_empty() && !e.is_empty() => {
-                                        Some(m)
-                                    }
+                                    (Some(n), Some(e)) if !n.is_empty() && !e.is_empty() => Some(m),
                                     _ => None,
                                 }
                             });
@@ -2785,7 +2789,9 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
     let out = Command::new("gpg")
         .args(["--list-keys", "--with-colons", entry])
         .output()
-        .map_err(|e| anyhow::anyhow!("failed to run gpg ({e}); install gnupg to seal embargo bundles"))?;
+        .map_err(|e| {
+            anyhow::anyhow!("failed to run gpg ({e}); install gnupg to seal embargo bundles")
+        })?;
     if !out.status.success() {
         return Ok(GpgKeyState::Missing);
     }
