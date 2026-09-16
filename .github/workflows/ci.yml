@@ -76,9 +76,11 @@ jobs:
       - name: Build Oot
         run: cargo build --release
       - name: Adjudicate PR against main
+        env:
+          PR_HEAD_REF: ${{ github.head_ref }}
         run: |
           ./target/release/oot adjudicate \
-            --change "${{ github.head_ref }}" \
+            --change "$PR_HEAD_REF" \
             --base-ref origin/main \
             --head-ref HEAD \
             --repo . \

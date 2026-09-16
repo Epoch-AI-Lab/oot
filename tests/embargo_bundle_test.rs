@@ -709,6 +709,9 @@ fn test_embargo_bundle_seal_accepts_untrusted_imported_key() {
     std::fs::write(src.join("README.md"), "v1\n").unwrap();
     git(&src, &["add", "."]);
     git(&src, &["commit", "-m", "base"]);
+    std::fs::write(src.join(".env"), "HANDOFF_TEST=private\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "private fixture"]);
 
     std::fs::write(
         proj.join("visibility.toml"),
@@ -730,7 +733,107 @@ fn test_embargo_bundle_seal_accepts_untrusted_imported_key() {
     );
     assert!(ok, "seal to an untrusted imported key must work: {msg}");
     assert!(artifact.exists(), "sealed artifact must exist");
+    assert!(!tmp.join("bundle").exists());
+    assert!(!tmp.join("bundle.tar").exists());
 
+    let signer_pub = tmp.join("signer.pub");
+    let (ok, msg) = gpg_run(
+        &operator_home,
+        &[
+            "--output",
+            signer_pub.to_str().unwrap(),
+            "--export",
+            &signer_id,
+        ],
+    );
+    assert!(ok, "export signer key failed: {msg}");
+    let (ok, msg) = gpg_run(&recipient_home, &["--import", signer_pub.to_str().unwrap()]);
+    assert!(ok, "import signer key failed: {msg}");
+
+    let denied_tar = tmp.join("denied.tar");
+    let (ok, msg) = gpg_run(
+        &operator_home,
+        &[
+            "--batch",
+            "--status-fd",
+            "1",
+            "--output",
+            denied_tar.to_str().unwrap(),
+            "--decrypt",
+            artifact.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        !ok,
+        "sender without recipient secret key must not decrypt: {msg}"
+    );
+    assert!(
+        msg.contains("[GNUPG:] NO_SECKEY"),
+        "expected missing recipient secret key: {msg}"
+    );
+    assert!(!denied_tar.exists());
+
+    let plain_tar = tmp.join("received.tar");
+    let (ok, msg) = gpg_run(
+        &recipient_home,
+        &[
+            "--batch",
+            "--status-fd",
+            "1",
+            "--output",
+            plain_tar.to_str().unwrap(),
+            "--decrypt",
+            artifact.to_str().unwrap(),
+        ],
+    );
+    assert!(ok, "recipient must decrypt and verify: {msg}");
+    assert!(
+        msg.contains(&format!("[GNUPG:] VALIDSIG {signer_id} ")),
+        "signature must match sender fingerprint: {msg}"
+    );
+    assert!(
+        msg.contains("[GNUPG:] DECRYPTION_OKAY"),
+        "decryption must complete: {msg}"
+    );
+
+    let extract = tmp.join("received");
+    std::fs::create_dir_all(&extract).unwrap();
+    let unpack = Command::new("tar")
+        .arg("-xf")
+        .arg(&plain_tar)
+        .arg("-C")
+        .arg(&extract)
+        .output()
+        .expect("tar should run");
+    assert!(
+        unpack.status.success(),
+        "unpack failed: {}",
+        String::from_utf8_lossy(&unpack.stderr)
+    );
+    let received = extract.join("bundle");
+    assert_eq!(
+        git(&received.join("repo"), &["rev-parse", "HEAD"]),
+        git(&src, &["rev-parse", "HEAD"])
+    );
+    assert_eq!(
+        git(&received.join("repo"), &["show", "HEAD:.env"]),
+        "HANDOFF_TEST=private"
+    );
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(received.join("MANIFEST.json")).unwrap()).unwrap();
+    assert_eq!(manifest["recipients"], serde_json::json!([key_id]));
+    assert_eq!(manifest["embargo_until"], "2099-01-01");
+    assert!(received.join("export-log.jsonl").exists());
+
+    let _ = Command::new("gpgconf")
+        .env("GNUPGHOME", &operator_home)
+        .args(["--kill", "gpg-agent"])
+        .status();
+    let _ = Command::new("gpgconf")
+        .env("GNUPGHOME", &recipient_home)
+        .args(["--kill", "gpg-agent"])
+        .status();
+    let _ = std::fs::remove_dir_all(&recipient_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
