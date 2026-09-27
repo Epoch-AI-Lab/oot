@@ -59,6 +59,24 @@ impl Default for VisibilityPolicy {
     }
 }
 
+impl VisibilityPolicy {
+    /// A stable fingerprint of the fields that decide who may receive a
+    /// bundle, recorded with the seal event so a later edit to
+    /// `embargo_recipients` or `embargo_until` is detectable afterwards.
+    pub fn audit_key(&self) -> String {
+        let mut canon = String::new();
+        canon.push_str("embargo_until=");
+        canon.push_str(self.embargo_until.as_deref().unwrap_or(""));
+        canon.push_str(";recipients=");
+        canon.push_str(&self.embargo_recipients.join(","));
+        canon.push_str(";private_paths=");
+        canon.push_str(&self.private_paths.join(","));
+        canon.push_str(";private_branches=");
+        canon.push_str(&self.private_branches.join(","));
+        crate::court::fnv1a(canon.as_bytes())
+    }
+}
+
 fn matches_pattern(candidate: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;

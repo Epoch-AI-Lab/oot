@@ -198,7 +198,8 @@ fn test_sealed_bundle_is_self_contained() {
     let hidden = tmp.join("hidden-store");
     std::fs::rename(proj.join(".oot/objects.git"), &hidden).unwrap();
     let head = git(&repo, &["rev-parse", "HEAD"]);
-    let log = git(&repo, &["log", "--oneline"]);
+    // --all, or a bundle that dropped a whole branch still looks complete.
+    let log = git(&repo, &["log", "--oneline", "--all"]);
     let packed = git(&repo, &["count-objects", "-v"]);
     std::fs::rename(&hidden, proj.join(".oot/objects.git")).unwrap();
 
@@ -276,7 +277,19 @@ fn test_verify_opens_bundle_with_symlinks() {
         ok,
         "a repo with symlinks must verify, not be refused as unsafe: {msg}"
     );
-    assert!(received.join("bundle/repo").exists());
+    // The links themselves must survive, and still point where they did.
+    let repo = received.join("bundle/repo");
+    assert!(repo.exists());
+    assert_eq!(
+        std::fs::read_link(repo.join("alias")).expect("alias must survive"),
+        Path::new("README.md"),
+        "alias target must be intact"
+    );
+    assert_eq!(
+        std::fs::read_link(repo.join("up-link")).expect("up-link must survive"),
+        Path::new("../src/other"),
+        "up-link target must be intact"
+    );
 
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
@@ -486,4 +499,118 @@ fn test_verify_clears_tree_when_manifest_is_unusable() {
         drop_key(&gpg_home);
         let _ = std::fs::remove_dir_all(&tmp);
     }
+}
+
+/// A signing key that expires AFTER it signed still stops the bundle
+/// opening: gpg emits `EXPKEYSIG` beside `VALIDSIG`, and that marker refuses
+/// the open. This was documented as the opposite for a while, on the strength
+/// of a claim about gpg that nobody had run. It is a real operational
+/// constraint — sign with a key that outlives the embargo, or expect to
+/// re-seal — so it gets a test rather than a comment.
+#[test]
+fn test_verify_refuses_bundle_whose_signer_key_expired() {
+    let tmp = scratch("expired-signer");
+    let (gpg_home, key_id) = make_test_key();
+    let gpg_home_str = gpg_home.to_str().unwrap().to_string();
+
+    // A key with a two second life, and an encryption subkey that outlives
+    // the seal so only the SIGNING key's expiry is what gets tested.
+    let short = Command::new("gpg")
+        .env("GNUPGHOME", &gpg_home_str)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-generate-key",
+            "brief@example.com",
+            "ed25519",
+            "sign",
+            "seconds=2",
+        ])
+        .status()
+        .expect("gpg should run");
+    assert!(short.success(), "short-lived keygen failed");
+    let brief = gpg_fpr(&gpg_home_str, "brief@example.com");
+    assert_ne!(brief, key_id, "test setup: a second key is required");
+    // The sealing side needs an encryption subkey to encrypt TO, so give the
+    // brief key one. Only the signing half is meant to expire.
+    let enc = Command::new("gpg")
+        .env("GNUPGHOME", &gpg_home_str)
+        .args([
+            "--batch",
+            "--pinentry-mode",
+            "loopback",
+            "--passphrase",
+            "",
+            "--quick-add-key",
+            &brief,
+            "cv25519",
+            "encrypt",
+            "0",
+        ])
+        .status()
+        .expect("gpg should run");
+    assert!(enc.success(), "encryption subkey add failed");
+
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{brief}\"]\nresign_key_id = \"{brief}\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(ok, "seal with a live key must work: {msg}");
+
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let (ok, msg) = gpg_fpr_state(&gpg_home_str, &brief);
+    assert!(ok, "list keys failed: {msg}");
+    assert!(
+        msg.contains("pub:e:"),
+        "test setup: the signing key must be expired by now: {msg}"
+    );
+
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(
+        !ok,
+        "a bundle whose signer key has expired must stop opening: {msg}"
+    );
+    assert!(
+        msg.contains("EXPKEYSIG") || msg.contains("refusing to open"),
+        "the refusal must name the reason: {msg}"
+    );
+    assert!(!received.exists(), "refused verify must not leave a tree");
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
 }

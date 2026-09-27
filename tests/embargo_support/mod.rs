@@ -134,6 +134,18 @@ pub fn drop_key(home: &Path) {
         .args(["--kill", "gpg-agent"])
         .status();
     let _ = std::fs::remove_dir_all(home);
+    // The parent is shared by every test in the run, so it can only be
+    // removed once it is empty — `remove_dir`, never `remove_dir_all`, or a
+    // sibling test's live keyring disappears mid-run. The last test out
+    // tidies it, which is what stops the empty dirs piling up in /tmp.
+    if let Some(parent) = home.parent() {
+        if parent
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("oot-"))
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 /// A source repo with one commit, plus a project whose policy seals to
@@ -164,6 +176,34 @@ pub fn project(tmp: &Path, key_id: &str) -> (std::path::PathBuf, std::path::Path
     let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
     assert!(ok, "import failed: {msg}");
     (src, proj)
+}
+
+/// The fingerprint of a key identified by its user id.
+pub fn gpg_fpr(home: &str, uid: &str) -> String {
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", home)
+        .args(["--list-keys", "--with-colons", uid])
+        .output()
+        .expect("gpg should run");
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find(|l| l.starts_with("fpr:"))
+        .and_then(|l| l.split(':').nth(9))
+        .expect("fingerprint for {uid}")
+        .to_string()
+}
+
+/// Raw colon output for a key, so a test can assert on its validity field.
+pub fn gpg_fpr_state(home: &str, fpr: &str) -> (bool, String) {
+    let out = Command::new("gpg")
+        .env("GNUPGHOME", home)
+        .args(["--list-keys", "--with-colons", fpr])
+        .output()
+        .expect("gpg should run");
+    (
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+    )
 }
 
 pub fn scratch(tag: &str) -> std::path::PathBuf {

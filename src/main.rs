@@ -836,6 +836,11 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 std::path::Path::new(&out),
                 expect_signer.as_deref(),
             )?;
+            if expect_signer.is_none() {
+                // Any valid signature opens without a pin. That is a silent
+                // downgrade on a governance tool, so say so on stderr.
+                eprintln!("note: opened WITHOUT --expect-signer; any valid signature was accepted");
+            }
             println!(
                 "verified embargo bundle from {}: {} changes, held until {} for {} recipient(s)",
                 verified.signer,

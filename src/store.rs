@@ -1567,13 +1567,29 @@ impl Store {
             let _ =
                 self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
         })?;
+        // For a governance tool the log has to answer "who sealed what, for
+        // whom, under which policy" after the fact. The signer and recipients
+        // are recorded as RESOLVED fingerprints, not as the policy strings,
+        // because the keyring may have changed since; the artifact is
+        // digested so a substituted file at the same path is detectable; and
+        // the policy key ties the event to the visibility.toml in force, so a
+        // later widening of `embargo_recipients` is visible.
+        let digest = std::fs::read(out)
+            .map(|bytes| crate::court::fnv1a(&bytes))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        let resolved_signer = resolve_key(&signer);
+        let resolved_recipients: Vec<String> = recipients.iter().map(|r| resolve_key(r)).collect();
         self.log_seal_event(
             "embargo-sealed",
             serde_json::json!({
                 "signer": signer,
+                "signer_fpr": resolved_signer,
                 "recipients": recipients,
+                "recipients_fpr": resolved_recipients,
                 "changes": exported.len(),
                 "artifact": out.display().to_string(),
+                "artifact_fnv1a": digest,
+                "policy_key": policy.audit_key(),
             }),
         )
         .inspect_err(|_| {
@@ -1608,7 +1624,7 @@ impl Store {
         // make it 0666 & ~umask, so the full plaintext history would sit
         // world-readable in the artifact's parent if it were left to tar.
         let tar_file = create_private(tar_path)?;
-        run(Command::new(tar_bin())
+        run(Command::new(tar_bin().map_err(anyhow::Error::msg)?)
             .args(["-cf"])
             .arg(tar_file.as_os_str())
             .arg("-C")
@@ -1622,7 +1638,7 @@ impl Store {
             )
             .arg("--")
             .arg(staging.file_name().unwrap_or_default()))?;
-        let mut gpg = Command::new(gpg_bin());
+        let mut gpg = Command::new(gpg_bin().map_err(anyhow::Error::msg)?);
         gpg.args([
             "--batch",
             "--yes",
@@ -2809,6 +2825,23 @@ pub fn validate_tree_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a key reference to a full fingerprint where possible, so the audit
+/// log records an identity rather than a string the keyring can change.
+fn resolve_key(entry: &str) -> String {
+    let out = Command::new(gpg_bin().unwrap_or_else(|_| "gpg".to_string()))
+        .args(["--list-keys", "--with-colons", "--", entry])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find(|l| l.starts_with("fpr:"))
+            .and_then(|l| l.split(':').nth(9))
+            .unwrap_or(entry)
+            .to_string(),
+        _ => entry.to_string(),
+    }
+}
+
 /// Run a command and hand back its stdout, for callers that read a value
 /// rather than just checking the exit status.
 fn run_stdout(cmd: &mut Command) -> Result<String> {
@@ -2873,13 +2906,21 @@ fn run(cmd: &mut Command) -> Result<()> {
 /// `OOT_GPG` pins an absolute path. Without it the name is resolved against
 /// `PATH` as before, so nothing changes for anyone who has not set it, and
 /// the env override is the documented answer rather than a silent assumption.
-fn gpg_bin() -> String {
-    std::env::var("OOT_GPG").unwrap_or_else(|_| "gpg".to_string())
+fn gpg_bin() -> std::result::Result<String, &'static str> {
+    match std::env::var("OOT_GPG") {
+        Ok(v) if v.trim().is_empty() => Err("OOT_GPG is set but empty"),
+        Ok(v) => Ok(v),
+        Err(_) => Ok("gpg".to_string()),
+    }
 }
 
 /// The tar used for bundle packing and extraction, for the same reason.
-fn tar_bin() -> String {
-    std::env::var("OOT_TAR").unwrap_or_else(|_| "tar".to_string())
+fn tar_bin() -> std::result::Result<String, &'static str> {
+    match std::env::var("OOT_TAR") {
+        Ok(v) if v.trim().is_empty() => Err("OOT_TAR is set but empty"),
+        Ok(v) => Ok(v),
+        Err(_) => Ok("tar".to_string()),
+    }
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -2932,6 +2973,7 @@ fn strip_signature_block(message: &str) -> String {
 /// as building plaintext; unknown trust is fine because the encrypt step
 /// runs with `--trust-model always` — the recipients named in the policy
 /// are the authorization.
+#[derive(PartialEq, Eq)]
 enum GpgKeyState {
     Found,
     Unusable(&'static str),
@@ -2939,7 +2981,7 @@ enum GpgKeyState {
 }
 
 fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
-    let out = Command::new(gpg_bin())
+    let out = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
         .args(["--list-keys", "--with-colons", "--", entry])
         .output()
         .map_err(|e| {
@@ -2949,18 +2991,35 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
         return Ok(GpgKeyState::Missing);
     }
     let mut state = GpgKeyState::Missing;
+    // The primary's own validity, then every subkey: gpg encrypts to a
+    // SUBKEY, so a live primary with a dead encryption subkey used to pass
+    // here and only fail once the full unfiltered history was on disk.
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.first() == Some(&"pub") && fields.len() > 1 {
-            state = match fields[1] {
-                "r" => GpgKeyState::Unusable("revoked"),
-                "e" => GpgKeyState::Unusable("expired"),
-                "d" => GpgKeyState::Unusable("disabled"),
-                _ => GpgKeyState::Found,
-            };
-            if matches!(state, GpgKeyState::Found) {
-                break;
+        let unusable = |v: &str| match v {
+            "r" => Some("revoked"),
+            "e" => Some("expired"),
+            "d" => Some("disabled"),
+            _ => None,
+        };
+        match fields.first() {
+            Some(&"pub") if fields.len() > 1 => {
+                if let Some(why) = unusable(fields[1]) {
+                    return Ok(GpgKeyState::Unusable(why));
+                }
+                state = GpgKeyState::Found;
             }
+            Some(&"sub") if fields.len() > 1 => {
+                if state == GpgKeyState::Missing {
+                    // A subkey record with no primary in front of it should
+                    // not happen; refuse rather than guess.
+                    return Ok(GpgKeyState::Missing);
+                }
+                if let Some(why) = unusable(fields[1]) {
+                    return Ok(GpgKeyState::Unusable(why));
+                }
+            }
+            _ => {}
         }
     }
     Ok(state)
@@ -3097,12 +3156,13 @@ pub struct VerifiedBundle {
 /// output, and any `BADSIG`/`ERRSIG`/`EXPSIG`/`EXPKEYSIG`/`REVKEYSIG`/
 /// `KEYREVOKED` marker refuses the open even beside a `VALIDSIG`.
 ///
-/// That marker list is what gpg actually emits, which is a narrower claim
-/// than "an expired signer cannot open this": gpg 2.4 emits no expiry
-/// marker for a key that expired *after* signing, so such a bundle still
-/// opens. That matches OpenPGP — a signature made while the key was live
-/// stays good — and is why expiry is enforced on the seal side, where the
-/// key still has to be usable.
+/// gpg emits `EXPKEYSIG` for a signing key that has since expired, even
+/// though the signature itself was made while the key was live, and that
+/// marker refuses the open like any other. So a bundle DOES become
+/// unopenable when its signer's key expires: seal under a key whose lifetime
+/// outlasts the embargo, and expect to re-seal rather than to keep opening an
+/// old artifact. (Verified against gpg 2.4.9 with a key that expired four
+/// seconds after signing.)
 ///
 /// `expect_signer` accepts either fingerprint gpg reports: the signing
 /// subkey, or the primary an operator reads off `gpg --fingerprint` and
@@ -3199,7 +3259,7 @@ pub fn embargo_verify(
             return Err(e);
         }
     };
-    let decrypt = Command::new(gpg_bin())
+    let decrypt = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
         .args([
             "--batch",
             "--yes",
@@ -3305,7 +3365,7 @@ pub fn embargo_verify(
         // unpacked, and extraction refuses to overwrite: hostile tars stay
         // outside and cannot exhaust the recipient's disk.
         check_tar_members(&tmp_tar)?;
-        run(Command::new(tar_bin())
+        run(Command::new(tar_bin().map_err(anyhow::Error::msg)?)
             .arg("--extract")
             .arg("--keep-old-files")
             .arg("--file")
@@ -3344,6 +3404,15 @@ pub fn embargo_verify(
             return Err(e);
         }
     };
+    // The seal side proves the bundle stands alone before it ships. Prove it
+    // again here: the recipient is about to be told to run `git log`, and a
+    // bundle whose objects did not travel would report success and then fail
+    // on that command. A stripped or partial bundle is a refusal, not a
+    // footnote.
+    if let Err(e) = check_bundle_history(&manifest_path, &manifest) {
+        let _ = std::fs::remove_dir_all(out_dir);
+        return Err(e);
+    }
     let embargo_until = manifest
         .get("embargo_until")
         .and_then(|v| v.as_str())
@@ -3406,7 +3475,7 @@ enum GpgSecretState {
 }
 
 fn gpg_secret_key_state(entry: &str) -> Result<GpgSecretState> {
-    let out = Command::new(gpg_bin())
+    let out = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
         .args(["--list-secret-keys", "--with-colons", "--", entry])
         .output()
         .map_err(|e| {
@@ -3447,6 +3516,52 @@ fn is_plain_dir(path: &Path) -> bool {
         std::fs::symlink_metadata(path).map(|m| (m.file_type().is_symlink(), m.is_dir())),
         Ok((false, true))
     )
+}
+
+/// Check that the received repo can actually deliver the history the manifest
+/// claims: the repo exists, its objects are all present, and every sha the
+/// manifest names resolves inside it.
+fn check_bundle_history(manifest_path: &Path, manifest: &serde_json::Value) -> Result<()> {
+    let root = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("MANIFEST.json has no parent directory"))?;
+    let repo = root.join("repo");
+    if !is_plain_dir(&repo) {
+        bail!(
+            "bundle has no repo/ directory next to {}; nothing to read",
+            manifest_path.display()
+        );
+    }
+    // Every object reachable from every ref must be present. `--missing=error`
+    // is what catches a missing blob, which `rev-list --all` alone does not.
+    run_stdout(Command::new("git").arg("-C").arg(&repo).args([
+        "rev-list",
+        "--objects",
+        "--all",
+        "--missing=error",
+    ]))
+    .context("bundle history is incomplete")?;
+    // And each change the manifest names must resolve, so a manifest that
+    // overstates the contents cannot pass either.
+    let shas: Vec<String> = manifest
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.get("sha").and_then(|s| s.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for sha in &shas {
+        run_stdout(Command::new("git").arg("-C").arg(&repo).args([
+            "cat-file",
+            "-e",
+            &format!("{sha}^{{commit}}"),
+        ]))
+        .with_context(|| format!("bundle is missing the change {sha}"))?;
+    }
+    Ok(())
 }
 
 /// Locate the bundle's MANIFEST.json: at the root (a `--plain` layout) or
@@ -3633,7 +3748,7 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
     }
     // Then names and types, via tar itself so long-name and pax encodings
     // are interpreted correctly instead of guessed at.
-    let listing = Command::new(tar_bin())
+    let listing = Command::new(tar_bin().map_err(anyhow::Error::msg)?)
         .arg("--list")
         .arg("--verbose")
         .arg("--numeric-owner")
