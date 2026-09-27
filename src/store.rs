@@ -3085,9 +3085,13 @@ pub fn embargo_verify(
         bail!("output already exists: {}", out_dir.display());
     }
     if let Some(expected) = expect_signer {
-        let norm: String = expected.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        // Normalizing first means a `0x` prefix or spaces do not silently
+        // shorten the pin below what the operator asked to check.
+        let norm = normalize_keyid(expected);
         if norm.len() < 16 {
-            bail!("--expect-signer needs at least 16 hex chars");
+            bail!(
+                "--expect-signer needs at least 16 hex chars (a full 40-character fingerprint is much better; got {expected:?})"
+            );
         }
     }
     if let Some(parent) = out_dir.parent() {
@@ -3185,41 +3189,50 @@ pub fn embargo_verify(
         let _ = std::fs::remove_dir_all(out_dir);
         bail!("gpg reported a failed signature status (refusing to open): {bad}");
     }
-    let Some(signing_key) = status.signing_key.clone() else {
+    if status.signatures.is_empty() {
         cleanup();
         let _ = std::fs::remove_dir_all(out_dir);
         bail!("gpg reported no valid signature (refusing to open)");
-    };
+    }
     if !status.decrypted_ok {
         cleanup();
         let _ = std::fs::remove_dir_all(out_dir);
         bail!("gpg reported no DECRYPTION_OKAY (refusing to open)");
     }
+    // Pin against every signature gpg reported, not just the last: a
+    // co-signed bundle is legitimate, and naming the first signer must open
+    // it. The subkey and the primary both count, because an operator's
+    // `gpg --fingerprint` output names the primary and that is what
+    // visibility.toml records.
     if let Some(expected) = expect_signer {
-        let norm = |s: &str| {
-            s.chars()
-                .filter(|c| c.is_ascii_hexdigit())
-                .collect::<String>()
-                .to_uppercase()
-        };
-        let want = norm(expected);
-        // Either the signing subkey or the primary fingerprint satisfies
-        // the pin: an operator's `gpg --fingerprint` output names the
-        // primary, and that is what visibility.toml records.
-        let candidates = [
-            Some(norm(&signing_key)),
-            status.primary_key.as_deref().map(norm),
-        ];
-        let matched = candidates.iter().flatten().any(|got| got.ends_with(&want));
+        let want = normalize_keyid(expected);
+        let matched = status.signatures.iter().any(|(sub, primary)| {
+            normalize_keyid(sub).ends_with(&want)
+                || primary
+                    .as_deref()
+                    .is_some_and(|p| normalize_keyid(p).ends_with(&want))
+        });
         if !matched {
             cleanup();
             let _ = std::fs::remove_dir_all(out_dir);
-            bail!("signer mismatch: bundle signed by {signing_key}, expected {expected}");
+            let signers: Vec<String> = status
+                .signatures
+                .iter()
+                .map(|(s, p)| p.clone().unwrap_or_else(|| s.clone()))
+                .collect();
+            bail!(
+                "signer mismatch: bundle signed by {}, expected {expected}",
+                signers.join(", ")
+            );
         }
     }
     // Report the primary fingerprint when gpg gave one: that is the stable
     // identity an operator records, and it is what a subkey pin resolves to.
-    let signer = status.primary_key.unwrap_or(signing_key);
+    let signer = status
+        .signatures
+        .first()
+        .and_then(|(_, p)| p.clone())
+        .unwrap_or_else(|| status.signatures[0].0.clone());
     if let Err(e) = (|| -> Result<()> {
         // Bounds and member policy are checked before a single byte is
         // unpacked, and extraction refuses to overwrite: hostile tars stay
@@ -3405,11 +3418,10 @@ const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// What gpg's `--status-fd` said about an opened bundle.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GpgStatus {
-    /// VALIDSIG field 1: the key that actually made the signature, which is
-    /// a signing subkey for most modern keys.
-    signing_key: Option<String>,
-    /// The final VALIDSIG field: the primary key fingerprint.
-    primary_key: Option<String>,
+    /// Every VALIDSIG gpg reported, as (signing subkey, primary). A bundle
+    /// can carry more than one signature, and a pin that only ever saw the
+    /// last one would refuse a co-signed bundle naming the first.
+    signatures: Vec<(String, Option<String>)>,
     /// Whether decryption completed.
     decrypted_ok: bool,
     /// A bad/expired/revoked signature marker, if gpg emitted one. Any of
@@ -3421,21 +3433,39 @@ struct GpgStatus {
 /// Parse gpg's status output. Pure, so the rules are unit-testable without
 /// a live keyring: an expired or revoked signer is awkward to stage on
 /// demand (gpg has no scriptable revoke), but its status line is just text.
+/// Reduce a key id to uppercase hex for comparison, so a fingerprint pasted
+/// with spaces, in lowercase, or with a `0x` prefix (the form
+/// `gpg --list-keys --keyid-format 0x` prints) still matches instead of
+/// reading as a mysterious mismatch.
+fn normalize_keyid(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    body.chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase()
+}
+
 fn parse_gpg_status(raw: &str) -> GpgStatus {
     let mut out = GpgStatus::default();
     for line in raw.lines() {
         let line = line.strip_prefix("[GNUPG:] ").unwrap_or(line);
         if let Some(rest) = line.strip_prefix("VALIDSIG ") {
             let mut fields = rest.split_whitespace();
-            out.signing_key = fields.next().map(str::to_string);
+            let subkey = fields.next().map(str::to_string);
             // The primary key fingerprint is the final field. After
             // `VALIDSIG <subkey>` the line is
             // `date ts expire version reserved pubkeyalgo hashalgo sigclass
             // <primary-fpr>`, i.e. token index 9 counting the subkey as 0.
-            if let Some(primary) = fields.nth(8) {
-                if is_hex_keyid(primary) {
-                    out.primary_key = Some(primary.to_string());
-                }
+            let primary = fields
+                .nth(8)
+                .filter(|p| is_hex_keyid(p))
+                .map(str::to_string);
+            if let Some(subkey) = subkey {
+                out.signatures.push((subkey, primary));
             }
         } else if line.starts_with("DECRYPTION_OKAY") {
             out.decrypted_ok = true;
@@ -3669,14 +3699,15 @@ mod tests {
         let st = parse_gpg_status(raw);
         assert_eq!(st.bad_marker, None);
         assert!(st.decrypted_ok);
+        assert_eq!(st.signatures.len(), 1, "one signature reported");
         // Field 1 is the signing subkey...
         assert_eq!(
-            st.signing_key.as_deref(),
-            Some("91044FBA76C9ED15AB14573589CAA03782C3251F")
+            st.signatures[0].0,
+            "91044FBA76C9ED15AB14573589CAA03782C3251F"
         );
         // ...and the last field is the primary an operator would pin.
         assert_eq!(
-            st.primary_key.as_deref(),
+            st.signatures[0].1.as_deref(),
             Some("D34A9B0A08FFB8619ABEBC095D9B8736695F8C9D")
         );
     }
@@ -3702,7 +3733,7 @@ mod tests {
             let st = parse_gpg_status(&raw);
             assert_eq!(st.bad_marker.as_deref(), Some(marker), "must flag {marker}");
             // The fingerprint is still parsed, so the error can name it.
-            assert!(st.signing_key.is_some());
+            assert!(!st.signatures.is_empty());
             assert!(st.decrypted_ok);
         }
     }
@@ -3718,7 +3749,7 @@ mod tests {
         let st = parse_gpg_status(raw);
         assert_eq!(st.bad_marker, None);
         assert!(st.decrypted_ok);
-        assert_eq!(st.signing_key, None, "no signature was reported");
+        assert!(st.signatures.is_empty(), "no signature was reported");
     }
 
     /// A stat error is not "absent". `symlink_metadata` failing for a reason
@@ -3798,6 +3829,54 @@ mod tests {
         std::fs::set_permissions(stuck.join("inner"), std::fs::Permissions::from_mode(0o700))
             .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A co-signed bundle reports one VALIDSIG per signature, and the pin
+    /// has to be checked against all of them. Last-wins would refuse a
+    /// bundle whose FIRST signer is the one the operator named.
+    #[test]
+    fn test_parse_gpg_status_keeps_every_signature() {
+        let (aaaa, bbbb) = ("A".repeat(40), "B".repeat(40));
+        let raw = format!(
+            "[GNUPG:] VALIDSIG 1111111111111111111111111111111111111111 \
+             2026-09-26 1 0 4 0 1 10 00 {aaaa}\n\
+             [GNUPG:] VALIDSIG 2222222222222222222222222222222222222222 \
+             2026-09-26 1 0 4 0 1 10 00 {bbbb}\n\
+             [GNUPG:] DECRYPTION_OKAY\n"
+        );
+        let st = parse_gpg_status(&raw);
+        assert_eq!(st.signatures.len(), 2, "both signatures must survive");
+        assert_eq!(st.signatures[0].1.as_deref(), Some(aaaa.as_str()));
+        assert_eq!(st.signatures[1].1.as_deref(), Some(bbbb.as_str()));
+        assert!(st.decrypted_ok);
+        assert_eq!(st.bad_marker, None);
+    }
+
+    /// `gpg --list-keys --keyid-format 0x` prints `0x`-prefixed ids, and
+    /// fingerprints get pasted with spaces. Normalizing must not shorten a
+    /// pin into reading as a mismatch.
+    #[test]
+    fn test_normalize_keyid_tolerates_pasted_forms() {
+        let bare = "D34A9B0A08FFB8619ABEBC095D9B8736695F8C9";
+        for pasted in [
+            bare.to_string(),
+            bare.to_lowercase(),
+            format!("0x{bare}"),
+            format!("0X{bare}"),
+            format!("  {bare}  "),
+            // Fingerprints get pasted out of `gpg --fingerprint` in groups.
+            bare.as_bytes()
+                .chunks(4)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
+        ] {
+            assert_eq!(normalize_keyid(&pasted), bare, "pasted: {pasted:?}");
+        }
+        // A suffix pin still matches on the normalized form.
+        let tail = &bare[bare.len() - 16..];
+        assert!(normalize_keyid(&format!("0x{tail}")).ends_with(tail));
     }
 
     /// The guard may only be armed on paths Oot owns. Arming over a
