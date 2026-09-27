@@ -269,3 +269,91 @@ fn test_seal_into_readonly_parent_fails_cleanly() {
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The bundle must stand alone. `replay` borrows the store's objects through
+/// `alternates`, an absolute path that means nothing on a maintainer's
+/// machine, so the seal has to fold the objects in and cut the link. If it
+/// does not, the recipient gets a repo whose history is unreadable while
+/// `embargo-verify` happily reports success.
+#[test]
+fn test_sealed_bundle_is_self_contained() {
+    let tmp = scratch("selfcontained");
+    let (gpg_home, key_id) = make_test_key();
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    // Several commits, so there is real history to lose. They must all be
+    // committed BEFORE the import, or the store never sees them.
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    for i in 0..4 {
+        std::fs::write(src.join("README.md"), format!("v{i}\n")).unwrap();
+        git(&src, &["add", "."]);
+        git(&src, &["commit", "-m", &format!("change {i}")]);
+    }
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{key_id}\"]\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "seal failed: {msg}");
+
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "verify failed: {msg}");
+
+    let repo = received.join("bundle/repo");
+    assert!(
+        !repo.join(".git/objects/info/alternates").exists(),
+        "a bundle that borrows the sender's odb is unreadable off-machine"
+    );
+
+    // Hide the store, then read the history: this is what a maintainer has.
+    let hidden = tmp.join("hidden-store");
+    std::fs::rename(proj.join(".oot/objects.git"), &hidden).unwrap();
+    let head = git(&repo, &["rev-parse", "HEAD"]);
+    let log = git(&repo, &["log", "--oneline"]);
+    let packed = git(&repo, &["count-objects", "-v"]);
+    std::fs::rename(&hidden, proj.join(".oot/objects.git")).unwrap();
+
+    assert!(!head.is_empty(), "the received repo must have a HEAD");
+    assert_eq!(
+        log.lines().count(),
+        4,
+        "every change must travel with the bundle: {log}"
+    );
+    assert!(
+        log.contains("change 3") && log.contains("change 0"),
+        "messages must survive the handoff: {log}"
+    );
+    assert!(
+        !packed.contains("in-pack: 0"),
+        "objects must be packed into the bundle, not borrowed: {packed}"
+    );
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

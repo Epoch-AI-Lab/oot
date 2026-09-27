@@ -1319,6 +1319,38 @@ impl Store {
         Ok(exported)
     }
 
+    /// Make `repo` self-contained: fold every object reachable from its
+    /// refs into its own object database, then drop the `alternates` link
+    /// that borrowed them from the store.
+    ///
+    /// `git repack -a -d` includes objects reached through `alternates`, so
+    /// one command plus deleting the file is enough. A bundle that keeps
+    /// the link is a bundle whose history is unreadable off this machine.
+    fn detach_alternates(&self, repo: &Path) -> Result<()> {
+        run(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["repack", "-a", "-d"]))?;
+        // `repack` leaves a stale alternates file behind on some paths, and
+        // an absolute path to the sender's store is meaningless elsewhere.
+        let alt = repo.join(".git/objects/info/alternates");
+        if alt.exists() {
+            std::fs::remove_file(&alt)?;
+        }
+        // Prove the bundle stands alone: with the store unreachable, every
+        // ref must still resolve to a real object.
+        let heads = run_stdout(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-list", "--all"]),
+        )?;
+        if heads.trim().is_empty() {
+            bail!("bundle has no reachable history after detaching objects");
+        }
+        Ok(())
+    }
+
     /// Build a maintainer-only embargo bundle: full history with nothing
     /// withheld, plus dockets, export log, and a MANIFEST naming who gets it.
     /// Oot writes the plain bundle here; sealing happens in
@@ -1367,6 +1399,12 @@ impl Store {
         if let Some((first, _)) = pointed.branches.first() {
             self.point_head(&repo_dir, first)?;
         }
+        // The bundle leaves this machine, so it must not borrow objects:
+        // `replay` attaches the store's odb through `alternates`, an
+        // absolute path that means nothing on a maintainer's box. Repack
+        // folds everything reachable into this repo and the link is cut,
+        // so `git log` works on the far side with the store gone.
+        self.detach_alternates(&repo_dir)?;
         // Sidecars travel with the bundle so maintainers can audit it.
         // Copy after logging: the bundle copy must hold this run's events.
         // Commit text can name private paths while blobs stay clean.
@@ -2745,6 +2783,22 @@ pub fn validate_tree_path(path: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Run a command and hand back its stdout, for callers that read a value
+/// rather than just checking the exit status.
+fn run_stdout(cmd: &mut Command) -> Result<String> {
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run {}", cmd.get_program().to_string_lossy()))?;
+    if !output.status.success() {
+        bail!(
+            "{} failed: {}",
+            cmd.get_program().to_string_lossy(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
 fn run(cmd: &mut Command) -> Result<()> {
