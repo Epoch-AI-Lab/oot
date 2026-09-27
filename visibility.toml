@@ -18,8 +18,29 @@ private_paths = [".env", "secrets/", ".pem"]
 # `embargo_recipients` names who may receive a sealed `embargo-bundle`;
 # entries are GPG key references (email or fingerprint) resolved against
 # the local keyring — Oot never fetches keys, import them with `gpg --import`.
-# Empty means bundle refuses. The sealed artifact is signed with
-# `resign_key_id` (or `--signer`) and Oot never sends it.
+# Untrusted-but-imported keys seal fine (--trust-model always: the policy
+# is the authorization); expired/revoked/disabled keys refuse. Empty means
+# bundle refuses. The sealed artifact is signed with `resign_key_id` or
+# `--signer` — either one needs a usable *secret* key in the local keyring —
+# and Oot never sends it: move the `.tar.gpg` out of band yourself, and the
+# recipient opens it with
+# `oot embargo-verify --artifact <file> --out <dir> --expect-signer <FPR>`.
+# The pin takes the primary fingerprint, the signing subkey, or a trailing
+# key id of 16+ hex chars; the recipient also needs a secret key.
+# Every authenticity claim here reduces to the `gpg` binary, so set
+# `OOT_GPG` (and `OOT_TAR`) to absolute paths if PATH is not trustworthy.
+# The recipient's `embargo-verify` appends both opens and refusals to
+# `oot-verify-log.jsonl` beside `--out`, with a digest of the artifact.
+#
+# Bundle layout: `--plain` writes the directory itself (repo/ + MANIFEST.json
+# + dockets/ + logs, audit-local only); sealed artifacts unpack to
+# `<out>/<staging>/` with the same contents. MANIFEST.json holds
+# `{embargo_until, recipients[], changes[][{change, sha}]}`; verify adds the
+# VALIDSIG signer to its report. Preconditions to seal, in the order the
+# checks fire: policy file present, `embargo_until` today or later, an
+# `--out` path that does not exist, a signer (`resign_key_id` or
+# `--signer`) whose secret key is usable, non-empty `embargo_recipients`,
+# and a non-empty store.
 
 # Rebuilt commits ship unsigned; set `resign_key_id` to a maintainer GPG
 # key id to re-sign them on filtered export. Clean commits keep their own sigs.

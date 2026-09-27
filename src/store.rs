@@ -1319,17 +1319,61 @@ impl Store {
         Ok(exported)
     }
 
+    /// Make `repo` self-contained: fold every object reachable from its
+    /// refs into its own object database, then drop the `alternates` link
+    /// that borrowed them from the store.
+    ///
+    /// `git repack -a -d` includes objects reached through `alternates`, so
+    /// one command plus deleting the file is enough. A bundle that keeps
+    /// the link is a bundle whose history is unreadable off this machine.
+    fn detach_alternates(&self, repo: &Path) -> Result<()> {
+        run(Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["repack", "-a", "-d"]))?;
+        // `repack` leaves a stale alternates file behind on some paths, and
+        // an absolute path to the sender's store is meaningless elsewhere.
+        let alt = repo.join(".git/objects/info/alternates");
+        // `exists` follows links, so a dangling one would be tarred into the
+        // bundle and break the far side; the same `symlink_metadata` rule the
+        // rest of this path uses.
+        if std::fs::symlink_metadata(&alt).is_ok() {
+            std::fs::remove_file(&alt)?;
+        }
+        // Prove the bundle stands alone: every object reachable from every
+        // ref must be present, not just the commits. `rev-list --all` walks
+        // commits only, so a bundle missing a blob sails past it.
+        run_stdout(Command::new("git").arg("-C").arg(repo).args([
+            "rev-list",
+            "--objects",
+            "--all",
+            "--missing=error",
+        ]))?;
+        let heads = run_stdout(
+            Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(["rev-list", "--all"]),
+        )?;
+        if heads.trim().is_empty() {
+            bail!("bundle has no reachable history after detaching objects");
+        }
+        Ok(())
+    }
+
     /// Build a maintainer-only embargo bundle: full history with nothing
-    /// withheld, plus dockets, export log, and a MANIFEST naming who gets it.
-    /// Oot writes the plain bundle. Sealing and sending belong to git-crypt
-    /// or a key service, never to Oot.
+    /// withheld, plus dockets, export log, and a MANIFEST.json naming who
+    /// gets it.
+    /// Oot writes the plain bundle here; sealing happens in
+    /// `embargo_bundle_sealed` through the gpg binary (same shell-out
+    /// model as git). Sending stays with the courier: Oot never sends.
     pub fn embargo_bundle(
         &self,
         out_dir: &Path,
         policy: &VisibilityPolicy,
     ) -> Result<Vec<(String, String)>> {
         if !policy.is_under_embargo() {
-            bail!("no active embargo: bundle needs embargo_until in the future");
+            bail!("no active embargo: bundle needs embargo_until today or later");
         }
         let recipients: Vec<String> = policy
             .embargo_recipients
@@ -1340,6 +1384,7 @@ impl Store {
         if recipients.is_empty() {
             bail!("embargo bundle refused: embargo_recipients is empty");
         }
+        refuse_symlink(out_dir, "bundle directory path")?;
         if out_dir.exists() {
             bail!("bundle directory already exists: {}", out_dir.display());
         }
@@ -1365,6 +1410,12 @@ impl Store {
         if let Some((first, _)) = pointed.branches.first() {
             self.point_head(&repo_dir, first)?;
         }
+        // The bundle leaves this machine, so it must not borrow objects:
+        // `replay` attaches the store's odb through `alternates`, an
+        // absolute path that means nothing on a maintainer's box. Repack
+        // folds everything reachable into this repo and the link is cut,
+        // so `git log` works on the far side with the store gone.
+        self.detach_alternates(&repo_dir)?;
         // Sidecars travel with the bundle so maintainers can audit it.
         // Copy after logging: the bundle copy must hold this run's events.
         // Commit text can name private paths while blobs stay clean.
@@ -1428,8 +1479,9 @@ impl Store {
         signer_override: Option<&str>,
     ) -> Result<Vec<(String, String)>> {
         if !policy.is_under_embargo() {
-            bail!("no active embargo: bundle needs embargo_until in the future");
+            bail!("no active embargo: bundle needs embargo_until today or later");
         }
+        refuse_symlink(out, "bundle artifact path")?;
         if out.exists() {
             bail!("bundle artifact already exists: {}", out.display());
         }
@@ -1465,6 +1517,17 @@ impl Store {
                 GpgKeyState::Missing => refused.push(format!("{r} (no key in keyring)")),
             }
         }
+        // The signer needs a usable secret key too: discovering its absence
+        // at `gpg --sign` time would waste a full plaintext build first.
+        match gpg_secret_key_state(&signer)? {
+            GpgSecretState::Usable => {}
+            GpgSecretState::Unusable(why) => {
+                refused.push(format!("{signer} ({why} signing key)"));
+            }
+            GpgSecretState::Missing => {
+                refused.push(format!("{signer} (no signing key in keyring)"));
+            }
+        }
         if !refused.is_empty() {
             self.log_seal_event("seal-refused", serde_json::json!({ "unresolved": refused }))?;
             bail!(
@@ -1481,27 +1544,69 @@ impl Store {
         let mut tar_name = staging.as_os_str().to_os_string();
         tar_name.push(".tar");
         let tar_path = std::path::PathBuf::from(tar_name);
+        // `--out x.tar` derives staging `x` and tar `x.tar`, which IS the
+        // artifact. gpg happens to fail on that today; refuse it outright
+        // rather than depend on someone else's binary being careful.
+        if tar_path == out {
+            bail!(
+                "refusing to seal: --out {} derives its own tar name; name the artifact *.tar.gpg",
+                out.display()
+            );
+        }
         // The staging dir holds the full unfiltered history and the tar is
         // plaintext too: the guard removes both on every exit path — return,
-        // error, or panic — so plaintext never outlives the command.
-        let guard = PlaintextGuard {
-            paths: vec![staging.clone(), tar_path.clone()],
-        };
+        // error, or panic — so plaintext never outlives the command. Arming
+        // proves both paths are absent first, so a refusal never deletes
+        // data the user already had at the predicted staging/tar names.
+        let guard = PlaintextGuard::arm(vec![staging.clone(), tar_path.clone()])?;
         let result = self.build_and_seal(&staging, &tar_path, out, policy, &signer, &recipients);
         let exported = result.inspect_err(|e| {
+            // The artifact did not exist on entry: a partial file from a
+            // failed seal must not linger where an operator could ship it.
+            let _ = std::fs::remove_file(out);
             let _ =
                 self.log_seal_event("seal-failed", serde_json::json!({ "error": e.to_string() }));
         })?;
+        // For a governance tool the log has to answer "who sealed what, for
+        // whom, under which policy" after the fact. The signer and recipients
+        // are recorded as RESOLVED fingerprints, not as the policy strings,
+        // because the keyring may have changed since; the artifact is
+        // digested so a substituted file at the same path is detectable; and
+        // the policy key ties the event to the visibility.toml in force, so a
+        // later widening of `embargo_recipients` is visible.
+        let digest = std::fs::read(out)
+            .map(|bytes| crate::court::fnv1a(&bytes))
+            .unwrap_or_else(|_| "unreadable".to_string());
+        let resolved_signer = resolve_key(&signer);
+        let resolved_recipients: Vec<String> = recipients.iter().map(|r| resolve_key(r)).collect();
         self.log_seal_event(
             "embargo-sealed",
             serde_json::json!({
                 "signer": signer,
+                "signer_fpr": resolved_signer,
                 "recipients": recipients,
+                "recipients_fpr": resolved_recipients,
                 "changes": exported.len(),
                 "artifact": out.display().to_string(),
+                "artifact_fnv1a": digest,
+                "policy_key": policy.audit_key(),
             }),
-        )?;
-        drop(guard);
+        )
+        .inspect_err(|_| {
+            // Fail closed: a sealed artifact with no audit event must not
+            // ship, so remove it when the log write fails.
+            let _ = std::fs::remove_file(out);
+        })?;
+        // Explicit cleanup, not just Drop: plaintext that outlives the
+        // command must fail the command, not print `sealed` and exit 0.
+        // Drop still runs afterwards and is a no-op once this succeeds.
+        let cleanup = guard.remove_now();
+        if cleanup.is_err() {
+            // Never hand back an artifact whose plaintext we could not
+            // remove: that is the one state an operator must never ship.
+            let _ = std::fs::remove_file(out);
+        }
+        cleanup?;
         Ok(exported)
     }
 
@@ -1515,20 +1620,25 @@ impl Store {
         recipients: &[String],
     ) -> Result<Vec<(String, String)>> {
         let exported = self.embargo_bundle(staging, policy)?;
-        run(Command::new("tar")
+        // Create the tar ourselves, 0600 from the first byte: `tar -cf` would
+        // make it 0666 & ~umask, so the full plaintext history would sit
+        // world-readable in the artifact's parent if it were left to tar.
+        let tar_file = create_private(tar_path)?;
+        run(Command::new(tar_bin().map_err(anyhow::Error::msg)?)
             .args(["-cf"])
-            .arg(tar_path)
+            .arg(tar_file.as_os_str())
             .arg("-C")
-            .arg(staging.parent().unwrap_or_else(|| Path::new(".")))
+            // A bare relative `--out` like `embargo.tar.gpg` has an empty
+            // parent, and `tar -C ""` fails outright.
+            .arg(
+                staging
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .arg("--")
             .arg(staging.file_name().unwrap_or_default()))?;
-        // The tar is plaintext: match the staging dir's 0700 stance on the
-        // file itself so the window before encryption is local-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(tar_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        let mut gpg = Command::new("gpg");
+        let mut gpg = Command::new(gpg_bin().map_err(anyhow::Error::msg)?);
         gpg.args([
             "--batch",
             "--yes",
@@ -1541,7 +1651,7 @@ impl Store {
         for r in recipients {
             gpg.args(["--recipient", r]);
         }
-        gpg.arg("--output").arg(out).arg(tar_path);
+        gpg.arg("--output").arg(out).arg("--").arg(tar_path);
         run(&mut gpg)?;
         Ok(exported)
     }
@@ -2715,6 +2825,60 @@ pub fn validate_tree_path(path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a key reference to a full fingerprint where possible, so the audit
+/// log records an identity rather than a string the keyring can change.
+fn resolve_key(entry: &str) -> String {
+    let out = Command::new(gpg_bin().unwrap_or_else(|_| "gpg".to_string()))
+        .args(["--list-keys", "--with-colons", "--", entry])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find(|l| l.starts_with("fpr:"))
+            .and_then(|l| l.split(':').nth(9))
+            .unwrap_or(entry)
+            .to_string(),
+        _ => entry.to_string(),
+    }
+}
+
+/// Run a command and hand back its stdout, for callers that read a value
+/// rather than just checking the exit status.
+fn run_stdout(cmd: &mut Command) -> Result<String> {
+    let output = cmd
+        .output()
+        .with_context(|| format!("failed to run {}", cmd.get_program().to_string_lossy()))?;
+    if !output.status.success() {
+        bail!(
+            "{} failed: {}",
+            cmd.get_program().to_string_lossy(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Create `path` as an empty file only its owner can read, and hand the path
+/// back to pass to a child process. `gpg --output` and `tar -cf` both create
+/// their target with 0666 & ~umask, so a caller that wants private plaintext
+/// has to make the file itself: `gpg --yes` keeps an existing file's mode,
+/// and `tar -cf` truncates an existing file rather than recreating it.
+fn create_private(path: &Path) -> Result<&Path> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?
+        .write_all(b"")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 fn run(cmd: &mut Command) -> Result<()> {
     let output = cmd
         .output()
@@ -2727,6 +2891,36 @@ fn run(cmd: &mut Command) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// The external tool Oot delegates to, resolved once.
+///
+/// Every authenticity claim in the embargo flow reduces to gpg: the signature
+/// check, the key pre-flight, the seal and the open. Resolving `gpg` from
+/// `PATH` means anything earlier on `PATH` can answer for it, and a shim
+/// that prints a `VALIDSIG` line unpacks whatever it likes. That needs local
+/// control of the environment, which is the same class of access as editing
+/// `.oot/` directly — but an operator handing this to a maintainer should not
+/// have to trust `PATH` as well.
+///
+/// `OOT_GPG` pins an absolute path. Without it the name is resolved against
+/// `PATH` as before, so nothing changes for anyone who has not set it, and
+/// the env override is the documented answer rather than a silent assumption.
+fn gpg_bin() -> std::result::Result<String, &'static str> {
+    match std::env::var("OOT_GPG") {
+        Ok(v) if v.trim().is_empty() => Err("OOT_GPG is set but empty"),
+        Ok(v) => Ok(v),
+        Err(_) => Ok("gpg".to_string()),
+    }
+}
+
+/// The tar used for bundle packing and extraction, for the same reason.
+fn tar_bin() -> std::result::Result<String, &'static str> {
+    match std::env::var("OOT_TAR") {
+        Ok(v) if v.trim().is_empty() => Err("OOT_TAR is set but empty"),
+        Ok(v) => Ok(v),
+        Err(_) => Ok("tar".to_string()),
+    }
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
@@ -2779,6 +2973,7 @@ fn strip_signature_block(message: &str) -> String {
 /// as building plaintext; unknown trust is fine because the encrypt step
 /// runs with `--trust-model always` — the recipients named in the policy
 /// are the authorization.
+#[derive(PartialEq, Eq)]
 enum GpgKeyState {
     Found,
     Unusable(&'static str),
@@ -2786,8 +2981,8 @@ enum GpgKeyState {
 }
 
 fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
-    let out = Command::new("gpg")
-        .args(["--list-keys", "--with-colons", entry])
+    let out = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
+        .args(["--list-keys", "--with-colons", "--", entry])
         .output()
         .map_err(|e| {
             anyhow::anyhow!("failed to run gpg ({e}); install gnupg to seal embargo bundles")
@@ -2796,18 +2991,35 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
         return Ok(GpgKeyState::Missing);
     }
     let mut state = GpgKeyState::Missing;
+    // The primary's own validity, then every subkey: gpg encrypts to a
+    // SUBKEY, so a live primary with a dead encryption subkey used to pass
+    // here and only fail once the full unfiltered history was on disk.
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let fields: Vec<&str> = line.split(':').collect();
-        if fields.first() == Some(&"pub") && fields.len() > 1 {
-            state = match fields[1] {
-                "r" => GpgKeyState::Unusable("revoked"),
-                "e" => GpgKeyState::Unusable("expired"),
-                "d" => GpgKeyState::Unusable("disabled"),
-                _ => GpgKeyState::Found,
-            };
-            if matches!(state, GpgKeyState::Found) {
-                break;
+        let unusable = |v: &str| match v {
+            "r" => Some("revoked"),
+            "e" => Some("expired"),
+            "d" => Some("disabled"),
+            _ => None,
+        };
+        match fields.first() {
+            Some(&"pub") if fields.len() > 1 => {
+                if let Some(why) = unusable(fields[1]) {
+                    return Ok(GpgKeyState::Unusable(why));
+                }
+                state = GpgKeyState::Found;
             }
+            Some(&"sub") if fields.len() > 1 => {
+                if state == GpgKeyState::Missing {
+                    // A subkey record with no primary in front of it should
+                    // not happen; refuse rather than guess.
+                    return Ok(GpgKeyState::Missing);
+                }
+                if let Some(why) = unusable(fields[1]) {
+                    return Ok(GpgKeyState::Unusable(why));
+                }
+            }
+            _ => {}
         }
     }
     Ok(state)
@@ -2816,34 +3028,99 @@ fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
 /// Removes plaintext artifacts (the staging dir and the intermediate tar)
 /// on every exit path — return, error, or panic — so the unfiltered history
 /// never outlives the command.
+///
+/// Armed only with paths Oot itself created. The caller must prove each
+/// path was absent (refusing symlinks and pre-existing files/dirs) before
+/// arming, because `Drop` cannot ask: a guard pointed at a path the user
+/// already had would delete their data on a clean refusal. `Drop` also
+/// re-checks with `symlink_metadata` so a swapped-in symlink is unlinked
+/// rather than followed.
+#[derive(Debug)]
 struct PlaintextGuard {
     paths: Vec<std::path::PathBuf>,
 }
 
-impl Drop for PlaintextGuard {
-    fn drop(&mut self) {
+impl PlaintextGuard {
+    /// Arm a guard only if every path is absent, symlinks included. A path
+    /// that already exists is reported and left untouched, so the command
+    /// refuses instead of destroying whatever lives there.
+    fn arm(paths: Vec<std::path::PathBuf>) -> Result<Self> {
+        for path in &paths {
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    let kind = if meta.file_type().is_symlink() {
+                        "symlink"
+                    } else if meta.is_dir() {
+                        "directory"
+                    } else {
+                        "file"
+                    };
+                    bail!(
+                        "refusing to seal: plaintext path already exists ({kind}): {}",
+                        path.display()
+                    );
+                }
+                // Absent is the only answer that lets the guard own it. Any
+                // other error (EACCES, ELOOP, ESTALE, ENFILE) means the state
+                // is unknown, and treating unknown as absent is how a guard
+                // ends up deleting something it did not create.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bail!(
+                    "refusing to seal: cannot inspect plaintext path {}: {e}",
+                    path.display()
+                ),
+            }
+        }
+        Ok(PlaintextGuard { paths })
+    }
+}
+
+impl PlaintextGuard {
+    /// Delete the guarded plaintext now, reporting any failure. `Drop`
+    /// cannot propagate an error, so the seal path calls this explicitly:
+    /// reporting `sealed` while plaintext survives is a lie, so a failed
+    /// cleanup must fail the command and delete the artifact too.
+    fn remove_now(&self) -> Result<()> {
+        // Attempt every path even after one fails: the tar holds the same
+        // plaintext as the staging dir, so abandoning it because the dir
+        // would not delete leaves the more portable copy behind.
+        let mut failures: Vec<String> = Vec::new();
         for path in &self.paths {
-            let result = if path.is_dir() {
+            // `symlink_metadata`, not `is_dir`: a link swapped in after
+            // arming must be unlinked, never traversed with remove_dir_all.
+            let is_dir = std::fs::symlink_metadata(path)
+                .map(|m| !m.file_type().is_symlink() && m.is_dir())
+                .unwrap_or(false);
+            let result = if is_dir {
                 std::fs::remove_dir_all(path)
             } else {
                 std::fs::remove_file(path)
             };
-            if let Err(e) = result {
-                if e.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!(
-                        "warning: could not remove plaintext {}: {e}",
-                        path.display()
-                    );
-                }
+            match result {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => failures.push(format!("{}: {e}", path.display())),
             }
         }
+        if !failures.is_empty() {
+            bail!("seal cleanup failed: {}", failures.join("; "));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for PlaintextGuard {
+    fn drop(&mut self) {
+        // `remove_now` already reported; here only best-effort so a normal
+        // early return never leaves plaintext behind.
+        let _ = self.remove_now();
     }
 }
 
 /// The staging dir for a sealed artifact: the artifact path with its
 /// extensions stripped, so extracting the tarball lands in a directory
 /// named like the bundle. `embargo-2099.tar.gpg` -> `embargo-2099/`.
-pub fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
+fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
     let name = out
         .file_stem()
         .and_then(|s| s.to_str())
@@ -2854,6 +3131,859 @@ pub fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
         .unwrap_or(Path::new("."))
         .to_path_buf()
         .join(name)
+}
+
+/// What the recipient learns from opening a sealed embargo bundle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedBundle {
+    /// Signing key fingerprint from gpg VALIDSIG.
+    pub signer: String,
+    /// Recipients named in MANIFEST.json.
+    pub recipients: Vec<String>,
+    /// Embargo date from MANIFEST.json, e.g. `2099-01-01`.
+    pub embargo_until: String,
+    /// Number of changes listed in MANIFEST.json.
+    pub changes: usize,
+}
+
+/// Open a sealed embargo bundle on the recipient side: decrypt with gpg
+/// (which also verifies the signature), unpack the tarball, and report
+/// the MANIFEST. Oot still never sends — the operator moves the artifact
+/// out of band over an existing secure channel; this only opens what
+/// arrived.
+///
+/// Both `VALIDSIG` and `DECRYPTION_OKAY` are required in gpg's status
+/// output, and any `BADSIG`/`ERRSIG`/`EXPSIG`/`EXPKEYSIG`/`REVKEYSIG`/
+/// `KEYREVOKED` marker refuses the open even beside a `VALIDSIG`.
+///
+/// gpg emits `EXPKEYSIG` for a signing key that has since expired, even
+/// though the signature itself was made while the key was live, and that
+/// marker refuses the open like any other. So a bundle DOES become
+/// unopenable when its signer's key expires: seal under a key whose lifetime
+/// outlasts the embargo, and expect to re-seal rather than to keep opening an
+/// old artifact. (Verified against gpg 2.4.9 with a key that expired four
+/// seconds after signing.)
+///
+/// `expect_signer` accepts either fingerprint gpg reports: the signing
+/// subkey, or the primary an operator reads off `gpg --fingerprint` and
+/// writes into `visibility.toml`. A full fingerprint, or a trailing key-id
+/// suffix of at least 16 hex chars, case-insensitive. A suffix is weaker
+/// than a fingerprint, so prefer the whole thing.
+///
+/// No network, no key fetch: both sides import keys out of band first. The
+/// intermediate plaintext tar is created 0600 and deleted; `out_dir` is
+/// chmod 0700, and every refusal path removes it rather than leaving
+/// decrypted history for the next run to trip over.
+pub fn embargo_verify(
+    artifact: &Path,
+    out_dir: &Path,
+    expect_signer: Option<&str>,
+) -> Result<VerifiedBundle> {
+    embargo_verify_audited(artifact, out_dir, expect_signer, None)
+}
+
+/// Open a bundle and write a recipient-side record of what happened.
+///
+/// The audit path defaults to a log beside the output tree and can be moved
+/// with `--audit-log`. Both outcomes are recorded: a refusal is exactly the
+/// event a maintainer will want to be able to show afterwards.
+///
+/// This log is written by the recipient, so it is a local record and not an
+/// authenticated one — it is evidence someone ran this, not proof from the
+/// sender. The artifact digest in each line is what binds a record to a
+/// specific file, so a claim can be checked against the artifact itself.
+pub fn embargo_verify_audited(
+    artifact: &Path,
+    out_dir: &Path,
+    expect_signer: Option<&str>,
+    audit_log: Option<&Path>,
+) -> Result<VerifiedBundle> {
+    let digest = std::fs::read(artifact)
+        .map(|b| crate::court::fnv1a(&b))
+        .unwrap_or_else(|_| "unreadable".to_string());
+    let log_path = audit_log.map(Path::to_path_buf).unwrap_or_else(|| {
+        out_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("oot-verify-log.jsonl")
+    });
+    match embargo_verify_inner(artifact, out_dir, expect_signer) {
+        Ok(v) => {
+            let _ = write_verify_record(
+                &log_path,
+                serde_json::json!({
+                    "event": "embargo-verified",
+                    "artifact": artifact.display().to_string(),
+                    "artifact_fnv1a": digest,
+                    "signer": v.signer,
+                    "signer_pinned": expect_signer.is_some(),
+                    "expected_signer": expect_signer,
+                    "embargo_until": v.embargo_until,
+                    "recipients": v.recipients,
+                    "changes": v.changes,
+                    "tree": out_dir.display().to_string(),
+                }),
+            );
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = write_verify_record(
+                &log_path,
+                serde_json::json!({
+                    "event": "embargo-verify-refused",
+                    "artifact": artifact.display().to_string(),
+                    "artifact_fnv1a": digest,
+                    "signer_pinned": expect_signer.is_some(),
+                    "reason": e.to_string(),
+                }),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Append one line to the recipient's audit log. A failure to record is
+/// reported but never turns a good open into a bad one: the bundle is already
+/// verified by then, and refusing it would leave the recipient with nothing.
+fn write_verify_record(path: &Path, mut entry: serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("epoch".into(), serde_json::json!(now_epoch()));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open audit log {}", path.display()))?;
+    writeln!(f, "{entry}")?;
+    Ok(())
+}
+
+fn embargo_verify_inner(
+    artifact: &Path,
+    out_dir: &Path,
+    expect_signer: Option<&str>,
+) -> Result<VerifiedBundle> {
+    if !artifact.is_file() {
+        if artifact.exists() {
+            bail!("not a bundle file: {}", artifact.display());
+        }
+        bail!("no such bundle artifact: {}", artifact.display());
+    }
+    refuse_symlink(out_dir, "verify output path")?;
+    if out_dir.exists() {
+        bail!("output already exists: {}", out_dir.display());
+    }
+    if let Some(expected) = expect_signer {
+        // Refusing junk rather than filtering it means a `0x` prefix or
+        // spaces cannot silently shorten the pin below what the operator
+        // asked to check.
+        let norm = normalize_keyid(expected).ok_or_else(|| {
+            anyhow!(
+                "--expect-signer must be a hex key id (a `0x` prefix and spaces are fine); got {expected:?}"
+            )
+        })?;
+        if norm.len() < 16 {
+            bail!(
+                "--expect-signer needs at least 16 hex chars (a full 40-character fingerprint is much better; got {expected:?})"
+            );
+        }
+    }
+    if let Some(parent) = out_dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    std::fs::create_dir_all(out_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700)) {
+            // Leave nothing behind, or the retry reports "output already
+            // exists" instead of the permission problem.
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e.into());
+        }
+    }
+    let tmp_tar = {
+        let name = out_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("embargo-bundle");
+        out_dir
+            .parent()
+            .unwrap_or(Path::new("."))
+            .join(format!("{name}.decrypting.tar"))
+    };
+    if tmp_tar.exists() {
+        std::fs::remove_dir_all(out_dir)?;
+        bail!(
+            "temporary tar already exists (stale verify?): {}",
+            tmp_tar.display()
+        );
+    }
+    // The temp tar is written by gpg with `--yes`: a planted symlink here
+    // would redirect decrypted plaintext, so refuse links, not just files.
+    // Like every other refusal here, this must not leave the output tree
+    // behind, or the retry hits a misleading "already exists".
+    if let Err(e) = refuse_symlink(&tmp_tar, "verify temporary tar path") {
+        let _ = std::fs::remove_dir_all(out_dir);
+        return Err(e);
+    }
+    let cleanup = || {
+        let _ = std::fs::remove_file(&tmp_tar);
+    };
+    // The temp tar is plaintext: create it 0600 ourselves. gpg creates its
+    // `--output` with 0666 & ~umask, so a chmod afterwards would leave the
+    // whole bundle world-readable in `out_dir.parent()` for the duration of
+    // the decrypt. `gpg --yes` keeps an existing file's mode.
+    let tar_owned = match create_private(&tmp_tar) {
+        Ok(p) => p.to_path_buf(),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e);
+        }
+    };
+    let decrypt = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
+        .args([
+            "--batch",
+            "--yes",
+            "--status-fd",
+            "1",
+            "--decrypt",
+            "--output",
+        ])
+        .arg(&tar_owned)
+        .arg("--")
+        .arg(artifact)
+        .output();
+    // A gpg that will not even start is still a refusal: clear the output
+    // dir, or every retry fails with a misleading "output already exists".
+    let decrypt = match decrypt {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tar_owned);
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(anyhow!(
+                "failed to run gpg ({e}); install gnupg to open embargo bundles"
+            ));
+        }
+    };
+    let status = String::from_utf8_lossy(&decrypt.stdout).to_string();
+    if !decrypt.status.success() {
+        cleanup();
+        let _ = std::fs::remove_dir_all(out_dir);
+        bail!(
+            "gpg decrypt failed: {}",
+            String::from_utf8_lossy(&decrypt.stderr).trim()
+        );
+    }
+    // VALIDSIG field 1 is the *signing subkey*; the final field is the
+    // primary fingerprint. Keys that sign through a subkey (the normal
+    // case for modern RSA setups) must still match the primary fingerprint
+    // the operator reads off `gpg --fingerprint` and writes into
+    // `visibility.toml`, so both are kept and either satisfies a pin.
+    let status = parse_gpg_status(&status);
+    if let Some(bad) = &status.bad_marker {
+        cleanup();
+        let _ = std::fs::remove_dir_all(out_dir);
+        bail!("gpg reported a failed signature status (refusing to open): {bad}");
+    }
+    if status.signatures.is_empty() {
+        cleanup();
+        let _ = std::fs::remove_dir_all(out_dir);
+        bail!("gpg reported no valid signature (refusing to open)");
+    }
+    if !status.decrypted_ok {
+        cleanup();
+        let _ = std::fs::remove_dir_all(out_dir);
+        bail!("gpg reported no DECRYPTION_OKAY (refusing to open)");
+    }
+    // Pin against every signature gpg reported, not just the last: a
+    // co-signed bundle is legitimate, and naming the first signer must open
+    // it. The subkey and the primary both count, because an operator's
+    // `gpg --fingerprint` output names the primary and that is what
+    // visibility.toml records.
+    let signer = if let Some(expected) = expect_signer {
+        let want = normalize_keyid(expected).unwrap_or_default();
+        let name_of = |sub: &str, primary: &Option<String>| {
+            primary.clone().unwrap_or_else(|| sub.to_string())
+        };
+        // Report the signature that actually satisfied the pin. Taking the
+        // first signer instead printed a different name from the one the
+        // operator pinned, on a co-signed bundle.
+        let matched = status.signatures.iter().find_map(|(sub, primary)| {
+            let sub_ok = normalize_keyid(sub).is_some_and(|k| k.ends_with(&want));
+            let pri_ok = primary
+                .as_deref()
+                .and_then(normalize_keyid)
+                .is_some_and(|k| k.ends_with(&want));
+            (sub_ok || pri_ok).then(|| name_of(sub, primary))
+        });
+        match matched {
+            Some(signer) => signer,
+            None => {
+                cleanup();
+                let _ = std::fs::remove_dir_all(out_dir);
+                let signers: Vec<String> = status
+                    .signatures
+                    .iter()
+                    .map(|(s, p)| name_of(s, p))
+                    .collect();
+                bail!(
+                    "signer mismatch: bundle signed by {}, expected {expected}",
+                    signers.join(", ")
+                );
+            }
+        }
+    } else {
+        // No pin: report the primary fingerprint, the stable identity an
+        // operator records.
+        status
+            .signatures
+            .first()
+            .map(|(sub, primary)| primary.clone().unwrap_or_else(|| sub.clone()))
+            .unwrap_or_default()
+    };
+    if let Err(e) = (|| -> Result<()> {
+        // Bounds and member policy are checked before a single byte is
+        // unpacked, and extraction refuses to overwrite: hostile tars stay
+        // outside and cannot exhaust the recipient's disk.
+        check_tar_members(&tmp_tar)?;
+        run(Command::new(tar_bin().map_err(anyhow::Error::msg)?)
+            .arg("--extract")
+            .arg("--keep-old-files")
+            .arg("--file")
+            .arg(&tmp_tar)
+            .arg("--directory")
+            .arg(out_dir))?;
+        Ok(())
+    })() {
+        cleanup();
+        let _ = std::fs::remove_dir_all(out_dir);
+        return Err(e);
+    }
+    if let Err(e) = std::fs::remove_file(&tmp_tar) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(anyhow!(
+                "could not remove decrypted plaintext {}: {e}",
+                tmp_tar.display()
+            ));
+        }
+    }
+    // The tree under `out_dir` is decrypted plaintext. A missing or
+    // unparseable manifest is a refusal, and a refusal must not leave that
+    // plaintext behind, so both failures clear the tree on the way out.
+    let manifest_path = find_manifest(out_dir).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(out_dir);
+    })?;
+    let manifest: serde_json::Value = match std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))
+        .and_then(|raw| {
+            serde_json::from_slice(&raw).context("bundle MANIFEST.json is not valid JSON")
+        }) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e);
+        }
+    };
+    // The seal side proves the bundle stands alone before it ships. Prove it
+    // again here: the recipient is about to be told to run `git log`, and a
+    // bundle whose objects did not travel would report success and then fail
+    // on that command. A stripped or partial bundle is a refusal, not a
+    // footnote.
+    if let Err(e) = check_bundle_history(&manifest_path, &manifest) {
+        let _ = std::fs::remove_dir_all(out_dir);
+        return Err(e);
+    }
+    let embargo_until = manifest
+        .get("embargo_until")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let recipients = manifest
+        .get("recipients")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let changes = manifest
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    Ok(VerifiedBundle {
+        signer,
+        recipients,
+        embargo_until,
+        changes,
+    })
+}
+
+/// Refuse paths that are symlinks: seal/verify outputs must be plain
+/// files or dirs created by Oot, not planted links that would redirect
+/// plaintext, signatures, or decrypted trees elsewhere. Uses
+/// `symlink_metadata` so dangling links are caught too (`exists` follows
+/// links and would miss them).
+///
+/// This inspects the final component only. A symlinked *parent* still
+/// redirects writes, and these paths are operator-supplied rather than
+/// attacker-supplied, so that is a documented limit rather than a
+/// guarantee.
+fn refuse_symlink(path: &Path, what: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("{} must not be a symlink: {}", what, path.display());
+        }
+        // NotFound is the only benign answer. Anything else (EACCES, ELOOP)
+        // leaves the state unknown, and unknown must not pass as "safe to
+        // write through".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => bail!("cannot inspect {}: {}: {e}", what, path.display()),
+        Ok(_) => {}
+    }
+    Ok(())
+}
+
+/// The secret-key state for `entry` in the local keyring: absent, present
+/// but unusable, or usable. Oot only resolves; it never generates or
+/// fetches keys.
+enum GpgSecretState {
+    Usable,
+    Unusable(&'static str),
+    Missing,
+}
+
+fn gpg_secret_key_state(entry: &str) -> Result<GpgSecretState> {
+    let out = Command::new(gpg_bin().map_err(anyhow::Error::msg)?)
+        .args(["--list-secret-keys", "--with-colons", "--", entry])
+        .output()
+        .map_err(|e| {
+            anyhow::anyhow!("failed to run gpg ({e}); install gnupg to seal embargo bundles")
+        })?;
+    if !out.status.success() {
+        return Ok(GpgSecretState::Missing);
+    }
+    // Field 2 of the `sec` record carries validity (`e`/`r`/`d`). An
+    // unusable key must not be reported as "no key in keyring": the
+    // operator would be told to import a key they already hold.
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        if !line.starts_with("sec:") {
+            continue;
+        }
+        return Ok(match line.split(':').nth(1) {
+            Some("e") => GpgSecretState::Unusable("expired"),
+            Some("r") => GpgSecretState::Unusable("revoked"),
+            Some("d") => GpgSecretState::Unusable("disabled"),
+            _ => GpgSecretState::Usable,
+        });
+    }
+    Ok(GpgSecretState::Missing)
+}
+
+/// True for a regular file that is not a symlink. `Path::is_file` follows
+/// links, so extracted-bundle lookups must use this instead.
+fn is_plain_file(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path).map(|m| (m.file_type().is_symlink(), m.is_file())),
+        Ok((false, true))
+    )
+}
+
+/// True for a real directory that is not a symlink.
+fn is_plain_dir(path: &Path) -> bool {
+    matches!(
+        std::fs::symlink_metadata(path).map(|m| (m.file_type().is_symlink(), m.is_dir())),
+        Ok((false, true))
+    )
+}
+
+/// Check that the received repo can actually deliver the history the manifest
+/// claims: the repo exists, its objects are all present, and every sha the
+/// manifest names resolves inside it.
+fn check_bundle_history(manifest_path: &Path, manifest: &serde_json::Value) -> Result<()> {
+    let root = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("MANIFEST.json has no parent directory"))?;
+    let repo = root.join("repo");
+    if !is_plain_dir(&repo) {
+        bail!(
+            "bundle has no repo/ directory next to {}; nothing to read",
+            manifest_path.display()
+        );
+    }
+    // Every object reachable from every ref must be present. `--missing=error`
+    // is what catches a missing blob, which `rev-list --all` alone does not.
+    run_stdout(Command::new("git").arg("-C").arg(&repo).args([
+        "rev-list",
+        "--objects",
+        "--all",
+        "--missing=error",
+    ]))
+    .context("bundle history is incomplete")?;
+    // And each change the manifest names must resolve, so a manifest that
+    // overstates the contents cannot pass either.
+    let shas: Vec<String> = manifest
+        .get("changes")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|c| c.get("sha").and_then(|s| s.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    for sha in &shas {
+        run_stdout(Command::new("git").arg("-C").arg(&repo).args([
+            "cat-file",
+            "-e",
+            &format!("{sha}^{{commit}}"),
+        ]))
+        .with_context(|| format!("bundle is missing the change {sha}"))?;
+    }
+    Ok(())
+}
+
+/// Locate the bundle's MANIFEST.json: at the root (a `--plain` layout) or
+/// one level down (a sealed artifact unpacks under its staging name).
+/// Symlinks are refused, since `is_file` follows them and a crafted tar
+/// could otherwise point the manifest at a file outside the output dir.
+fn find_manifest(out_dir: &Path) -> Result<PathBuf> {
+    let direct = out_dir.join("MANIFEST.json");
+    if is_plain_file(&direct) {
+        return Ok(direct);
+    }
+    for entry in std::fs::read_dir(out_dir)
+        .with_context(|| format!("failed to list {}", out_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", out_dir.display()))?;
+        if !is_plain_dir(&entry.path()) {
+            continue;
+        }
+        let candidate = entry.path().join("MANIFEST.json");
+        if is_plain_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "decrypted bundle has no MANIFEST.json under {}",
+        out_dir.display()
+    )
+}
+
+/// Ceilings on an incoming bundle, not a description of a normal one.
+/// An embargo bundle is a FULL unfiltered history, so it carries every git
+/// object in the store: roughly three per commit, which a 100k-commit
+/// repository blows past on member count and lands in the low tens of GiB.
+/// These numbers are sized above that so real histories are never refused.
+///
+/// They are a floor against floods, NOT a disk-exhaustion defence: 64 GiB
+/// from a small artifact is enough to fill a volume, and no cap on declared
+/// size can promise otherwise. What holds the line is refusing the member
+/// types whose size field does not mean payload bytes (sparse, pax), plus
+/// GNU tar's own refusal of traversal, absolute and hardlink members.
+const MAX_BUNDLE_MEMBERS: usize = 2_000_000;
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+
+/// What gpg's `--status-fd` said about an opened bundle.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct GpgStatus {
+    /// Every VALIDSIG gpg reported, as (signing subkey, primary). A bundle
+    /// can carry more than one signature, and a pin that only ever saw the
+    /// last one would refuse a co-signed bundle naming the first.
+    signatures: Vec<(String, Option<String>)>,
+    /// Whether decryption completed.
+    decrypted_ok: bool,
+    /// A bad/expired/revoked signature marker, if gpg emitted one. Any of
+    /// these poisons the open even beside a VALIDSIG line: a key that died
+    /// after sealing must stop opening bundles.
+    bad_marker: Option<String>,
+}
+
+/// Reduce a key id to uppercase hex for comparison, so a fingerprint pasted
+/// with spaces, in lowercase, or with a `0x` prefix (the form
+/// `gpg --list-keys --keyid-format 0x` prints) still matches instead of
+/// reading as a mysterious mismatch.
+///
+/// Returns None for anything that is not hex, whitespace and an optional
+/// `0x`. Filtering to hex instead would accept a 39-character pin whose junk
+/// happens to fall in the middle and quietly compare as the 16 characters
+/// that survived: the operator asked to check more than that.
+fn normalize_keyid(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let body = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
+    if body.is_empty()
+        || !body
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let hex: String = body
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>()
+        .to_uppercase();
+    if hex.is_empty() {
+        None
+    } else {
+        Some(hex)
+    }
+}
+
+/// Parse gpg's status output. Pure, so the rules are unit-testable without
+/// a live keyring: an expired or revoked signer is awkward to stage on
+/// demand (gpg has no scriptable revoke), but its status line is just text.
+fn parse_gpg_status(raw: &str) -> GpgStatus {
+    let mut out = GpgStatus::default();
+    for line in raw.lines() {
+        let line = line.strip_prefix("[GNUPG:] ").unwrap_or(line);
+        if let Some(rest) = line.strip_prefix("VALIDSIG ") {
+            let mut fields = rest.split_whitespace();
+            let subkey = fields.next().map(str::to_string);
+            // The primary key fingerprint is the final field. After
+            // `VALIDSIG <subkey>` the line is
+            // `date ts expire version reserved pubkeyalgo hashalgo sigclass
+            // <primary-fpr>`, i.e. token index 9 counting the subkey as 0.
+            let primary = fields
+                .nth(8)
+                .filter(|p| is_hex_keyid(p))
+                .map(str::to_string);
+            if let Some(subkey) = subkey {
+                out.signatures.push((subkey, primary));
+            }
+        } else if line.starts_with("DECRYPTION_OKAY") {
+            out.decrypted_ok = true;
+        } else if line.starts_with("BADSIG")
+            || line.starts_with("ERRSIG")
+            || line.starts_with("EXPSIG")
+            || line.starts_with("EXPKEYSIG")
+            || line.starts_with("REVKEYSIG")
+            || line.starts_with("KEYREVOKED")
+        {
+            out.bad_marker = Some(line.to_string());
+        }
+    }
+    out
+}
+
+/// The text after `skip` whitespace-delimited columns, or None if the line
+/// has fewer. Returns the remainder rather than one token, so a name
+/// containing spaces survives intact.
+fn nth_column(line: &str, skip: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut cols = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        if cols == skip {
+            return Some(line[i..].trim_end().to_string());
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        cols += 1;
+    }
+    None
+}
+
+/// Whether `s` is a plausible key id: hex only, at least 8 chars. Keeps a
+/// malformed or truncated gpg status field from being used as a fingerprint.
+fn is_hex_keyid(s: &str) -> bool {
+    s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// Reject a bundle tar before extraction: unsafe member names (absolute or
+/// `..`), member counts or sizes past the caps, and member types an
+/// embargo bundle never contains. Oot-made bundles hold exactly one top
+/// dir with a git repo, dockets, logs, and MANIFEST.json — all regular
+/// files, directories, and symlinks Oot never writes.
+///
+/// Names are only part of the defense: GNU tar itself refuses `..`
+/// traversal, absolute members, and cross-device hard links. This check
+/// fails early and explicitly so a hostile tar is never unpacked at all.
+fn check_tar_members(tar_path: &Path) -> Result<()> {
+    // Caps first, from a raw header walk. Sizes are attacker-controlled and
+    // a sparse archive declares gigabytes it never stores, so GNU tar may
+    // refuse to list it at all: the caps must hold regardless of whether
+    // tar can parse the file.
+    let (members, bytes) =
+        tar_header_totals(tar_path, MAX_BUNDLE_MEMBERS as u64, MAX_BUNDLE_BYTES)?;
+    if members == 0 {
+        bail!("bundle tar is empty (refusing to open)");
+    }
+    if members > MAX_BUNDLE_MEMBERS as u64 {
+        bail!("bundle tar has more than {MAX_BUNDLE_MEMBERS} members (refusing to open)");
+    }
+    if bytes > MAX_BUNDLE_BYTES {
+        bail!("bundle tar expands past {MAX_BUNDLE_BYTES} bytes (refusing to open)");
+    }
+    // Then names and types, via tar itself so long-name and pax encodings
+    // are interpreted correctly instead of guessed at.
+    let listing = Command::new(tar_bin().map_err(anyhow::Error::msg)?)
+        .arg("--list")
+        .arg("--verbose")
+        .arg("--numeric-owner")
+        .arg("--file")
+        .arg(tar_path)
+        .output()
+        .map_err(|e| anyhow!("failed to list bundle tar ({e})"))?;
+    if !listing.status.success() {
+        bail!(
+            "bundle tar is unreadable: {}",
+            String::from_utf8_lossy(&listing.stderr).trim()
+        );
+    }
+    for line in String::from_utf8_lossy(&listing.stdout).lines() {
+        let Some((meta, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        // `-rw-r--r-- root/root  1234 2026-09-26 00:00 bundle/repo`
+        // `lrwxrwxrwx root/root     0 2026-09-26 00:00 bundle/link -> ../x`
+        // The name is the last token only for files and directories: a
+        // symlink line ends with its TARGET. Taking the last token checks
+        // the target and never the name, so a bundle with an ordinary
+        // `-> ../shared` link is refused while a hostile name sails past.
+        // Split the arrow off first, then read the fixed columns:
+        // owner, size, date, time, name.
+        let tail = match rest.split_once(" -> ") {
+            Some((head, _target)) => head,
+            None => rest,
+        };
+        // Skip exactly four columns (owner, size, date, time) and take the
+        // REST, not the fifth token: a filename may contain spaces, and
+        // `nth(4)` judged only the first word of it, so a member named
+        // `bundle/pwn /../../tmp/x` was checked as `bundle/pwn` and allowed.
+        let Some(name) = nth_column(tail, 4) else {
+            continue;
+        };
+        let name = name.trim_end_matches('/');
+        if name.is_empty() {
+            continue;
+        }
+        if name.starts_with('/') || name.split('/').any(|c| c == "..") {
+            bail!("bundle tar has unsafe member (refusing to open): {name}");
+        }
+        match meta.chars().next().unwrap_or('-') {
+            // Regular files, directories, and symlinks only. FIFOs, block
+            // and character devices have no place in a code bundle and are
+            // a way to make a recipient's tooling misbehave.
+            '-' | 'd' | 'l' => {}
+            other => {
+                bail!("bundle tar has unsupported member type '{other}' (refusing to open): {name}")
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Walk ustar/GNU headers to count members and total the declared payload
+/// sizes. Reads headers only, so a sparse archive that declares gigabytes
+/// costs nothing to reject. Returns (member count, declared bytes).
+fn tar_header_totals(tar_path: &Path, max_members: u64, max_bytes: u64) -> Result<(u64, u64)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let file = std::fs::File::open(tar_path)
+        .with_context(|| format!("failed to open {}", tar_path.display()))?;
+    let mut reader = std::io::BufReader::with_capacity(64 * 1024, file);
+    let mut header = [0u8; 512];
+    let mut members: u64 = 0;
+    let mut bytes: u64 = 0;
+    // Bounded so a header run of zeros or a malformed archive cannot spin.
+    // The cap is enforced by bailing, not by quietly stopping: returning
+    // "exactly max_members" would let a flood masquerade as a fit archive.
+    loop {
+        if members > max_members {
+            bail!("bundle tar has more than {max_members} members (refusing to open)");
+        }
+        match reader.read_exact(&mut header) {
+            Ok(()) => {}
+            // Running out of bytes before the end-of-archive marker means
+            // the archive is shorter than its own headers claim. Oot never
+            // writes sparse tars, so treat it as corrupt or hostile rather
+            // than quietly trusting the totals gathered so far.
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                bail!("bundle tar is truncated (refusing to open)");
+            }
+            Err(e) => return Err(anyhow!("bundle tar read failed: {e}")),
+        }
+        if header.iter().all(|b| *b == 0) {
+            break; // end-of-archive marker
+        }
+        members += 1;
+        if members > max_members {
+            bail!("bundle tar has more than {max_members} members (refusing to open)");
+        }
+        // Octal size at offset 124, 12 bytes, NUL/space terminated. GNU
+        // base-256 (high bit set) means a value too large for octal fields:
+        // saturate rather than trust it.
+        let raw = &header[124..136];
+        let size = if raw[0] & 0x80 != 0 {
+            u64::MAX / 4
+        } else {
+            let text: String = raw
+                .iter()
+                .take_while(|b| **b != 0 && **b != b' ')
+                .map(|b| *b as char)
+                .collect();
+            u64::from_str_radix(text.trim(), 8).unwrap_or(0)
+        };
+        // Offsets 124..136 mean "payload bytes" only for a plain file or a
+        // symlink. For a GNU sparse member ('S') they hold the ARCHIVED
+        // size and the expanded size lives in a sparse map we do not read,
+        // and pax records ('x', 'g') can override the size outright. Both
+        // turn the byte cap into a decoration — a 1.2 KB archive measured
+        // as 128 GiB — so refuse the types rather than guess their size.
+        let typeflag = header[156];
+        if matches!(typeflag, b'S' | b'x' | b'g') {
+            let name: String = header[..100]
+                .iter()
+                .take_while(|b| **b != 0)
+                .map(|b| *b as char)
+                .collect();
+            bail!("bundle tar member has an unsupported type: {name}");
+        }
+        // Typeflag '5' is a directory: it declares no payload.
+        if typeflag != b'5' {
+            bytes = bytes.saturating_add(size);
+            // Check as we go, before touching the payload: a sparse member
+            // declaring more than the whole cap must be refused without the
+            // archive ever having to be that large on disk.
+            if bytes > max_bytes {
+                bail!("bundle tar expands past {max_bytes} bytes (refusing to open)");
+            }
+        }
+        // Skip the payload, padded to a 512 boundary.
+        let padded = size.div_ceil(512) * 512;
+        if padded > 0 && reader.seek(SeekFrom::Current(padded as i64)).is_err() {
+            // The archive is shorter than its own headers claim: a sparse
+            // member, which Oot never writes. Report the byte cap when that
+            // is the real objection, truncation otherwise.
+            if bytes > max_bytes {
+                bail!("bundle tar expands past {max_bytes} bytes (refusing to open)");
+            }
+            bail!("bundle tar is truncated (refusing to open)");
+        }
+    }
+    Ok((members, bytes))
 }
 
 fn message_names_private_path(message: &str, policy: &VisibilityPolicy) -> bool {
@@ -2889,6 +4019,457 @@ fn message_names_private_path(message: &str, policy: &VisibilityPolicy) -> bool 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unique scratch dir for a guard test.
+    fn guard_tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "oot-guard-{}-{}-{}",
+            std::process::id(),
+            tag,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Parse gpg's status output. These assertions are the only coverage of
+    /// the "signer died after sealing" rule: gpg cannot be scripted to
+    /// revoke a key in a test, but the status lines it would emit are just
+    /// text, and a VALIDSIG sitting next to an expiry marker must still
+    /// poison the open.
+    #[test]
+    fn test_parse_gpg_status_reads_both_fingerprints() {
+        // Real shape of a subkey signature, as gpg 2.4 prints it.
+        let raw = "[GNUPG:] NEWSIG\n\
+                   [GNUPG:] GOODSIG 91044FBA76C9ED15AB14573589CAA03782C3251F\n\
+                   [GNUPG:] VALIDSIG 91044FBA76C9ED15AB14573589CAA03782C3251F \
+                   2026-09-26 1790441135 0 4 0 1 10 00 \
+                   D34A9B0A08FFB8619ABEBC095D9B8736695F8C9D\n\
+                   [GNUPG:] DECRYPTION_OKAY\n";
+        let st = parse_gpg_status(raw);
+        assert_eq!(st.bad_marker, None);
+        assert!(st.decrypted_ok);
+        assert_eq!(st.signatures.len(), 1, "one signature reported");
+        // Field 1 is the signing subkey...
+        assert_eq!(
+            st.signatures[0].0,
+            "91044FBA76C9ED15AB14573589CAA03782C3251F"
+        );
+        // ...and the last field is the primary an operator would pin.
+        assert_eq!(
+            st.signatures[0].1.as_deref(),
+            Some("D34A9B0A08FFB8619ABEBC095D9B8736695F8C9D")
+        );
+    }
+
+    #[test]
+    fn test_parse_gpg_status_flags_died_signers() {
+        // Every marker that means "this signature is not good" must be
+        // caught, even when a VALIDSIG line is present alongside it.
+        for marker in [
+            "BADSIG 91044FBA76C9ED15AB14573589CAA03782C3251F",
+            "ERRSIG 91044FBA76C9ED15AB14573589CAA03782C3251F 1 10 01 1789000000 9 0",
+            "EXPSIG 91044FBA76C9ED15AB14573589CAA03782C3251F",
+            "EXPKEYSIG 91044FBA76C9ED15AB14573589CAA03782C3251F",
+            "REVKEYSIG 91044FBA76C9ED15AB14573589CAA03782C3251F",
+            "KEYREVOKED 91044FBA76C9ED15AB14573589CAA03782C3251F",
+        ] {
+            let raw = format!(
+                "[GNUPG:] VALIDSIG 91044FBA76C9ED15AB14573589CAA03782C3251F \
+                 2026-09-26 1790441135 0 4 0 1 10 00 \
+                 D34A9B0A08FFB8619ABEBC095D9B8736695F8C9D\n\
+                 [GNUPG:] {marker}\n[GNUPG:] DECRYPTION_OKAY\n"
+            );
+            let st = parse_gpg_status(&raw);
+            assert_eq!(st.bad_marker.as_deref(), Some(marker), "must flag {marker}");
+            // The fingerprint is still parsed, so the error can name it.
+            assert!(!st.signatures.is_empty());
+            assert!(st.decrypted_ok);
+        }
+    }
+
+    #[test]
+    fn test_parse_gpg_status_ignores_benign_noise() {
+        // Encrypted-to lines and trust chatter must not look like failures.
+        let raw = "[GNUPG:] ENC_TO 91044FBA76C9ED15AB14573589CAA03782C3251F 1 0\n\
+                   [GNUPG:] BEGIN_DECRYPTION\n\
+                   [GNUPG:] TRUST_UNDEFINED 0 shell\n\
+                   [GNUPG:] DECRYPTION_INFO 2 9 1\n\
+                   [GNUPG:] DECRYPTION_OKAY\n";
+        let st = parse_gpg_status(raw);
+        assert_eq!(st.bad_marker, None);
+        assert!(st.decrypted_ok);
+        assert!(st.signatures.is_empty(), "no signature was reported");
+    }
+
+    /// The byte and member caps are a floor against absurd floods, not a
+    /// description of a normal bundle, so they are tested with injectable
+    /// limits rather than a multi-gigabyte fixture.
+    #[test]
+    fn test_tar_header_totals_enforces_injected_limits() {
+        let dir = guard_tmp("tarwalk");
+        let path = dir.join("t.tar");
+
+        // 12 members, one declaring 4 KiB, each with its real payload so the
+        // walk's seek stays in sync with the archive.
+        let mut out: Vec<u8> = Vec::new();
+        for i in 0..12u32 {
+            let size = if i == 0 { 4096 } else { 1 };
+            out.extend_from_slice(&ustar_header_for_tests(&format!("bundle/f{i}"), size));
+            out.resize(out.len() + size as usize, 0);
+            out.resize(out.len().next_multiple_of(512), 0);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        std::fs::write(&path, &out).unwrap();
+
+        // Generous limits: counted, accepted.
+        let (members, bytes) = tar_header_totals(&path, 1_000, 1_000_000).unwrap();
+        assert_eq!(members, 12);
+        assert_eq!(bytes, 4096 + 11);
+
+        // Member cap: refuses, and names the cap.
+        let err = tar_header_totals(&path, 5, 1_000_000).unwrap_err();
+        assert!(
+            err.to_string().contains("more than 5 members"),
+            "must name the member cap: {err}"
+        );
+
+        // Byte cap: refuses, and names the cap.
+        let err = tar_header_totals(&path, 1_000, 4_096).unwrap_err();
+        assert!(
+            err.to_string().contains("expands past 4096 bytes"),
+            "must name the byte cap: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member whose size field does not mean payload bytes defeats the byte
+    /// cap outright: GNU sparse ('S') hides the expanded size in a map we do
+    /// not read, and pax ('x'/'g') can override the size. A 1.2 KB archive
+    /// measured as 128 GiB, so these types are refused rather than guessed.
+    #[test]
+    fn test_tar_header_totals_refuses_sparse_and_pax_members() {
+        let dir = guard_tmp("sparse");
+        for (flag, label) in [(b'S', "sparse"), (b'x', "pax-extended")] {
+            let path = dir.join(format!("{label}.tar"));
+            let mut h = ustar_header_for_tests("bundle/hole.bin", 0);
+            h[156] = flag;
+            // Re-checksum after changing the typeflag.
+            h[148..156].copy_from_slice(b"        ");
+            let sum: u32 = h.iter().map(|b| *b as u32).sum();
+            let chk = format!("{sum:06o}\0 ");
+            h[148..156].copy_from_slice(chk.as_bytes());
+            let mut out: Vec<u8> = h.to_vec();
+            out.extend_from_slice(&[0u8; 1024]);
+            std::fs::write(&path, &out).unwrap();
+
+            let err = tar_header_totals(&path, 1_000, 1_000_000).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported type"),
+                "{label} must be refused: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member name may contain spaces, and the check used to read only the
+    /// first word of it, so `bundle/pwn /../../tmp/x` was judged on
+    /// `bundle/pwn` and allowed.
+    #[test]
+    fn test_nth_column_keeps_spaces_in_the_name() {
+        let line = "1000/1000         6 1970-01-01 05:30 bundle/pwn /../../tmp/x";
+        assert_eq!(
+            nth_column(line, 4).as_deref(),
+            Some("bundle/pwn /../../tmp/x"),
+            "the whole name must survive"
+        );
+        // A line with too few columns yields nothing rather than a fragment.
+        assert_eq!(nth_column("1000/1000 6 1970-01-01", 4), None);
+        assert_eq!(
+            nth_column("  a b  c d  name with  spaces ", 4).as_deref(),
+            Some("name with  spaces")
+        );
+    }
+
+    /// A ustar header declaring `size` bytes. Octal, NUL-terminated, with a
+    /// correct checksum, so the walk and GNU tar agree about the archive.
+    fn ustar_header_for_tests(name: &str, size: u64) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let mut octal = |v: u64, at: usize, len: usize| {
+            let width = len - 1;
+            let mut s = format!("{v:0width$o}", width = width);
+            s.truncate(width);
+            h[at..at + width].copy_from_slice(s.as_bytes());
+            h[at + width] = 0;
+        };
+        octal(0o644, 100, 8);
+        octal(0, 108, 8);
+        octal(0, 116, 8);
+        octal(size, 124, 12);
+        octal(0, 136, 12);
+        h[148..156].copy_from_slice(b"        ");
+        h[156] = b'0';
+        h[257..262].copy_from_slice(b"ustar");
+        h[263..265].copy_from_slice(b"00");
+        let sum: u32 = h.iter().map(|b| *b as u32).sum();
+        let chk = format!("{sum:06o}\0 ");
+        h[148..156].copy_from_slice(chk.as_bytes());
+        h
+    }
+
+    /// A stat error is not "absent". `symlink_metadata` failing for a reason
+    /// other than NotFound — EACCES here — means the state is UNKNOWN, and
+    /// treating unknown as absent is how a guard ends up deleting something
+    /// it never created, or how a symlink check passes a link it could not
+    /// see. Both helpers must refuse instead.
+    #[cfg(unix)]
+    #[test]
+    fn test_plaintext_paths_refuse_on_stat_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = guard_tmp("statfail");
+        // A directory we own but cannot traverse: every stat inside it fails
+        // with EACCES rather than reporting the entry as absent.
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let inside = locked.join("staging");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&inside).is_err(),
+            "test setup: the path must be unstattable"
+        );
+
+        assert!(
+            PlaintextGuard::arm(vec![inside.clone()]).is_err(),
+            "arming on an unstattable path must refuse, not assume absent"
+        );
+        let refused = refuse_symlink(&inside, "test path");
+        assert!(
+            refused.is_err(),
+            "a symlink check that cannot stat must refuse, not pass"
+        );
+        assert!(
+            refused.unwrap_err().to_string().contains("cannot inspect"),
+            "the error must say the state is unknown"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cleanup must attempt every guarded path even after one fails: the tar
+    /// holds the same plaintext as the staging dir, so abandoning it because
+    /// the dir would not delete leaves the more portable copy on disk.
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_now_attempts_every_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = guard_tmp("multi");
+        // Arm first, while the paths are absent, then build the plaintext:
+        // that is the real order, and arming over existing paths is what the
+        // other test covers.
+        let stuck = dir.join("stuck");
+        let tar = dir.join("stuck.tar");
+        let guard = PlaintextGuard::arm(vec![stuck.clone(), tar.clone()]).unwrap();
+        std::fs::create_dir_all(stuck.join("inner")).unwrap();
+        std::fs::write(stuck.join("inner/x"), "PLAINTEXT").unwrap();
+        std::fs::write(&tar, "PLAINTEXT TAR").unwrap();
+        // A subdirectory we cannot write: emptying the tree fails partway.
+        std::fs::set_permissions(stuck.join("inner"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        // The command must fail...
+        let err = guard.remove_now().unwrap_err();
+        assert!(
+            err.to_string().contains("cleanup failed"),
+            "must report the failure: {err}"
+        );
+        // ...and the tar it could have removed must be gone anyway.
+        assert!(
+            !tar.exists(),
+            "one failing path must not skip the rest: the plaintext tar survived"
+        );
+        assert!(stuck.exists(), "the stuck dir could not be removed");
+
+        std::fs::set_permissions(stuck.join("inner"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A co-signed bundle reports one VALIDSIG per signature, and the pin
+    /// has to be checked against all of them. Last-wins would refuse a
+    /// bundle whose FIRST signer is the one the operator named.
+    #[test]
+    fn test_parse_gpg_status_keeps_every_signature() {
+        let (aaaa, bbbb) = ("A".repeat(40), "B".repeat(40));
+        let raw = format!(
+            "[GNUPG:] VALIDSIG 1111111111111111111111111111111111111111 \
+             2026-09-26 1 0 4 0 1 10 00 {aaaa}\n\
+             [GNUPG:] VALIDSIG 2222222222222222222222222222222222222222 \
+             2026-09-26 1 0 4 0 1 10 00 {bbbb}\n\
+             [GNUPG:] DECRYPTION_OKAY\n"
+        );
+        let st = parse_gpg_status(&raw);
+        assert_eq!(st.signatures.len(), 2, "both signatures must survive");
+        assert_eq!(st.signatures[0].1.as_deref(), Some(aaaa.as_str()));
+        assert_eq!(st.signatures[1].1.as_deref(), Some(bbbb.as_str()));
+        assert!(st.decrypted_ok);
+        assert_eq!(st.bad_marker, None);
+    }
+
+    /// `gpg --list-keys --keyid-format 0x` prints `0x`-prefixed ids, and
+    /// fingerprints get pasted with spaces. Normalizing must not shorten a
+    /// pin into reading as a mismatch.
+    #[test]
+    fn test_normalize_keyid_tolerates_pasted_forms() {
+        let bare = "D34A9B0A08FFB8619ABEBC095D9B8736695F8C9";
+        for pasted in [
+            bare.to_string(),
+            bare.to_lowercase(),
+            format!("0x{bare}"),
+            format!("0X{bare}"),
+            format!("  {bare}  "),
+            // Fingerprints get pasted out of `gpg --fingerprint` in groups.
+            bare.as_bytes()
+                .chunks(4)
+                .map(|c| std::str::from_utf8(c).unwrap())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
+        ] {
+            assert_eq!(
+                normalize_keyid(&pasted).as_deref(),
+                Some(bare),
+                "pasted: {pasted:?}"
+            );
+        }
+        // A suffix pin still matches on the normalized form.
+        let tail = &bare[bare.len() - 16..];
+        assert!(normalize_keyid(&format!("0x{tail}"))
+            .unwrap()
+            .ends_with(tail));
+
+        // Junk is refused rather than filtered out. Filtering is what let a
+        // 39-character pin compare as the 16 characters that happened to
+        // survive, so the operator checked far less than they typed.
+        let junk: Vec<String> = vec![
+            format!("{bare}zzz"),
+            format!("{}not-a-key{}", &bare[..24], &bare[bare.len() - 16..]),
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            "not-a-key!!".to_string(),
+            "0x".to_string(),
+            String::new(),
+        ];
+        for junk in junk {
+            assert_eq!(
+                normalize_keyid(&junk),
+                None,
+                "must refuse rather than quietly shorten: {junk:?}"
+            );
+        }
+    }
+
+    /// The guard may only be armed on paths Oot owns. Arming over a
+    /// pre-existing file or directory would delete the user's data on a
+    /// clean refusal, so `arm` must refuse instead.
+    #[test]
+    fn test_plaintext_guard_refuses_preexisting_paths() {
+        let dir = guard_tmp("preexist");
+        let file = dir.join("notes.tar");
+        let staging = dir.join("notes");
+        std::fs::write(&file, "PRECIOUS").unwrap();
+        std::fs::create_dir_all(staging.join("deep")).unwrap();
+        std::fs::write(staging.join("deep/data.txt"), "IRREPLACEABLE").unwrap();
+
+        // Refuses, naming the conflict.
+        let err = PlaintextGuard::arm(vec![staging.clone(), file.clone()]).unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "must name the conflict: {err}"
+        );
+        // And the refusal destroys nothing.
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "PRECIOUS");
+        assert_eq!(
+            std::fs::read_to_string(staging.join("deep/data.txt")).unwrap(),
+            "IRREPLACEABLE"
+        );
+
+        // A pre-existing symlink is refused by the same check.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("elsewhere"), &link).unwrap();
+        let err = PlaintextGuard::arm(vec![link.clone()]).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink"),
+            "must say symlink: {err}"
+        );
+        assert!(link.symlink_metadata().is_ok(), "symlink must survive");
+
+        // Only when both are absent does arming succeed, and dropping the
+        // guard then removes exactly what Oot created.
+        let created = dir.join("fresh");
+        let tar = dir.join("fresh.tar");
+        {
+            let _guard = PlaintextGuard::arm(vec![created.clone(), tar.clone()]).unwrap();
+            std::fs::create_dir_all(&created).unwrap();
+            std::fs::write(created.join("x.txt"), "x").unwrap();
+            std::fs::write(&tar, "tar").unwrap();
+        }
+        assert!(!created.exists(), "guard must remove the staging dir");
+        assert!(!tar.exists(), "guard must remove the tar");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cleanup failure must be reportable: `Drop` cannot propagate, so
+    /// `remove_now` exists and must return Err rather than warn into
+    /// nothing. A path that is not removable in this process is simulated
+    /// by pointing the guard at a path inside a file (ENOTDIR).
+    #[cfg(unix)]
+    #[test]
+    fn test_plaintext_guard_reports_cleanup_failure() {
+        let dir = guard_tmp("failclean");
+        // A read-only parent: an unprivileged owner still cannot unlink
+        // entries from a 0555 directory, so cleanup fails for real without
+        // needing a second uid.
+        let ro = dir.join("readonly");
+        std::fs::create_dir_all(&ro).unwrap();
+        let staging = ro.join("staging");
+        let tar = ro.join("staging.tar");
+
+        // arm() passes (both absent), the plaintext is created while the
+        // parent is still writable, then the parent goes read-only so
+        // cleanup fails for real.
+        let guard = PlaintextGuard::arm(vec![staging.clone(), tar.clone()]).unwrap();
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("secret.txt"), "PLAINTEXT").unwrap();
+        std::fs::write(&tar, "PLAINTEXT TAR").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let err = guard.remove_now().unwrap_err();
+        // Restore write access so the scratch dir can be cleaned up.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(
+            err.to_string().contains("cleanup failed"),
+            "must name the cleanup failure: {err}"
+        );
+
+        // A missing path is not a failure: nothing left to remove.
+        let guard = PlaintextGuard::arm(vec![dir.join("never-existed")]).unwrap();
+        assert!(guard.remove_now().is_ok(), "absent path is not a failure");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn test_parse_offset() {

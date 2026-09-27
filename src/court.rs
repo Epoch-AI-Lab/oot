@@ -212,7 +212,7 @@ fn push_list(out: &mut String, items: &[String]) {
 
 /// FNV-1a 64-bit, hex-encoded. Not cryptographic — it only has to be stable
 /// and good enough to notice that a policy file changed.
-fn fnv1a(bytes: &[u8]) -> String {
+pub(crate) fn fnv1a(bytes: &[u8]) -> String {
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for &b in bytes {
         hash ^= u64::from(b);

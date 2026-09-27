@@ -10,15 +10,20 @@ use std::path::Path;
 
 /// Declares who may see what, and when a patch may go public.
 ///
-/// This is policy, not cryptography. Actual encryption is delegated to
-/// git-crypt or a hosted key service. Oot owns the rule and the gate.
+/// This is policy, not cryptography. Bulk encryption stays out of Oot
+/// (git-crypt or a hosted key service); the one exception is sealed
+/// embargo bundles, which are sign+encrypted through the gpg binary the
+/// same way Oot already shells out to git. Oot owns the rule and the gate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisibilityPolicy {
     /// Path fragments that are private. A touched path matching any entry
     /// raises a visibility dispute.
     #[serde(default = "default_private_paths")]
     pub private_paths: Vec<String>,
-    /// If set, the change is held under embargo until this date (e.g. `YYYY-MM-DD`).
+    /// If set, the change is held under embargo until this date
+    /// (`YYYY-MM-DD`; also `YYYY/MM/DD`, `YYYY.MM.DD`, and the `DD-MM-YYYY`
+    /// family). The date itself counts as held; malformed dates fail
+    /// closed, that is, held.
     #[serde(default)]
     pub embargo_until: Option<String>,
     /// Branch names that must stay private. Referencing these raises a visibility dispute.
@@ -29,8 +34,11 @@ pub struct VisibilityPolicy {
     /// filtering rebuilds history, clean commits keep their own sigs.
     #[serde(default)]
     pub resign_key_id: Option<String>,
-    /// Maintainer key ids allowed to receive an embargo bundle.
-    /// Empty means bundle refuses. Only names who gets it, Oot never sends.
+    /// Maintainer key references allowed to receive an embargo bundle: an
+    /// email or a fingerprint, resolved against the local keyring. Oot never
+    /// fetches keys, so an entry that does not resolve refuses the seal
+    /// before any plaintext exists. Empty means the bundle refuses. This
+    /// only names who gets it; Oot never sends.
     #[serde(default)]
     pub embargo_recipients: Vec<String>,
 }
@@ -48,6 +56,24 @@ impl Default for VisibilityPolicy {
             resign_key_id: None,
             embargo_recipients: vec![],
         }
+    }
+}
+
+impl VisibilityPolicy {
+    /// A stable fingerprint of the fields that decide who may receive a
+    /// bundle, recorded with the seal event so a later edit to
+    /// `embargo_recipients` or `embargo_until` is detectable afterwards.
+    pub fn audit_key(&self) -> String {
+        let mut canon = String::new();
+        canon.push_str("embargo_until=");
+        canon.push_str(self.embargo_until.as_deref().unwrap_or(""));
+        canon.push_str(";recipients=");
+        canon.push_str(&self.embargo_recipients.join(","));
+        canon.push_str(";private_paths=");
+        canon.push_str(&self.private_paths.join(","));
+        canon.push_str(";private_branches=");
+        canon.push_str(&self.private_branches.join(","));
+        crate::court::fnv1a(canon.as_bytes())
     }
 }
 

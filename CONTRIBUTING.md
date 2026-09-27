@@ -24,7 +24,7 @@ Repo is a seed, not a finished runtime. Build order is fixed because each bit fe
 4. **Meaning disputes.** Structural engine (tree-sitter today) plus hosted intent check. Flags changes that agree on tokens but disagree on meaning. One axis, after visibility.
 5. **Docket format.** On-disk record of a judgement, with visibility and embargo, so a human can review later.
 6. **In-memory execution.** No materialized tree needed, for agents. This shit has to be fast.
-7. **Hosted model client.** Intent scoring and embargo delivery. Only part that is not open source.
+7. **Hosted model client.** Intent scoring is a paid service and not in this repo. Embargo sealing and verify are open source in `src/store.rs`; moving sealed artifacts stays out of band (Oot never sends).
 
 Original pitch was "Git settles lines, Oot settles meaning." Now governance leads, meaning follows, custody carries both.
 
