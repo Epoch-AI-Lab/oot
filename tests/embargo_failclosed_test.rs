@@ -478,3 +478,93 @@ fn test_seal_accepts_bare_relative_out() {
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// The decrypted tar holds the whole bundle in plaintext while gpg writes
+/// it, and gpg's `--output` creates files 0666 & ~umask. Oot has to make the
+/// file itself at 0600, or the plaintext sits world-readable in whatever
+/// directory the caller chose for the whole duration of the decrypt.
+#[test]
+#[cfg(unix)]
+fn test_verify_temp_tar_is_private_while_gpg_writes_it() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
+
+    let tmp = scratch("perms");
+    let (gpg_home, key_id) = make_test_key();
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    // Enough content that the decrypt takes long enough to sample.
+    for i in 0..40 {
+        std::fs::write(src.join(format!("f{i}.txt")), format!("payload {i}\n")).unwrap();
+    }
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{key_id}\"]\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "seal failed: {msg}");
+
+    let tar = tmp.join("received.decrypting.tar");
+    let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&seen);
+    let watcher = std::thread::spawn(move || {
+        for _ in 0..100_000 {
+            if let Ok(md) = std::fs::symlink_metadata(&tar) {
+                let mode = md.permissions().mode() & 0o777;
+                let mut seen = sink.lock().unwrap();
+                if !seen.contains(&mode) {
+                    seen.push(mode);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+    });
+
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "verify failed: {msg}");
+    watcher.join().unwrap();
+
+    let modes = seen.lock().unwrap().clone();
+    assert!(
+        !modes.is_empty(),
+        "test setup: the temp tar was never observed, so this proves nothing"
+    );
+    for mode in &modes {
+        assert_eq!(
+            *mode & 0o077,
+            0,
+            "decrypted plaintext was group/world accessible (mode {mode:o})"
+        );
+    }
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

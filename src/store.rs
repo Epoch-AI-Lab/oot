@@ -1593,9 +1593,13 @@ impl Store {
         recipients: &[String],
     ) -> Result<Vec<(String, String)>> {
         let exported = self.embargo_bundle(staging, policy)?;
+        // Create the tar ourselves, 0600 from the first byte: `tar -cf` would
+        // make it 0666 & ~umask, so the full plaintext history would sit
+        // world-readable in the artifact's parent until a later chmod.
+        let tar_file = create_private(tar_path)?;
         run(Command::new("tar")
             .args(["-cf"])
-            .arg(tar_path)
+            .arg(tar_file.as_os_str())
             .arg("-C")
             // A bare relative `--out` like `embargo.tar.gpg` has an empty
             // parent, and `tar -C ""` fails outright.
@@ -1607,13 +1611,6 @@ impl Store {
             )
             .arg("--")
             .arg(staging.file_name().unwrap_or_default()))?;
-        // The tar is plaintext: match the staging dir's 0700 stance on the
-        // file itself so the window before encryption is local-only.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(tar_path, std::fs::Permissions::from_mode(0o600))?;
-        }
         let mut gpg = Command::new("gpg");
         gpg.args([
             "--batch",
@@ -2817,6 +2814,27 @@ fn run_stdout(cmd: &mut Command) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+/// Create `path` as an empty file only its owner can read, and hand the path
+/// back to pass to a child process. `gpg --output` and `tar -cf` both create
+/// their target with 0666 & ~umask, so a caller that wants private plaintext
+/// has to make the file itself: `gpg --yes` keeps an existing file's mode,
+/// and `tar -cf` truncates an existing file rather than recreating it.
+fn create_private(path: &Path) -> Result<&Path> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?
+        .write_all(b"")
+        .with_context(|| format!("failed to write {}", path.display()))?;
+    Ok(path)
+}
+
 fn run(cmd: &mut Command) -> Result<()> {
     let output = cmd
         .output()
@@ -3096,6 +3114,17 @@ pub fn embargo_verify(
     let cleanup = || {
         let _ = std::fs::remove_file(&tmp_tar);
     };
+    // The temp tar is plaintext: create it 0600 ourselves. gpg creates its
+    // `--output` with 0666 & ~umask, so a chmod afterwards would leave the
+    // whole bundle world-readable in `out_dir.parent()` for the duration of
+    // the decrypt. `gpg --yes` keeps an existing file's mode.
+    let tar_owned = match create_private(&tmp_tar) {
+        Ok(p) => p.to_path_buf(),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e);
+        }
+    };
     let decrypt = Command::new("gpg")
         .args([
             "--batch",
@@ -3105,11 +3134,22 @@ pub fn embargo_verify(
             "--decrypt",
             "--output",
         ])
-        .arg(&tmp_tar)
+        .arg(&tar_owned)
         .arg("--")
         .arg(artifact)
-        .output()
-        .map_err(|e| anyhow!("failed to run gpg ({e}); install gnupg to open embargo bundles"))?;
+        .output();
+    // A gpg that will not even start is still a refusal: clear the output
+    // dir, or every retry fails with a misleading "output already exists".
+    let decrypt = match decrypt {
+        Ok(out) => out,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tar_owned);
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(anyhow!(
+                "failed to run gpg ({e}); install gnupg to open embargo bundles"
+            ));
+        }
+    };
     let status = String::from_utf8_lossy(&decrypt.stdout).to_string();
     if !decrypt.status.success() {
         cleanup();
@@ -3166,11 +3206,6 @@ pub fn embargo_verify(
     // identity an operator records, and it is what a subkey pin resolves to.
     let signer = status.primary_key.unwrap_or(signing_key);
     if let Err(e) = (|| -> Result<()> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp_tar, std::fs::Permissions::from_mode(0o600))?;
-        }
         // Bounds and member policy are checked before a single byte is
         // unpacked, and extraction refuses to overwrite: hostile tars stay
         // outside and cannot exhaust the recipient's disk.
