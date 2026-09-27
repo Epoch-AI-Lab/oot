@@ -1334,7 +1334,10 @@ impl Store {
         // `repack` leaves a stale alternates file behind on some paths, and
         // an absolute path to the sender's store is meaningless elsewhere.
         let alt = repo.join(".git/objects/info/alternates");
-        if alt.exists() {
+        // `exists` follows links, so a dangling one would be tarred into the
+        // bundle and break the far side; the same `symlink_metadata` rule the
+        // rest of this path uses.
+        if std::fs::symlink_metadata(&alt).is_ok() {
             std::fs::remove_file(&alt)?;
         }
         // Prove the bundle stands alone: every object reachable from every
@@ -1370,7 +1373,7 @@ impl Store {
         policy: &VisibilityPolicy,
     ) -> Result<Vec<(String, String)>> {
         if !policy.is_under_embargo() {
-            bail!("no active embargo: bundle needs embargo_until in the future");
+            bail!("no active embargo: bundle needs embargo_until today or later");
         }
         let recipients: Vec<String> = policy
             .embargo_recipients
@@ -1476,7 +1479,7 @@ impl Store {
         signer_override: Option<&str>,
     ) -> Result<Vec<(String, String)>> {
         if !policy.is_under_embargo() {
-            bail!("no active embargo: bundle needs embargo_until in the future");
+            bail!("no active embargo: bundle needs embargo_until today or later");
         }
         refuse_symlink(out, "bundle artifact path")?;
         if out.exists() {
@@ -1603,7 +1606,7 @@ impl Store {
         let exported = self.embargo_bundle(staging, policy)?;
         // Create the tar ourselves, 0600 from the first byte: `tar -cf` would
         // make it 0666 & ~umask, so the full plaintext history would sit
-        // world-readable in the artifact's parent until a later chmod.
+        // world-readable in the artifact's parent if it were left to tar.
         let tar_file = create_private(tar_path)?;
         run(Command::new("tar")
             .args(["-cf"])
@@ -3105,9 +3108,14 @@ pub fn embargo_verify(
         bail!("output already exists: {}", out_dir.display());
     }
     if let Some(expected) = expect_signer {
-        // Normalizing first means a `0x` prefix or spaces do not silently
-        // shorten the pin below what the operator asked to check.
-        let norm = normalize_keyid(expected);
+        // Refusing junk rather than filtering it means a `0x` prefix or
+        // spaces cannot silently shorten the pin below what the operator
+        // asked to check.
+        let norm = normalize_keyid(expected).ok_or_else(|| {
+            anyhow!(
+                "--expect-signer must be a hex key id (a `0x` prefix and spaces are fine); got {expected:?}"
+            )
+        })?;
         if norm.len() < 16 {
             bail!(
                 "--expect-signer needs at least 16 hex chars (a full 40-character fingerprint is much better; got {expected:?})"
@@ -3123,7 +3131,12 @@ pub fn embargo_verify(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700))?;
+        if let Err(e) = std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700)) {
+            // Leave nothing behind, or the retry reports "output already
+            // exists" instead of the permission problem.
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e.into());
+        }
     }
     let tmp_tar = {
         let name = out_dir
@@ -3224,35 +3237,47 @@ pub fn embargo_verify(
     // it. The subkey and the primary both count, because an operator's
     // `gpg --fingerprint` output names the primary and that is what
     // visibility.toml records.
-    if let Some(expected) = expect_signer {
-        let want = normalize_keyid(expected);
-        let matched = status.signatures.iter().any(|(sub, primary)| {
-            normalize_keyid(sub).ends_with(&want)
-                || primary
-                    .as_deref()
-                    .is_some_and(|p| normalize_keyid(p).ends_with(&want))
+    let signer = if let Some(expected) = expect_signer {
+        let want = normalize_keyid(expected).unwrap_or_default();
+        let name_of = |sub: &str, primary: &Option<String>| {
+            primary.clone().unwrap_or_else(|| sub.to_string())
+        };
+        // Report the signature that actually satisfied the pin. Taking the
+        // first signer instead printed a different name from the one the
+        // operator pinned, on a co-signed bundle.
+        let matched = status.signatures.iter().find_map(|(sub, primary)| {
+            let sub_ok = normalize_keyid(sub).is_some_and(|k| k.ends_with(&want));
+            let pri_ok = primary
+                .as_deref()
+                .and_then(normalize_keyid)
+                .is_some_and(|k| k.ends_with(&want));
+            (sub_ok || pri_ok).then(|| name_of(sub, primary))
         });
-        if !matched {
-            cleanup();
-            let _ = std::fs::remove_dir_all(out_dir);
-            let signers: Vec<String> = status
-                .signatures
-                .iter()
-                .map(|(s, p)| p.clone().unwrap_or_else(|| s.clone()))
-                .collect();
-            bail!(
-                "signer mismatch: bundle signed by {}, expected {expected}",
-                signers.join(", ")
-            );
+        match matched {
+            Some(signer) => signer,
+            None => {
+                cleanup();
+                let _ = std::fs::remove_dir_all(out_dir);
+                let signers: Vec<String> = status
+                    .signatures
+                    .iter()
+                    .map(|(s, p)| name_of(s, p))
+                    .collect();
+                bail!(
+                    "signer mismatch: bundle signed by {}, expected {expected}",
+                    signers.join(", ")
+                );
+            }
         }
-    }
-    // Report the primary fingerprint when gpg gave one: that is the stable
-    // identity an operator records, and it is what a subkey pin resolves to.
-    let signer = status
-        .signatures
-        .first()
-        .and_then(|(_, p)| p.clone())
-        .unwrap_or_else(|| status.signatures[0].0.clone());
+    } else {
+        // No pin: report the primary fingerprint, the stable identity an
+        // operator records.
+        status
+            .signatures
+            .first()
+            .map(|(sub, primary)| primary.clone().unwrap_or_else(|| sub.clone()))
+            .unwrap_or_default()
+    };
     if let Err(e) = (|| -> Result<()> {
         // Bounds and member policy are checked before a single byte is
         // unpacked, and extraction refuses to overwrite: hostile tars stay
@@ -3325,10 +3350,15 @@ pub fn embargo_verify(
 }
 
 /// Refuse paths that are symlinks: seal/verify outputs must be plain
-/// files or dirs created by Oot, never planted links that would redirect
+/// files or dirs created by Oot, not planted links that would redirect
 /// plaintext, signatures, or decrypted trees elsewhere. Uses
 /// `symlink_metadata` so dangling links are caught too (`exists` follows
 /// links and would miss them).
+///
+/// This inspects the final component only. A symlinked *parent* still
+/// redirects writes, and these paths are operator-supplied rather than
+/// attacker-supplied, so that is a documented limit rather than a
+/// guarantee.
 fn refuse_symlink(path: &Path, what: &str) -> Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() => {
@@ -3453,25 +3483,43 @@ struct GpgStatus {
     bad_marker: Option<String>,
 }
 
-/// Parse gpg's status output. Pure, so the rules are unit-testable without
-/// a live keyring: an expired or revoked signer is awkward to stage on
-/// demand (gpg has no scriptable revoke), but its status line is just text.
 /// Reduce a key id to uppercase hex for comparison, so a fingerprint pasted
 /// with spaces, in lowercase, or with a `0x` prefix (the form
 /// `gpg --list-keys --keyid-format 0x` prints) still matches instead of
 /// reading as a mysterious mismatch.
-fn normalize_keyid(raw: &str) -> String {
+///
+/// Returns None for anything that is not hex, whitespace and an optional
+/// `0x`. Filtering to hex instead would accept a 39-character pin whose junk
+/// happens to fall in the middle and quietly compare as the 16 characters
+/// that survived: the operator asked to check more than that.
+fn normalize_keyid(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     let body = trimmed
         .strip_prefix("0x")
         .or_else(|| trimmed.strip_prefix("0X"))
         .unwrap_or(trimmed);
-    body.chars()
+    if body.is_empty()
+        || !body
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c.is_ascii_whitespace())
+    {
+        return None;
+    }
+    let hex: String = body
+        .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .collect::<String>()
-        .to_uppercase()
+        .to_uppercase();
+    if hex.is_empty() {
+        None
+    } else {
+        Some(hex)
+    }
 }
 
+/// Parse gpg's status output. Pure, so the rules are unit-testable without
+/// a live keyring: an expired or revoked signer is awkward to stage on
+/// demand (gpg has no scriptable revoke), but its status line is just text.
 fn parse_gpg_status(raw: &str) -> GpgStatus {
     let mut out = GpgStatus::default();
     for line in raw.lines() {
@@ -4067,7 +4115,11 @@ mod tests {
                 .join(" ")
                 .to_lowercase(),
         ] {
-            assert_eq!(normalize_keyid(&pasted), bare, "pasted: {pasted:?}");
+            assert_eq!(
+                normalize_keyid(&pasted).as_deref(),
+                Some(bare),
+                "pasted: {pasted:?}"
+            );
         }
         // A suffix pin still matches on the normalized form.
         let tail = &bare[bare.len() - 16..];
@@ -4078,14 +4130,15 @@ mod tests {
         // Junk is refused rather than filtered out. Filtering is what let a
         // 39-character pin compare as the 16 characters that happened to
         // survive, so the operator checked far less than they typed.
-        for junk in [
+        let junk: Vec<String> = vec![
             format!("{bare}zzz"),
             format!("{}not-a-key{}", &bare[..24], &bare[bare.len() - 16..]),
-            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
-            "not-a-key!!",
-            "",
-            "0x",
-        ] {
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".to_string(),
+            "not-a-key!!".to_string(),
+            "0x".to_string(),
+            String::new(),
+        ];
+        for junk in junk {
             assert_eq!(
                 normalize_keyid(&junk),
                 None,

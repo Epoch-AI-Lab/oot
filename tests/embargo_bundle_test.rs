@@ -1785,7 +1785,7 @@ fn test_embargo_verify_refuses_short_signer() {
     );
     assert!(ok, "sealed bundle failed: {msg}");
 
-    for pin in ["ABC", "DEADBEEF", "not-a-key!!"] {
+    for pin in ["ABC", "DEADBEEF"] {
         let received = tmp.join(format!("received-{pin}"));
         let (ok, msg) = oot_with_env(
             &[
@@ -1802,6 +1802,33 @@ fn test_embargo_verify_refuses_short_signer() {
         );
         assert!(!ok, "short pin {pin} must fail");
         assert!(msg.contains("at least 16 hex chars"), "must say why: {msg}");
+        assert!(!received.exists(), "refused pin must not create output");
+    }
+
+    // A pin that is not hex is refused as such, rather than being filtered
+    // down to whatever hex it happens to contain: a 39-character pin with
+    // junk in the middle used to compare as 16 characters.
+    for pin in [
+        "not-a-key!!",
+        "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+    ] {
+        let received = tmp.join("received-junk");
+        let _ = std::fs::remove_dir_all(&received);
+        let (ok, msg) = oot_with_env(
+            &[
+                "embargo-verify",
+                "--artifact",
+                artifact.to_str().unwrap(),
+                "--out",
+                received.to_str().unwrap(),
+                "--expect-signer",
+                pin,
+            ],
+            &proj,
+            &[("GNUPGHOME", gpg_home_str)],
+        );
+        assert!(!ok, "junk pin {pin} must fail");
+        assert!(msg.contains("must be a hex key id"), "must say why: {msg}");
         assert!(!received.exists(), "refused pin must not create output");
     }
 

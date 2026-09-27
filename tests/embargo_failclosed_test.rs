@@ -524,8 +524,12 @@ fn test_verify_temp_tar_is_private_while_gpg_writes_it() {
     let tar = tmp.join("received.decrypting.tar");
     let seen: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&seen);
+    // Poll until verify finishes rather than for a fixed count: a fixed
+    // 100k iterations at 100us costs 10s whatever the decrypt takes.
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = std::sync::Arc::clone(&done);
     let watcher = std::thread::spawn(move || {
-        for _ in 0..100_000 {
+        while !flag.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(md) = std::fs::symlink_metadata(&tar) {
                 let mode = md.permissions().mode() & 0o777;
                 let mut seen = sink.lock().unwrap();
@@ -550,6 +554,7 @@ fn test_verify_temp_tar_is_private_while_gpg_writes_it() {
         &[("GNUPGHOME", gpg_home.to_str().unwrap())],
     );
     assert!(ok, "verify failed: {msg}");
+    done.store(true, std::sync::atomic::Ordering::Relaxed);
     watcher.join().unwrap();
 
     let modes = seen.lock().unwrap().clone();

@@ -151,9 +151,11 @@ fingerprint from `gpg --fingerprint`, the signing subkey, or a trailing key
 id of at least 16 hex chars:
 
 ```bash
-# recipient
+# recipient — replace SIGNER_FPR with the sender's key, asked for out of
+# band, or read it from the trust you already have in that key:
+#   gpg --fingerprint --with-colons SIGNER_FPR | awk -F: '/^fpr/{print $10}'
 ./target/release/oot embargo-verify --artifact embargo-2099-01-01.tar.gpg \
-    --out received --expect-signer "$(gpg --fingerprint --with-colons | awk -F: '/^fpr/{print $10; exit}')"
+    --out received --expect-signer SIGNER_FPR
 cd received/*/repo && git log --oneline
 ```
 
