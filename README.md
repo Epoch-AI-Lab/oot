@@ -59,7 +59,7 @@ $ ./target/release/oot adjudicate --change feature/auth-refactor \
 
 It exits 1 because it touched `secrets/.env`. Exit 0 is `adjudicated`, everything else is nonzero so CI can gate on it.
 
-If it breaks policy, we block or cloak the hell out of it. If its a security fix, we can embargo it until a date you set, same way Git and GitHub do it manually ([OSSF guide](https://github.com/ossf/oss-vulnerability-guide), [Git embargo](https://www.kernel.org/pub/software/scm/git/docs/howto/coordinate-embargoed-releases.html)). Detection and blocking ship today. Quietly sending held patches to maintainers is still todo, that part is hard.
+If it breaks policy, we block or cloak the hell out of it. If its a security fix, we can embargo it until a date you set, same way Git and GitHub do it manually ([OSSF guide](https://github.com/ossf/oss-vulnerability-guide), [Git embargo](https://www.kernel.org/pub/software/scm/git/docs/howto/coordinate-embargoed-releases.html)). Detection, blocking, and sealing ship today: `embargo-bundle` seals the full history plus dockets to named recipients with gpg, and `embargo-verify` opens and checks it on their side. Moving the sealed artifact stays the courier's job — Oot never sends.
 
 ## Where Oot sits
 
@@ -88,7 +88,7 @@ Working seed and a bit rough around the edges. Engine runs, docket renders, git 
 - [x] `oot gc` / `oot prune`: sweep unreferenced changes, dockets, mappings, and pack/prune the bare Git ODB with grace periods
 - [x] Export to git: byte-identical round-trip (merges, binaries, unicode, non-UTC), sigs survive when not rebuilt, annotated tag objects (tagger, message, signature) survive when the target exports byte-identically
 - [x] Visibility-filtered export: withhold private changes, rebuild kept trees minus those paths, skip empties, embargo blocks export, GPG signatures survive on untouched history prefixes, rebuilt commits ship unsigned unless `resign_key_id` re-signs them, tags on rebuilt targets are recreated with the original tagger and message (freshly signed when a key is set), log to `.oot/export-log.jsonl`
-- [x] Embargo bundle: `embargo-status` plus `embargo-bundle` seal full history plus dockets plus MANIFEST to named recipients with gpg (sign+encrypt, no plaintext left behind); `--plain` writes the unsealed directory instead. Oot never sends.
+- [x] Embargo bundle: `embargo-status` plus `embargo-bundle` seal full history plus dockets plus MANIFEST.json to named recipients with gpg (sign+encrypt, no plaintext left behind); `--plain` writes the unsealed directory instead (audit-local, never verifiable). `embargo-verify` opens a sealed artifact on the recipient side: requires VALIDSIG + DECRYPTION_OKAY, pins the signer with `--expect-signer`, unpacks and reports the MANIFEST. Oot never sends: move the `.tar.gpg` out of band.
 
 Same-named defs in one file (two `render` methods) are tracked separately: we match identical bodies first, then pair the rest, so only the real change is reported.
 
@@ -103,7 +103,7 @@ Adjudication runtime, docket format, adapters, store, garbage collector, and exp
 We havent built this shit yet. It needs real users to be worth the cost, and we have none so we aint rushing.
 
 - **Hosted intent scoring.** A model that checks what a change says vs what it does. Structural engine catches *that* code changed, this catches *what it means*. Needs a server and a model and someone to pay.
-- **Embargo distribution.** The bundle ships sealed now (gpg sign+encrypt to `embargo_recipients`, resolved against the local keyring). Still missing: actually moving the artifact to maintainers — that is a courier, a key service, or auth we have not built.
+- **Embargo distribution.** The bundle ships sealed now (gpg sign+encrypt to `embargo_recipients`, resolved against the local keyring) and opens with `embargo-verify` (signature required, signer pinnable). Still missing: actually moving the artifact to maintainers — that is a courier, a key service, or auth we have not built. By design Oot never sends; the operator moves the `.tar.gpg` over an existing secure channel.
 
 ## Try it
 
@@ -131,6 +131,17 @@ GIT_AUTHOR_NAME=you GIT_AUTHOR_EMAIL=you@example.com ./target/release/oot record
 ./target/release/oot gc --dry-run
 ./target/release/oot gc --force
 ./target/release/oot export --out exported   # auto-applies ./visibility.toml when present
+```
+
+Embargo handoff (needs `embargo_until` + `embargo_recipients` in
+`visibility.toml`, keys pre-imported with `gpg --import`):
+
+```bash
+./target/release/oot embargo-status
+./target/release/oot embargo-bundle --out embargo-2099-01-01.tar.gpg
+# move the .tar.gpg out of band — Oot never sends
+./target/release/oot embargo-verify --artifact embargo-2099-01-01.tar.gpg --out received --expect-signer <signer-FPR>
+cd received/*/repo && git log --oneline
 ```
 
 ## Contribute

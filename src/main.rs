@@ -136,15 +136,21 @@ enum Commands {
         #[arg(long)]
         change: Option<String>,
     },
-    /// Show embargo state: held until date plus recipient count.
+    /// Show embargo state: held/lifted until date plus recipient count.
+    /// Also reports no-policy and none. Exits 0 for a readable policy
+    /// (including a held or lifted one, unlike adjudicate which exits
+    /// nonzero on an Embargoed docket); exits 1 only when the policy
+    /// cannot be read, e.g. a malformed embargo_until.
     EmbargoStatus {
         /// Path to a visibility-policy TOML. Defaults to `./visibility.toml`.
         #[arg(long)]
         visibility: Option<String>,
     },
-    /// Seal a maintainer-only bundle: full repo plus dockets plus MANIFEST,
+    /// Seal a maintainer-only bundle: full repo plus dockets plus MANIFEST.json,
     /// tarred and sign+encrypted to the recipients with gpg. Oot never
-    /// sends. Pass --plain to write the unsealed directory instead.
+    /// sends. Pass --plain to write the unsealed directory instead (audit-local
+    /// only: plain bundles cannot be verified). Needs ./visibility.toml with a
+    /// future embargo_until, non-empty embargo_recipients, and a non-empty store.
     EmbargoBundle {
         /// Path for the sealed artifact, e.g. embargo-2099-01-01.tar.gpg.
         /// Must not exist yet. With --plain, a directory instead.
@@ -157,8 +163,30 @@ enum Commands {
         #[arg(long)]
         plain: bool,
         /// GPG key id signing the bundle. Defaults to `resign_key_id`.
+        /// Sealed bundles only (rejected with --plain); errors when neither
+        /// is set. The signer needs a usable secret key in the keyring.
         #[arg(long)]
         signer: Option<String>,
+    },
+    /// Open a sealed embargo bundle on the recipient side: verify the gpg
+    /// signature, decrypt, unpack, and report the MANIFEST. Oot never
+    /// sends; the operator moves the artifact out of band first. Requires
+    /// VALIDSIG + DECRYPTION_OKAY from gpg; --out must not exist yet.
+    EmbargoVerify {
+        /// Sealed artifact, e.g. embargo-2099-01-01.tar.gpg.
+        #[arg(long, value_name = "FILE")]
+        artifact: String,
+        /// Directory to unpack into. Must not exist yet.
+        #[arg(long, value_name = "DIR")]
+        out: String,
+        /// Pin the expected signer: the primary fingerprint from
+        /// `gpg --fingerprint` (what visibility.toml records), or the
+        /// signing subkey, or a trailing key-id suffix of either. At least
+        /// 16 hex chars, case-insensitive; 16 is only a 64-bit key id, so
+        /// prefer the full 40. Refuses to open on mismatch. Strongly
+        /// recommended: without it any valid signature opens.
+        #[arg(long, value_name = "FPR")]
+        expect_signer: Option<String>,
     },
     /// Materialize a stored change's tree into the working copy.
     /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
@@ -787,16 +815,35 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 let exported =
                     store.embargo_bundle_sealed(&out_path, &policy, signer.as_deref())?;
                 println!("sealed embargo bundle: {} changes to {out}", exported.len());
-                let stem = oot::store::sealed_staging_dir(&out_path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
-                println!("verify + open (gpg reports the signer):");
-                println!("  gpg --decrypt {out} > bundle.tar");
-                println!("  tar -xf bundle.tar");
-                println!("  cd {stem}/repo && git log --oneline");
+                println!("verify + open on the recipient side (checks the signature):");
+                println!("  oot embargo-verify --artifact {out} --out <dir> --expect-signer <FPR>");
+                println!("  (inspect only: gpg --decrypt {out} | tar -tf -)");
+                println!("  cd <dir>/*/repo && git log --oneline");
             }
+            Ok(std::process::ExitCode::SUCCESS)
+        }
+        Commands::EmbargoVerify {
+            artifact,
+            out,
+            expect_signer,
+        } => {
+            let verified = oot::store::embargo_verify(
+                std::path::Path::new(&artifact),
+                std::path::Path::new(&out),
+                expect_signer.as_deref(),
+            )?;
+            println!(
+                "verified embargo bundle from {}: {} changes, held until {} for {} recipient(s)",
+                verified.signer,
+                verified.changes,
+                if verified.embargo_until.is_empty() {
+                    "(no date)"
+                } else {
+                    &verified.embargo_until
+                },
+                verified.recipients.len()
+            );
+            println!("unpacked to {out}");
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Update {

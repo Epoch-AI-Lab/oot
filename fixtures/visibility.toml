@@ -1,3 +1,6 @@
 private_paths = ["secrets/", ".env"]
 embargo_until = "2027-09-01"
 private_branches = []
+# Note: no embargo_recipients here, so `embargo-bundle` with this fixture
+# refuses (`embargo_recipients is empty`). Bundle tests use inline policies
+# with recipients set.

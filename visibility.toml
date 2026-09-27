@@ -18,8 +18,19 @@ private_paths = [".env", "secrets/", ".pem"]
 # `embargo_recipients` names who may receive a sealed `embargo-bundle`;
 # entries are GPG key references (email or fingerprint) resolved against
 # the local keyring — Oot never fetches keys, import them with `gpg --import`.
-# Empty means bundle refuses. The sealed artifact is signed with
-# `resign_key_id` (or `--signer`) and Oot never sends it.
+# Untrusted-but-imported keys seal fine (--trust-model always: the policy
+# is the authorization); expired/revoked/disabled keys refuse. Empty means
+# bundle refuses. The sealed artifact is signed with `resign_key_id`
+# (or `--signer`, which needs a usable secret key) and Oot never sends it:
+# move the `.tar.gpg` out of band, recipients open it with
+# `oot embargo-verify --artifact <file> --out <dir> --expect-signer <FPR>`.
+#
+# Bundle layout: `--plain` writes the directory itself (repo/ + MANIFEST.json
+# + dockets/ + logs, audit-local only); sealed artifacts unpack to
+# `<out>/<staging>/` with the same contents. MANIFEST.json holds
+# `{embargo_until, recipients[], changes[][{change, sha}]}`; verify adds the
+# VALIDSIG signer to its report. Preconditions to seal: policy file present,
+# future `embargo_until`, non-empty `embargo_recipients`, non-empty store.
 
 # Rebuilt commits ship unsigned; set `resign_key_id` to a maintainer GPG
 # key id to re-sign them on filtered export. Clean commits keep their own sigs.

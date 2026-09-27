@@ -10,15 +10,19 @@ use std::path::Path;
 
 /// Declares who may see what, and when a patch may go public.
 ///
-/// This is policy, not cryptography. Actual encryption is delegated to
-/// git-crypt or a hosted key service. Oot owns the rule and the gate.
+/// This is policy, not cryptography. Bulk encryption stays out of Oot
+/// (git-crypt or a hosted key service); the one exception is sealed
+/// embargo bundles, which are sign+encrypted through the gpg binary the
+/// same way Oot already shells out to git. Oot owns the rule and the gate.
 #[derive(Debug, Clone, Deserialize)]
 pub struct VisibilityPolicy {
     /// Path fragments that are private. A touched path matching any entry
     /// raises a visibility dispute.
     #[serde(default = "default_private_paths")]
     pub private_paths: Vec<String>,
-    /// If set, the change is held under embargo until this date (e.g. `YYYY-MM-DD`).
+    /// If set, the change is held under embargo until this date
+    /// (`YYYY-MM-DD`; also `YYYY/MM/DD`, `YYYY.MM.DD`, `DD-MM-YYYY`).
+    /// The date itself counts as held; malformed dates fail closed (held).
     #[serde(default)]
     pub embargo_until: Option<String>,
     /// Branch names that must stay private. Referencing these raises a visibility dispute.
