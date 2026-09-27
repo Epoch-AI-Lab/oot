@@ -159,7 +159,7 @@ fn project(tmp: &Path, key_id: &str) -> (std::path::PathBuf, std::path::PathBuf)
 }
 
 fn scratch(tag: &str) -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("oot-symlink-{}-{}", std::process::id(), tag));
+    let dir = std::env::temp_dir().join(format!("oot-argcase-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     dir
@@ -191,7 +191,7 @@ fn test_seal_refuses_symlinked_artifact() {
     // A link to an existing target is caught by the `already exists` check
     // too, so only the dangling variant below distinguishes the two.
     assert!(
-        msg.contains("symlink") || msg.contains("already exists"),
+        msg.contains("must not be a symlink") || msg.contains("already exists"),
         "error must explain the refusal: {msg}"
     );
     // The link is still a link, and the target keeps exactly its one file.
@@ -302,7 +302,7 @@ fn test_verify_refuses_symlinked_output() {
     assert!(out.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
     assert!(
-        msg.contains("symlink"),
+        msg.contains("must not be a symlink"),
         "error must name the symlink: {msg}"
     );
 
@@ -339,7 +339,7 @@ fn test_seal_refuses_dangling_symlinked_artifact() {
     );
     assert!(!ok, "seal onto a dangling symlink must refuse");
     assert!(
-        msg.contains("symlink"),
+        msg.contains("must not be a symlink"),
         "error must name the symlink: {msg}"
     );
     // Nothing was written through the link, and the link is intact.
@@ -381,7 +381,10 @@ fn test_dangling_symlinks_refused_on_every_derived_path() {
         &[("GNUPGHOME", &gpg_home)],
     );
     assert!(!ok, "--plain into a dangling symlink must refuse");
-    assert!(msg.contains("symlink"), "must name the symlink: {msg}");
+    assert!(
+        msg.contains("must not be a symlink"),
+        "must name the symlink: {msg}"
+    );
     assert_eq!(
         std::fs::read_dir(&plain_dest).unwrap().count(),
         0,
@@ -414,7 +417,10 @@ fn test_dangling_symlinks_refused_on_every_derived_path() {
         &[("GNUPGHOME", &gpg_home)],
     );
     assert!(!ok, "verify into a dangling symlink must refuse");
-    assert!(msg.contains("symlink"), "must name the symlink: {msg}");
+    assert!(
+        msg.contains("must not be a symlink"),
+        "must name the symlink: {msg}"
+    );
     assert_eq!(
         std::fs::read_dir(&recv_dest).unwrap().count(),
         0,
@@ -443,7 +449,10 @@ fn test_dangling_symlinks_refused_on_every_derived_path() {
         &[("GNUPGHOME", &gpg_home)],
     );
     assert!(!ok, "a dangling temp-tar symlink must refuse the open");
-    assert!(msg.contains("symlink"), "must name the symlink: {msg}");
+    assert!(
+        msg.contains("must not be a symlink"),
+        "must name the symlink: {msg}"
+    );
     assert_eq!(
         std::fs::read_dir(&tar_dest).unwrap().count(),
         0,
@@ -458,77 +467,95 @@ fn test_dangling_symlinks_refused_on_every_derived_path() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// A symlink at the verify temp-tar path must refuse AND clear the output
-/// dir, so the operator's retry does not hit a misleading "already
-/// exists". Every other refusal path upholds that invariant.
+/// The temp-tar path that gpg writes plaintext into must refuse a symlink,
+/// dangling or not. A *live* link looks like a stale file to the `exists()`
+/// guard and is caught there, so the case that actually exercises
+/// `refuse_symlink` is the dangling one, where `Path::exists` reports false.
+/// Both must refuse, both must clear the output dir, and neither may write
+/// through the link.
 #[test]
-fn test_verify_symlink_temp_tar_clears_output_dir() {
-    let tmp = scratch("tmptar");
-    let (gpg_home, key_id) = make_test_key();
-    let (_src, proj) = project(&tmp, &key_id);
-    let gpg_home = gpg_home.to_str().unwrap().to_string();
+fn test_verify_temp_tar_symlink_refuses_and_clears_output() {
+    for dangling in [true, false] {
+        let tmp = scratch(&format!(
+            "tmptar-{}",
+            if dangling { "dangling" } else { "live" }
+        ));
+        let (gpg_home, key_id) = make_test_key();
+        let (_src, proj) = project(&tmp, &key_id);
+        let gpg_home = gpg_home.to_str().unwrap().to_string();
 
-    let artifact = tmp.join("bundle.tar.gpg");
-    let (ok, msg) = oot_with_env(
-        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
-        &proj,
-        &[("GNUPGHOME", &gpg_home)],
-    );
-    assert!(ok, "seal failed: {msg}");
+        let artifact = tmp.join("bundle.tar.gpg");
+        let (ok, msg) = oot_with_env(
+            &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+            &proj,
+            &[("GNUPGHOME", &gpg_home)],
+        );
+        assert!(ok, "seal failed: {msg}");
 
-    // The temp tar is `<out-name>.decrypting.tar`, a sibling of `--out`.
-    let victim = tmp.join("victim");
-    std::fs::create_dir_all(&victim).unwrap();
-    std::fs::write(victim.join("keep.txt"), "VICTIM").unwrap();
-    let received = tmp.join("received");
-    std::os::unix::fs::symlink(&victim, tmp.join("received.decrypting.tar")).unwrap();
+        // The temp tar is `<out-name>.decrypting.tar`, a sibling of `--out`.
+        let victim = tmp.join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("keep.txt"), "VICTIM").unwrap();
+        let target = if dangling {
+            victim.join("not-there.tar")
+        } else {
+            victim.join("keep.txt")
+        };
+        let received = tmp.join("received");
+        std::os::unix::fs::symlink(&target, tmp.join("received.decrypting.tar")).unwrap();
 
-    let (ok, msg) = oot_with_env(
-        &[
-            "embargo-verify",
-            "--artifact",
-            artifact.to_str().unwrap(),
-            "--out",
-            received.to_str().unwrap(),
-        ],
-        &proj,
-        &[("GNUPGHOME", &gpg_home)],
-    );
-    assert!(!ok, "a symlinked temp tar must refuse the open");
-    assert!(
-        msg.contains("symlink"),
-        "error must name the symlink: {msg}"
-    );
-    assert!(
-        !received.exists(),
-        "refused verify must not leave an output tree: {msg}"
-    );
-    assert!(
-        tmp.join("received.decrypting.tar")
-            .symlink_metadata()
-            .is_ok(),
-        "the planted symlink must survive"
-    );
-    assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+        let (ok, msg) = oot_with_env(
+            &[
+                "embargo-verify",
+                "--artifact",
+                artifact.to_str().unwrap(),
+                "--out",
+                received.to_str().unwrap(),
+            ],
+            &proj,
+            &[("GNUPGHOME", &gpg_home)],
+        );
+        assert!(!ok, "a symlinked temp tar must refuse the open");
+        assert!(
+            msg.contains("must not be a symlink") || msg.contains("stale verify"),
+            "refusal must be explained: {msg}"
+        );
+        assert!(
+            !received.exists(),
+            "refused verify must not leave an output tree: {msg}"
+        );
+        assert!(
+            tmp.join("received.decrypting.tar")
+                .symlink_metadata()
+                .is_ok(),
+            "the planted symlink must survive"
+        );
+        // The victim is untouched: one file, and no plaintext landed in it.
+        assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
+        assert_eq!(
+            std::fs::read_to_string(victim.join("keep.txt")).unwrap(),
+            "VICTIM",
+            "verify must not write through the symlink"
+        );
 
-    // Once the operator clears the real cause, the retry succeeds: the
-    // refusal left no output tree behind.
-    std::fs::remove_file(tmp.join("received.decrypting.tar")).unwrap();
-    let (ok, msg) = oot_with_env(
-        &[
-            "embargo-verify",
-            "--artifact",
-            artifact.to_str().unwrap(),
-            "--out",
-            received.to_str().unwrap(),
-        ],
-        &proj,
-        &[("GNUPGHOME", &gpg_home)],
-    );
-    assert!(ok, "retry after a symlink refusal must work: {msg}");
+        // Clearing the real cause makes the retry clean: no stale refusal.
+        std::fs::remove_file(tmp.join("received.decrypting.tar")).unwrap();
+        let (ok, msg) = oot_with_env(
+            &[
+                "embargo-verify",
+                "--artifact",
+                artifact.to_str().unwrap(),
+                "--out",
+                received.to_str().unwrap(),
+            ],
+            &proj,
+            &[("GNUPGHOME", &gpg_home)],
+        );
+        assert!(ok, "retry after a symlink refusal must work: {msg}");
 
-    drop_key(Path::new(&gpg_home));
-    let _ = std::fs::remove_dir_all(&tmp);
+        drop_key(Path::new(&gpg_home));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }
 
 /// `--plain` writes a directory. A symlink at that path must be refused,
@@ -555,7 +582,7 @@ fn test_plain_bundle_refuses_symlinked_output_dir() {
     assert!(out.symlink_metadata().unwrap().file_type().is_symlink());
     assert_eq!(std::fs::read_dir(&victim).unwrap().count(), 1);
     assert!(
-        msg.contains("symlink"),
+        msg.contains("must not be a symlink"),
         "error must name the symlink: {msg}"
     );
 
