@@ -133,16 +133,32 @@ GIT_AUTHOR_NAME=you GIT_AUTHOR_EMAIL=you@example.com ./target/release/oot record
 ./target/release/oot export --out exported   # auto-applies ./visibility.toml when present
 ```
 
-Embargo handoff (needs `embargo_until` + `embargo_recipients` in
-`visibility.toml`, keys pre-imported with `gpg --import`):
+Embargo handoff. The **sender** needs `embargo_until` (today or later),
+non-empty `embargo_recipients`, and a signer whose secret key is in the local
+keyring — set `resign_key_id` or pass `--signer`. Import every key with
+`gpg --import` first; Oot never fetches one.
 
 ```bash
+# sender
 ./target/release/oot embargo-status
 ./target/release/oot embargo-bundle --out embargo-2099-01-01.tar.gpg
-# move the .tar.gpg out of band — Oot never sends
-./target/release/oot embargo-verify --artifact embargo-2099-01-01.tar.gpg --out received --expect-signer <signer-FPR>
+# move the .tar.gpg out of band yourself — Oot never sends
+```
+
+The **recipient** needs the secret key for one of the recipients plus the
+signer's public key, and should pin the signer. The pin takes the primary
+fingerprint from `gpg --fingerprint`, the signing subkey, or a trailing key
+id of at least 16 hex chars:
+
+```bash
+# recipient
+./target/release/oot embargo-verify --artifact embargo-2099-01-01.tar.gpg \
+    --out received --expect-signer "$(gpg --fingerprint --with-colons | awk -F: '/^fpr/{print $10; exit}')"
 cd received/*/repo && git log --oneline
 ```
+
+The received `repo/` is self-contained: history travels inside the bundle, so
+it reads fine with the sender's machine switched off.
 
 ## Contribute
 

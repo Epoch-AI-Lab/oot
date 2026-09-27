@@ -149,8 +149,10 @@ enum Commands {
     /// Seal a maintainer-only bundle: full repo plus dockets plus MANIFEST.json,
     /// tarred and sign+encrypted to the recipients with gpg. Oot never
     /// sends. Pass --plain to write the unsealed directory instead (audit-local
-    /// only: plain bundles cannot be verified). Needs ./visibility.toml with a
-    /// future embargo_until, non-empty embargo_recipients, and a non-empty store.
+    /// only: plain bundles cannot be verified). Needs ./visibility.toml with an
+    /// embargo_until of today or later, a signer (resign_key_id or --signer)
+    /// whose secret key is usable, non-empty embargo_recipients, a non-empty
+    /// store, and an --out path that does not exist yet.
     EmbargoBundle {
         /// Path for the sealed artifact, e.g. embargo-2099-01-01.tar.gpg.
         /// Must not exist yet. With --plain, a directory instead.
@@ -183,8 +185,10 @@ enum Commands {
         /// `gpg --fingerprint` (what visibility.toml records), or the
         /// signing subkey, or a trailing key-id suffix of either. At least
         /// 16 hex chars, case-insensitive; 16 is only a 64-bit key id, so
-        /// prefer the full 40. Refuses to open on mismatch. Strongly
-        /// recommended: without it any valid signature opens.
+        /// prefer the full 40. Refuses to open on mismatch, and deletes the
+        /// output. Strongly recommended: without it any valid signature opens.
+        /// You need a secret key for one of the bundle's recipients, plus
+        /// the signer's public key, or the open fails on the missing secret.
         #[arg(long, value_name = "FPR")]
         expect_signer: Option<String>,
     },
