@@ -1337,8 +1337,15 @@ impl Store {
         if alt.exists() {
             std::fs::remove_file(&alt)?;
         }
-        // Prove the bundle stands alone: with the store unreachable, every
-        // ref must still resolve to a real object.
+        // Prove the bundle stands alone: every object reachable from every
+        // ref must be present, not just the commits. `rev-list --all` walks
+        // commits only, so a bundle missing a blob sails past it.
+        run_stdout(Command::new("git").arg("-C").arg(repo).args([
+            "rev-list",
+            "--objects",
+            "--all",
+            "--missing=error",
+        ]))?;
         let heads = run_stdout(
             Command::new("git")
                 .arg("-C")
@@ -4064,7 +4071,27 @@ mod tests {
         }
         // A suffix pin still matches on the normalized form.
         let tail = &bare[bare.len() - 16..];
-        assert!(normalize_keyid(&format!("0x{tail}")).ends_with(tail));
+        assert!(normalize_keyid(&format!("0x{tail}"))
+            .unwrap()
+            .ends_with(tail));
+
+        // Junk is refused rather than filtered out. Filtering is what let a
+        // 39-character pin compare as the 16 characters that happened to
+        // survive, so the operator checked far less than they typed.
+        for junk in [
+            format!("{bare}zzz"),
+            format!("{}not-a-key{}", &bare[..24], &bare[bare.len() - 16..]),
+            "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ",
+            "not-a-key!!",
+            "",
+            "0x",
+        ] {
+            assert_eq!(
+                normalize_keyid(&junk),
+                None,
+                "must refuse rather than quietly shorten: {junk:?}"
+            );
+        }
     }
 
     /// The guard may only be armed on paths Oot owns. Arming over a
