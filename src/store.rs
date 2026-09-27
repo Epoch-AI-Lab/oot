@@ -2954,18 +2954,29 @@ impl PlaintextGuard {
     /// refuses instead of destroying whatever lives there.
     fn arm(paths: Vec<std::path::PathBuf>) -> Result<Self> {
         for path in &paths {
-            if let Ok(meta) = std::fs::symlink_metadata(path) {
-                let kind = if meta.file_type().is_symlink() {
-                    "symlink"
-                } else if meta.is_dir() {
-                    "directory"
-                } else {
-                    "file"
-                };
-                bail!(
-                    "refusing to seal: plaintext path already exists ({kind}): {}",
+            match std::fs::symlink_metadata(path) {
+                Ok(meta) => {
+                    let kind = if meta.file_type().is_symlink() {
+                        "symlink"
+                    } else if meta.is_dir() {
+                        "directory"
+                    } else {
+                        "file"
+                    };
+                    bail!(
+                        "refusing to seal: plaintext path already exists ({kind}): {}",
+                        path.display()
+                    );
+                }
+                // Absent is the only answer that lets the guard own it. Any
+                // other error (EACCES, ELOOP, ESTALE, ENFILE) means the state
+                // is unknown, and treating unknown as absent is how a guard
+                // ends up deleting something it did not create.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => bail!(
+                    "refusing to seal: cannot inspect plaintext path {}: {e}",
                     path.display()
-                );
+                ),
             }
         }
         Ok(PlaintextGuard { paths })
@@ -2978,6 +2989,10 @@ impl PlaintextGuard {
     /// reporting `sealed` while plaintext survives is a lie, so a failed
     /// cleanup must fail the command and delete the artifact too.
     fn remove_now(&self) -> Result<()> {
+        // Attempt every path even after one fails: the tar holds the same
+        // plaintext as the staging dir, so abandoning it because the dir
+        // would not delete leaves the more portable copy behind.
+        let mut failures: Vec<String> = Vec::new();
         for path in &self.paths {
             // `symlink_metadata`, not `is_dir`: a link swapped in after
             // arming must be unlinked, never traversed with remove_dir_all.
@@ -2992,11 +3007,11 @@ impl PlaintextGuard {
             match result {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => bail!(
-                    "seal cleanup failed: could not remove plaintext {}: {e}",
-                    path.display()
-                ),
+                Err(e) => failures.push(format!("{}: {e}", path.display())),
             }
+        }
+        if !failures.is_empty() {
+            bail!("seal cleanup failed: {}", failures.join("; "));
         }
         Ok(())
     }
@@ -3282,10 +3297,16 @@ pub fn embargo_verify(
 /// `symlink_metadata` so dangling links are caught too (`exists` follows
 /// links and would miss them).
 fn refuse_symlink(path: &Path, what: &str) -> Result<()> {
-    if let Ok(meta) = std::fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
             bail!("{} must not be a symlink: {}", what, path.display());
         }
+        // NotFound is the only benign answer. Anything else (EACCES, ELOOP)
+        // leaves the state unknown, and unknown must not pass as "safe to
+        // write through".
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => bail!("cannot inspect {}: {}: {e}", what, path.display()),
+        Ok(_) => {}
     }
     Ok(())
 }
@@ -3698,6 +3719,85 @@ mod tests {
         assert_eq!(st.bad_marker, None);
         assert!(st.decrypted_ok);
         assert_eq!(st.signing_key, None, "no signature was reported");
+    }
+
+    /// A stat error is not "absent". `symlink_metadata` failing for a reason
+    /// other than NotFound — EACCES here — means the state is UNKNOWN, and
+    /// treating unknown as absent is how a guard ends up deleting something
+    /// it never created, or how a symlink check passes a link it could not
+    /// see. Both helpers must refuse instead.
+    #[cfg(unix)]
+    #[test]
+    fn test_plaintext_paths_refuse_on_stat_errors() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = guard_tmp("statfail");
+        // A directory we own but cannot traverse: every stat inside it fails
+        // with EACCES rather than reporting the entry as absent.
+        let locked = dir.join("locked");
+        std::fs::create_dir_all(&locked).unwrap();
+        let inside = locked.join("staging");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&inside).is_err(),
+            "test setup: the path must be unstattable"
+        );
+
+        assert!(
+            PlaintextGuard::arm(vec![inside.clone()]).is_err(),
+            "arming on an unstattable path must refuse, not assume absent"
+        );
+        let refused = refuse_symlink(&inside, "test path");
+        assert!(
+            refused.is_err(),
+            "a symlink check that cannot stat must refuse, not pass"
+        );
+        assert!(
+            refused.unwrap_err().to_string().contains("cannot inspect"),
+            "the error must say the state is unknown"
+        );
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Cleanup must attempt every guarded path even after one fails: the tar
+    /// holds the same plaintext as the staging dir, so abandoning it because
+    /// the dir would not delete leaves the more portable copy on disk.
+    #[cfg(unix)]
+    #[test]
+    fn test_remove_now_attempts_every_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = guard_tmp("multi");
+        // Arm first, while the paths are absent, then build the plaintext:
+        // that is the real order, and arming over existing paths is what the
+        // other test covers.
+        let stuck = dir.join("stuck");
+        let tar = dir.join("stuck.tar");
+        let guard = PlaintextGuard::arm(vec![stuck.clone(), tar.clone()]).unwrap();
+        std::fs::create_dir_all(stuck.join("inner")).unwrap();
+        std::fs::write(stuck.join("inner/x"), "PLAINTEXT").unwrap();
+        std::fs::write(&tar, "PLAINTEXT TAR").unwrap();
+        // A subdirectory we cannot write: emptying the tree fails partway.
+        std::fs::set_permissions(stuck.join("inner"), std::fs::Permissions::from_mode(0o500))
+            .unwrap();
+
+        // The command must fail...
+        let err = guard.remove_now().unwrap_err();
+        assert!(
+            err.to_string().contains("cleanup failed"),
+            "must report the failure: {err}"
+        );
+        // ...and the tar it could have removed must be gone anyway.
+        assert!(
+            !tar.exists(),
+            "one failing path must not skip the rest: the plaintext tar survived"
+        );
+        assert!(stuck.exists(), "the stuck dir could not be removed");
+
+        std::fs::set_permissions(stuck.join("inner"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The guard may only be armed on paths Oot owns. Arming over a
