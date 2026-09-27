@@ -1533,6 +1533,15 @@ impl Store {
         let mut tar_name = staging.as_os_str().to_os_string();
         tar_name.push(".tar");
         let tar_path = std::path::PathBuf::from(tar_name);
+        // `--out x.tar` derives staging `x` and tar `x.tar`, which IS the
+        // artifact. gpg happens to fail on that today; refuse it outright
+        // rather than depend on someone else's binary being careful.
+        if tar_path == out {
+            bail!(
+                "refusing to seal: --out {} derives its own tar name; name the artifact *.tar.gpg",
+                out.display()
+            );
+        }
         // The staging dir holds the full unfiltered history and the tar is
         // plaintext too: the guard removes both on every exit path — return,
         // error, or panic — so plaintext never outlives the command. Arming
@@ -1588,7 +1597,14 @@ impl Store {
             .args(["-cf"])
             .arg(tar_path)
             .arg("-C")
-            .arg(staging.parent().unwrap_or_else(|| Path::new(".")))
+            // A bare relative `--out` like `embargo.tar.gpg` has an empty
+            // parent, and `tar -C ""` fails outright.
+            .arg(
+                staging
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new(".")),
+            )
             .arg("--")
             .arg(staging.file_name().unwrap_or_default()))?;
         // The tar is plaintext: match the staging dir's 0700 stance on the
@@ -3419,11 +3435,21 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
             continue;
         };
         // `-rw-r--r-- root/root  1234 2026-09-26 00:00 bundle/repo`
-        let name = rest
-            .split_whitespace()
-            .last()
-            .unwrap_or("")
-            .trim_end_matches('/');
+        // `lrwxrwxrwx root/root     0 2026-09-26 00:00 bundle/link -> ../x`
+        // The name is the last token only for files and directories: a
+        // symlink line ends with its TARGET. Taking the last token checks
+        // the target and never the name, so a bundle with an ordinary
+        // `-> ../shared` link is refused while a hostile name sails past.
+        // Split the arrow off first, then read the fixed columns:
+        // owner, size, date, time, name.
+        let tail = match rest.split_once(" -> ") {
+            Some((head, _target)) => head,
+            None => rest,
+        };
+        let Some(name) = tail.split_whitespace().nth(4) else {
+            continue;
+        };
+        let name = name.trim_end_matches('/');
         if name.is_empty() {
             continue;
         }

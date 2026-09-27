@@ -134,6 +134,30 @@ fn drop_key(home: &Path) {
     let _ = std::fs::remove_dir_all(home);
 }
 
+/// A source repo with one commit, plus a project whose policy seals to
+/// `key_id`. Returns (src, proj).
+fn project(tmp: &Path, key_id: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{key_id}\"]\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    (src, proj)
+}
+
 fn scratch(tag: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("oot-failclosed-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&dir);
@@ -352,6 +376,103 @@ fn test_sealed_bundle_is_self_contained() {
     assert!(
         !packed.contains("in-pack: 0"),
         "objects must be packed into the bundle, not borrowed: {packed}"
+    );
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The member check read the last field of tar's listing, which for a symlink
+/// is its TARGET. A repo with an ordinary `-> ../shared` link was therefore
+/// refused as an "unsafe member" and could never be verified, while the real
+/// name went unchecked.
+#[test]
+fn test_verify_opens_bundle_with_symlinks() {
+    let tmp = scratch("symlinks");
+    let (gpg_home, key_id) = make_test_key();
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    std::os::unix::fs::symlink("README.md", src.join("alias")).unwrap();
+    std::os::unix::fs::symlink("../src/other", src.join("up-link")).unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        format!(
+            "private_paths = [\".env\"]\nembargo_until = \"2099-01-01\"\nprivate_branches = []\nembargo_recipients = [\"{key_id}\"]\nresign_key_id = \"{key_id}\"\n"
+        ),
+    )
+    .unwrap();
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(ok, "seal failed: {msg}");
+
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(
+        ok,
+        "a repo with symlinks must verify, not be refused as unsafe: {msg}"
+    );
+    assert!(received.join("bundle/repo").exists());
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// The documented handoff uses a bare relative `--out`, with no directory
+/// part. That derives a staging path whose parent is the empty string, and
+/// `tar -C ""` fails, so the command the README prints could never work.
+#[test]
+fn test_seal_accepts_bare_relative_out() {
+    let tmp = scratch("bareout");
+    let (gpg_home, key_id) = make_test_key();
+    let (_src, proj) = project(&tmp, &key_id);
+
+    let artifact = Path::new("embargo-2099-01-01.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", gpg_home.to_str().unwrap())],
+    );
+    assert!(
+        ok,
+        "a bare relative --out must work, it is what the docs print: {msg}"
+    );
+    assert!(
+        proj.join(artifact).exists(),
+        "artifact must land beside --out"
+    );
+    assert!(
+        !proj.join("embargo-2099-01-01").exists(),
+        "the plaintext staging dir must be cleaned up"
+    );
+    assert!(
+        !proj.join("embargo-2099-01-01.tar").exists(),
+        "the plaintext tar must be cleaned up"
     );
 
     drop_key(&gpg_home);
