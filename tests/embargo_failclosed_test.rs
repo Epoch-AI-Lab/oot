@@ -568,3 +568,78 @@ fn test_verify_temp_tar_is_private_while_gpg_writes_it() {
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// An unusable MANIFEST is a refusal, and the decrypted tree under `--out` is
+/// plaintext: it must not survive the error, or the next run fails on
+/// "output already exists" instead of the real problem.
+#[test]
+fn test_verify_clears_tree_when_manifest_is_unusable() {
+    for case in ["missing", "corrupt"] {
+        let tmp = scratch(&format!("manifest-{case}"));
+        let (gpg_home, key_id) = make_test_key();
+        let (_src, proj) = project(&tmp, &key_id);
+        let gpg_home_str = gpg_home.to_str().unwrap().to_string();
+
+        let stage = tmp.join("stage");
+        std::fs::create_dir_all(stage.join("bundle")).unwrap();
+        std::fs::write(stage.join("bundle/secret.txt"), "PLAINTEXT").unwrap();
+        if case == "corrupt" {
+            std::fs::write(stage.join("bundle/MANIFEST.json"), "not json at all").unwrap();
+        }
+        let tar_path = tmp.join("payload.tar");
+        let made = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&stage)
+            .arg("--")
+            .arg("bundle")
+            .status()
+            .expect("tar should run");
+        assert!(made.success(), "tar create failed");
+
+        let artifact = tmp.join("payload.tar.gpg");
+        let sealed = Command::new("gpg")
+            .env("GNUPGHOME", &gpg_home_str)
+            .args([
+                "--batch",
+                "--yes",
+                "--trust-model",
+                "always",
+                "--encrypt",
+                "--sign",
+                "--local-user",
+                &key_id,
+                "--recipient",
+                &key_id,
+                "--output",
+                artifact.to_str().unwrap(),
+                "--",
+                tar_path.to_str().unwrap(),
+            ])
+            .status()
+            .expect("gpg should run");
+        assert!(sealed.success(), "gpg seal failed");
+
+        let received = tmp.join("received");
+        let (ok, msg) = oot_with_env(
+            &[
+                "embargo-verify",
+                "--artifact",
+                artifact.to_str().unwrap(),
+                "--out",
+                received.to_str().unwrap(),
+            ],
+            &proj,
+            &[("GNUPGHOME", &gpg_home_str)],
+        );
+        assert!(!ok, "{case} manifest must be refused");
+        assert!(
+            !received.exists(),
+            "{case}: a refused open must not leave decrypted plaintext: {msg}"
+        );
+
+        drop_key(&gpg_home);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+}

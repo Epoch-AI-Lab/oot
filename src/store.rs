@@ -3232,40 +3232,23 @@ pub fn embargo_verify(
             ));
         }
     }
-    // Manifest discovery follows the seal layout (bundle root for --plain
-    // style, one level down for sealed artifacts). Every candidate is
-    // symlink-checked first: `is_file` follows links, and a crafted tar
-    // could otherwise point the manifest — or the repo — outside.
-    let manifest_path = {
-        let direct = out_dir.join("MANIFEST.json");
-        if is_plain_file(&direct) {
-            direct
-        } else {
-            let mut found: Option<PathBuf> = None;
-            for entry in std::fs::read_dir(out_dir)? {
-                let entry = entry?;
-                if !is_plain_dir(&entry.path()) {
-                    continue;
-                }
-                let candidate = entry.path().join("MANIFEST.json");
-                if is_plain_file(&candidate) {
-                    found = Some(candidate);
-                    break;
-                }
-            }
-            found.ok_or_else(|| {
-                anyhow!(
-                    "decrypted bundle has no MANIFEST.json under {}",
-                    out_dir.display()
-                )
-            })?
+    // The tree under `out_dir` is decrypted plaintext. A missing or
+    // unparseable manifest is a refusal, and a refusal must not leave that
+    // plaintext behind, so both failures clear the tree on the way out.
+    let manifest_path = find_manifest(out_dir).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(out_dir);
+    })?;
+    let manifest: serde_json::Value = match std::fs::read(&manifest_path)
+        .with_context(|| format!("failed to read {}", manifest_path.display()))
+        .and_then(|raw| {
+            serde_json::from_slice(&raw).context("bundle MANIFEST.json is not valid JSON")
+        }) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(out_dir);
+            return Err(e);
         }
     };
-    let manifest: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(&manifest_path)
-            .with_context(|| format!("failed to read {}", manifest_path.display()))?,
-    )
-    .context("bundle MANIFEST.json is not valid JSON")?;
     let embargo_until = manifest
         .get("embargo_until")
         .and_then(|v| v.as_str())
@@ -3357,6 +3340,33 @@ fn is_plain_dir(path: &Path) -> bool {
     matches!(
         std::fs::symlink_metadata(path).map(|m| (m.file_type().is_symlink(), m.is_dir())),
         Ok((false, true))
+    )
+}
+
+/// Locate the bundle's MANIFEST.json: at the root (a `--plain` layout) or
+/// one level down (a sealed artifact unpacks under its staging name).
+/// Symlinks are refused, since `is_file` follows them and a crafted tar
+/// could otherwise point the manifest at a file outside the output dir.
+fn find_manifest(out_dir: &Path) -> Result<PathBuf> {
+    let direct = out_dir.join("MANIFEST.json");
+    if is_plain_file(&direct) {
+        return Ok(direct);
+    }
+    for entry in std::fs::read_dir(out_dir)
+        .with_context(|| format!("failed to list {}", out_dir.display()))?
+    {
+        let entry = entry.with_context(|| format!("failed to read {}", out_dir.display()))?;
+        if !is_plain_dir(&entry.path()) {
+            continue;
+        }
+        let candidate = entry.path().join("MANIFEST.json");
+        if is_plain_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    bail!(
+        "decrypted bundle has no MANIFEST.json under {}",
+        out_dir.display()
     )
 }
 
