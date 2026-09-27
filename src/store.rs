@@ -3179,6 +3179,97 @@ pub fn embargo_verify(
     out_dir: &Path,
     expect_signer: Option<&str>,
 ) -> Result<VerifiedBundle> {
+    embargo_verify_audited(artifact, out_dir, expect_signer, None)
+}
+
+/// Open a bundle and write a recipient-side record of what happened.
+///
+/// The audit path defaults to a log beside the output tree and can be moved
+/// with `--audit-log`. Both outcomes are recorded: a refusal is exactly the
+/// event a maintainer will want to be able to show afterwards.
+///
+/// This log is written by the recipient, so it is a local record and not an
+/// authenticated one — it is evidence someone ran this, not proof from the
+/// sender. The artifact digest in each line is what binds a record to a
+/// specific file, so a claim can be checked against the artifact itself.
+pub fn embargo_verify_audited(
+    artifact: &Path,
+    out_dir: &Path,
+    expect_signer: Option<&str>,
+    audit_log: Option<&Path>,
+) -> Result<VerifiedBundle> {
+    let digest = std::fs::read(artifact)
+        .map(|b| crate::court::fnv1a(&b))
+        .unwrap_or_else(|_| "unreadable".to_string());
+    let log_path = audit_log.map(Path::to_path_buf).unwrap_or_else(|| {
+        out_dir
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .join("oot-verify-log.jsonl")
+    });
+    match embargo_verify_inner(artifact, out_dir, expect_signer) {
+        Ok(v) => {
+            let _ = write_verify_record(
+                &log_path,
+                serde_json::json!({
+                    "event": "embargo-verified",
+                    "artifact": artifact.display().to_string(),
+                    "artifact_fnv1a": digest,
+                    "signer": v.signer,
+                    "signer_pinned": expect_signer.is_some(),
+                    "expected_signer": expect_signer,
+                    "embargo_until": v.embargo_until,
+                    "recipients": v.recipients,
+                    "changes": v.changes,
+                    "tree": out_dir.display().to_string(),
+                }),
+            );
+            Ok(v)
+        }
+        Err(e) => {
+            let _ = write_verify_record(
+                &log_path,
+                serde_json::json!({
+                    "event": "embargo-verify-refused",
+                    "artifact": artifact.display().to_string(),
+                    "artifact_fnv1a": digest,
+                    "signer_pinned": expect_signer.is_some(),
+                    "reason": e.to_string(),
+                }),
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Append one line to the recipient's audit log. A failure to record is
+/// reported but never turns a good open into a bad one: the bundle is already
+/// verified by then, and refusing it would leave the recipient with nothing.
+fn write_verify_record(path: &Path, mut entry: serde_json::Value) -> Result<()> {
+    use std::io::Write;
+    if let Some(obj) = entry.as_object_mut() {
+        obj.insert("epoch".into(), serde_json::json!(now_epoch()));
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open audit log {}", path.display()))?;
+    writeln!(f, "{entry}")?;
+    Ok(())
+}
+
+fn embargo_verify_inner(
+    artifact: &Path,
+    out_dir: &Path,
+    expect_signer: Option<&str>,
+) -> Result<VerifiedBundle> {
     if !artifact.is_file() {
         if artifact.exists() {
             bail!("not a bundle file: {}", artifact.display());

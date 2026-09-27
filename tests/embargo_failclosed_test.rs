@@ -614,3 +614,98 @@ fn test_verify_refuses_bundle_whose_signer_key_expired() {
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A recipient-side record of what happened. For a governance tool, "who
+/// opened this bundle, when, and was the signer pinned" is the question a
+/// maintainer will be asked later, and it was unanswerable: verify wrote
+/// nothing at all. Both outcomes must be recorded, because a refusal is
+/// exactly the event worth keeping.
+#[test]
+fn test_verify_records_opens_and_refusals() {
+    let tmp = scratch("verify-audit");
+    let (gpg_home, key_id) = make_test_key();
+    let (_src, proj) = project(&tmp, &key_id);
+    let gpg_home_str = gpg_home.to_str().unwrap().to_string();
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(ok, "seal failed: {msg}");
+
+    // Default location: a log beside the output tree.
+    let log = tmp.join("oot-verify-log.jsonl");
+
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+            "--expect-signer",
+            &key_id,
+        ],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(ok, "verify failed: {msg}");
+    assert!(
+        msg.contains("recorded this open"),
+        "must say it recorded: {msg}"
+    );
+
+    // A refusal, with the log somewhere else.
+    let elsewhere = tmp.join("audit").join("opens.jsonl");
+    let (ok, _msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            tmp.join("received2").to_str().unwrap(),
+            "--expect-signer",
+            "DEADBEEFDEADBEEF",
+            "--audit-log",
+            elsewhere.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(!ok, "a wrong pin must still be refused");
+
+    let opened: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&log).unwrap()).unwrap();
+    let opened = opened.as_object().expect("one JSON object");
+    assert_eq!(opened["event"], "embargo-verified");
+    assert_eq!(opened["signer_pinned"], true);
+    assert_eq!(opened["signer"], key_id);
+    assert_eq!(opened["embargo_until"], "2099-01-01");
+    assert!(
+        opened["artifact_fnv1a"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "the record must bind to the artifact: {opened:?}"
+    );
+
+    let refused: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&elsewhere).unwrap()).unwrap();
+    let refused = refused.as_object().expect("one JSON object");
+    assert_eq!(refused["event"], "embargo-verify-refused");
+    assert!(
+        refused["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("signer mismatch")),
+        "a refusal must say why: {refused:?}"
+    );
+    assert_eq!(
+        refused["artifact_fnv1a"], opened["artifact_fnv1a"],
+        "both records must name the same artifact"
+    );
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}

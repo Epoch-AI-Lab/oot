@@ -191,6 +191,12 @@ enum Commands {
         /// the signer's public key, or the open fails on the missing secret.
         #[arg(long, value_name = "FPR")]
         expect_signer: Option<String>,
+        /// Where to append the recipient-side audit record. Defaults to
+        /// `oot-verify-log.jsonl` beside --out. Both opens and refusals are
+        /// recorded, with a digest of the artifact so a record can be checked
+        /// against the file itself.
+        #[arg(long, value_name = "FILE")]
+        audit_log: Option<String>,
     },
     /// Materialize a stored change's tree into the working copy.
     /// Does not move any branch pointer. Run `oot record` to save the result as a new change.
@@ -830,11 +836,13 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             artifact,
             out,
             expect_signer,
+            audit_log,
         } => {
-            let verified = oot::store::embargo_verify(
+            let verified = oot::store::embargo_verify_audited(
                 std::path::Path::new(&artifact),
                 std::path::Path::new(&out),
                 expect_signer.as_deref(),
+                audit_log.as_deref().map(std::path::Path::new),
             )?;
             if expect_signer.is_none() {
                 // Any valid signature opens without a pin. That is a silent
@@ -853,6 +861,16 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 verified.recipients.len()
             );
             println!("unpacked to {out}");
+            let log = audit_log.clone().unwrap_or_else(|| {
+                std::path::Path::new(&out)
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join("oot-verify-log.jsonl")
+                    .display()
+                    .to_string()
+            });
+            println!("recorded this open in {log}");
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::Update {

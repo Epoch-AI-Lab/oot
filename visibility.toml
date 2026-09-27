@@ -29,6 +29,8 @@ private_paths = [".env", "secrets/", ".pem"]
 # key id of 16+ hex chars; the recipient also needs a secret key.
 # Every authenticity claim here reduces to the `gpg` binary, so set
 # `OOT_GPG` (and `OOT_TAR`) to absolute paths if PATH is not trustworthy.
+# The recipient's `embargo-verify` appends both opens and refusals to
+# `oot-verify-log.jsonl` beside `--out`, with a digest of the artifact.
 #
 # Bundle layout: `--plain` writes the directory itself (repo/ + MANIFEST.json
 # + dockets/ + logs, audit-local only); sealed artifacts unpack to

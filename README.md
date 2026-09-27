@@ -162,6 +162,12 @@ cd received/*/repo && git log --oneline
 The received `repo/` is self-contained: history travels inside the bundle, so
 it reads fine with the sender's machine switched off.
 
+Both opens and refusals are appended to `oot-verify-log.jsonl` beside `--out`
+(move it with `--audit-log`). Each line carries a digest of the artifact, so a
+record can be checked against the file it claims to describe. It is a local
+record written by the recipient: evidence that someone ran this, not proof
+from the sender.
+
 ## Contribute
 
 We need folks who have been burned by repo-level permissions, leaked diffs, and clean merges that ship bugs. If that shit pissed you off, talk to us:
