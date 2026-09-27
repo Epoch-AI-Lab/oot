@@ -21,8 +21,9 @@ pub struct VisibilityPolicy {
     #[serde(default = "default_private_paths")]
     pub private_paths: Vec<String>,
     /// If set, the change is held under embargo until this date
-    /// (`YYYY-MM-DD`; also `YYYY/MM/DD`, `YYYY.MM.DD`, `DD-MM-YYYY`).
-    /// The date itself counts as held; malformed dates fail closed (held).
+    /// (`YYYY-MM-DD`; also `YYYY/MM/DD`, `YYYY.MM.DD`, and the `DD-MM-YYYY`
+    /// family). The date itself counts as held; malformed dates fail
+    /// closed, that is, held.
     #[serde(default)]
     pub embargo_until: Option<String>,
     /// Branch names that must stay private. Referencing these raises a visibility dispute.
@@ -33,8 +34,11 @@ pub struct VisibilityPolicy {
     /// filtering rebuilds history, clean commits keep their own sigs.
     #[serde(default)]
     pub resign_key_id: Option<String>,
-    /// Maintainer key ids allowed to receive an embargo bundle.
-    /// Empty means bundle refuses. Only names who gets it, Oot never sends.
+    /// Maintainer key references allowed to receive an embargo bundle: an
+    /// email or a fingerprint, resolved against the local keyring. Oot never
+    /// fetches keys, so an entry that does not resolve refuses the seal
+    /// before any plaintext exists. Empty means the bundle refuses. This
+    /// only names who gets it; Oot never sends.
     #[serde(default)]
     pub embargo_recipients: Vec<String>,
 }

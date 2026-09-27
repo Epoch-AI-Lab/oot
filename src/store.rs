@@ -1352,7 +1352,8 @@ impl Store {
     }
 
     /// Build a maintainer-only embargo bundle: full history with nothing
-    /// withheld, plus dockets, export log, and a MANIFEST naming who gets it.
+    /// withheld, plus dockets, export log, and a MANIFEST.json naming who
+    /// gets it.
     /// Oot writes the plain bundle here; sealing happens in
     /// `embargo_bundle_sealed` through the gpg binary (same shell-out
     /// model as git). Sending stays with the courier: Oot never sends.
@@ -3028,7 +3029,7 @@ impl Drop for PlaintextGuard {
 /// The staging dir for a sealed artifact: the artifact path with its
 /// extensions stripped, so extracting the tarball lands in a directory
 /// named like the bundle. `embargo-2099.tar.gpg` -> `embargo-2099/`.
-pub fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
+fn sealed_staging_dir(out: &Path) -> std::path::PathBuf {
     let name = out
         .file_stem()
         .and_then(|s| s.to_str())
@@ -3061,14 +3062,26 @@ pub struct VerifiedBundle {
 /// arrived.
 ///
 /// Both `VALIDSIG` and `DECRYPTION_OKAY` are required in gpg's status
-/// output, and any `BADSIG`/`ERRSIG`/expiry/revocation marker refuses the
-/// open — even beside a `VALIDSIG`. That expiry strictness is deliberate:
-/// old bundles stop opening when the signer key dies, so re-seal under a
-/// live key instead of overriding the check. With `expect_signer`, the VALIDSIG fingerprint must match a full
-/// fingerprint or a trailing key-id suffix (case-insensitive, at least 16
-/// hex chars). No network, no key fetch: both sides import keys out of
-/// band first. The intermediate plaintext tar is deleted; the extracted
-/// tree under `out_dir` is chmod 0700.
+/// output, and any `BADSIG`/`ERRSIG`/`EXPSIG`/`EXPKEYSIG`/`REVKEYSIG`/
+/// `KEYREVOKED` marker refuses the open even beside a `VALIDSIG`.
+///
+/// That marker list is what gpg actually emits, which is a narrower claim
+/// than "an expired signer cannot open this": gpg 2.4 emits no expiry
+/// marker for a key that expired *after* signing, so such a bundle still
+/// opens. That matches OpenPGP — a signature made while the key was live
+/// stays good — and is why expiry is enforced on the seal side, where the
+/// key still has to be usable.
+///
+/// `expect_signer` accepts either fingerprint gpg reports: the signing
+/// subkey, or the primary an operator reads off `gpg --fingerprint` and
+/// writes into `visibility.toml`. A full fingerprint, or a trailing key-id
+/// suffix of at least 16 hex chars, case-insensitive. A suffix is weaker
+/// than a fingerprint, so prefer the whole thing.
+///
+/// No network, no key fetch: both sides import keys out of band first. The
+/// intermediate plaintext tar is created 0600 and deleted; `out_dir` is
+/// chmod 0700, and every refusal path removes it rather than leaving
+/// decrypted history for the next run to trip over.
 pub fn embargo_verify(
     artifact: &Path,
     out_dir: &Path,
@@ -3414,8 +3427,6 @@ fn find_manifest(out_dir: &Path) -> Result<PathBuf> {
 const MAX_BUNDLE_MEMBERS: usize = 2_000_000;
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
-/// Whether `s` is a plausible key id: hex only, at least 8 chars. Keeps a
-/// malformed gpg status field from being used as a fingerprint.
 /// What gpg's `--status-fd` said about an opened bundle.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GpgStatus {
@@ -3483,6 +3494,8 @@ fn parse_gpg_status(raw: &str) -> GpgStatus {
     out
 }
 
+/// Whether `s` is a plausible key id: hex only, at least 8 chars. Keeps a
+/// malformed or truncated gpg status field from being used as a fingerprint.
 fn is_hex_keyid(s: &str) -> bool {
     s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
