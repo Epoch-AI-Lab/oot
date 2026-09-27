@@ -3404,14 +3404,15 @@ fn find_manifest(out_dir: &Path) -> Result<PathBuf> {
     )
 }
 
-/// Caps on an incoming bundle. A signed artifact is still attacker-
-/// reachable when a signer key leaks, so extraction is bounded: a ~3 MB
-/// hostile tar must not be able to exhaust a recipient's disk. 4 GiB of
-/// plain files is far beyond any real code bundle, and the byte cap is
-/// deliberately under the 8 GiB ceiling of a ustar octal size field so it
-/// is reachable by a crafted header.
-const MAX_BUNDLE_MEMBERS: usize = 100_000;
-const MAX_BUNDLE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Ceilings on an incoming bundle, not a description of a normal one.
+/// An embargo bundle is a FULL unfiltered history, so it carries every git
+/// object in the store: roughly three per commit, which a 100k-commit
+/// repository blows past. The numbers here refuse absurd floods — a ~3 MB
+/// artifact must not be able to fill a disk — while leaving real histories
+/// alone. They are a last line of defence: GNU tar independently refuses
+/// traversal, absolute and hardlink members.
+const MAX_BUNDLE_MEMBERS: usize = 2_000_000;
+const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 /// Whether `s` is a plausible key id: hex only, at least 8 chars. Keeps a
 /// malformed gpg status field from being used as a fingerprint.
@@ -3500,7 +3501,8 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
     // a sparse archive declares gigabytes it never stores, so GNU tar may
     // refuse to list it at all: the caps must hold regardless of whether
     // tar can parse the file.
-    let (members, bytes) = tar_header_totals(tar_path)?;
+    let (members, bytes) =
+        tar_header_totals(tar_path, MAX_BUNDLE_MEMBERS as u64, MAX_BUNDLE_BYTES)?;
     if members == 0 {
         bail!("bundle tar is empty (refusing to open)");
     }
@@ -3568,7 +3570,7 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
 /// Walk ustar/GNU headers to count members and total the declared payload
 /// sizes. Reads headers only, so a sparse archive that declares gigabytes
 /// costs nothing to reject. Returns (member count, declared bytes).
-fn tar_header_totals(tar_path: &Path) -> Result<(u64, u64)> {
+fn tar_header_totals(tar_path: &Path, max_members: u64, max_bytes: u64) -> Result<(u64, u64)> {
     use std::io::{Read, Seek, SeekFrom};
     let file = std::fs::File::open(tar_path)
         .with_context(|| format!("failed to open {}", tar_path.display()))?;
@@ -3577,7 +3579,12 @@ fn tar_header_totals(tar_path: &Path) -> Result<(u64, u64)> {
     let mut members: u64 = 0;
     let mut bytes: u64 = 0;
     // Bounded so a header run of zeros or a malformed archive cannot spin.
-    while members < 2_000_000 {
+    // The cap is enforced by bailing, not by quietly stopping: returning
+    // "exactly max_members" would let a flood masquerade as a fit archive.
+    loop {
+        if members > max_members {
+            bail!("bundle tar has more than {max_members} members (refusing to open)");
+        }
         match reader.read_exact(&mut header) {
             Ok(()) => {}
             // Running out of bytes before the end-of-archive marker means
@@ -3593,6 +3600,9 @@ fn tar_header_totals(tar_path: &Path) -> Result<(u64, u64)> {
             break; // end-of-archive marker
         }
         members += 1;
+        if members > max_members {
+            bail!("bundle tar has more than {max_members} members (refusing to open)");
+        }
         // Octal size at offset 124, 12 bytes, NUL/space terminated. GNU
         // base-256 (high bit set) means a value too large for octal fields:
         // saturate rather than trust it.
@@ -3613,8 +3623,8 @@ fn tar_header_totals(tar_path: &Path) -> Result<(u64, u64)> {
             // Check as we go, before touching the payload: a sparse member
             // declaring more than the whole cap must be refused without the
             // archive ever having to be that large on disk.
-            if bytes > MAX_BUNDLE_BYTES {
-                bail!("bundle tar expands past {MAX_BUNDLE_BYTES} bytes (refusing to open)");
+            if bytes > max_bytes {
+                bail!("bundle tar expands past {max_bytes} bytes (refusing to open)");
             }
         }
         // Skip the payload, padded to a 512 boundary.
@@ -3623,8 +3633,8 @@ fn tar_header_totals(tar_path: &Path) -> Result<(u64, u64)> {
             // The archive is shorter than its own headers claim: a sparse
             // member, which Oot never writes. Report the byte cap when that
             // is the real objection, truncation otherwise.
-            if bytes > MAX_BUNDLE_BYTES {
-                bail!("bundle tar expands past {MAX_BUNDLE_BYTES} bytes (refusing to open)");
+            if bytes > max_bytes {
+                bail!("bundle tar expands past {max_bytes} bytes (refusing to open)");
             }
             bail!("bundle tar is truncated (refusing to open)");
         }
@@ -3750,6 +3760,75 @@ mod tests {
         assert_eq!(st.bad_marker, None);
         assert!(st.decrypted_ok);
         assert!(st.signatures.is_empty(), "no signature was reported");
+    }
+
+    /// The byte and member caps are a floor against absurd floods, not a
+    /// description of a normal bundle, so they are tested with injectable
+    /// limits rather than a multi-gigabyte fixture.
+    #[test]
+    fn test_tar_header_totals_enforces_injected_limits() {
+        let dir = guard_tmp("tarwalk");
+        let path = dir.join("t.tar");
+
+        // 12 members, one declaring 4 KiB, each with its real payload so the
+        // walk's seek stays in sync with the archive.
+        let mut out: Vec<u8> = Vec::new();
+        for i in 0..12u32 {
+            let size = if i == 0 { 4096 } else { 1 };
+            out.extend_from_slice(&ustar_header_for_tests(&format!("bundle/f{i}"), size));
+            out.resize(out.len() + size as usize, 0);
+            out.resize(out.len().next_multiple_of(512), 0);
+        }
+        out.extend_from_slice(&[0u8; 1024]);
+        std::fs::write(&path, &out).unwrap();
+
+        // Generous limits: counted, accepted.
+        let (members, bytes) = tar_header_totals(&path, 1_000, 1_000_000).unwrap();
+        assert_eq!(members, 12);
+        assert_eq!(bytes, 4096 + 11);
+
+        // Member cap: refuses, and names the cap.
+        let err = tar_header_totals(&path, 5, 1_000_000).unwrap_err();
+        assert!(
+            err.to_string().contains("more than 5 members"),
+            "must name the member cap: {err}"
+        );
+
+        // Byte cap: refuses, and names the cap.
+        let err = tar_header_totals(&path, 1_000, 4_096).unwrap_err();
+        assert!(
+            err.to_string().contains("expands past 4096 bytes"),
+            "must name the byte cap: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A ustar header declaring `size` bytes. Octal, NUL-terminated, with a
+    /// correct checksum, so the walk and GNU tar agree about the archive.
+    fn ustar_header_for_tests(name: &str, size: u64) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let mut octal = |v: u64, at: usize, len: usize| {
+            let width = len - 1;
+            let mut s = format!("{v:0width$o}", width = width);
+            s.truncate(width);
+            h[at..at + width].copy_from_slice(s.as_bytes());
+            h[at + width] = 0;
+        };
+        octal(0o644, 100, 8);
+        octal(0, 108, 8);
+        octal(0, 116, 8);
+        octal(size, 124, 12);
+        octal(0, 136, 12);
+        h[148..156].copy_from_slice(b"        ");
+        h[156] = b'0';
+        h[257..262].copy_from_slice(b"ustar");
+        h[263..265].copy_from_slice(b"00");
+        let sum: u32 = h.iter().map(|b| *b as u32).sum();
+        let chk = format!("{sum:06o}\0 ");
+        h[148..156].copy_from_slice(chk.as_bytes());
+        h
     }
 
     /// A stat error is not "absent". `symlink_metadata` failing for a reason
