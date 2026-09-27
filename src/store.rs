@@ -1608,7 +1608,7 @@ impl Store {
         // make it 0666 & ~umask, so the full plaintext history would sit
         // world-readable in the artifact's parent if it were left to tar.
         let tar_file = create_private(tar_path)?;
-        run(Command::new("tar")
+        run(Command::new(tar_bin())
             .args(["-cf"])
             .arg(tar_file.as_os_str())
             .arg("-C")
@@ -1622,7 +1622,7 @@ impl Store {
             )
             .arg("--")
             .arg(staging.file_name().unwrap_or_default()))?;
-        let mut gpg = Command::new("gpg");
+        let mut gpg = Command::new(gpg_bin());
         gpg.args([
             "--batch",
             "--yes",
@@ -2860,6 +2860,28 @@ fn run(cmd: &mut Command) -> Result<()> {
     Ok(())
 }
 
+/// The external tool Oot delegates to, resolved once.
+///
+/// Every authenticity claim in the embargo flow reduces to gpg: the signature
+/// check, the key pre-flight, the seal and the open. Resolving `gpg` from
+/// `PATH` means anything earlier on `PATH` can answer for it, and a shim
+/// that prints a `VALIDSIG` line unpacks whatever it likes. That needs local
+/// control of the environment, which is the same class of access as editing
+/// `.oot/` directly — but an operator handing this to a maintainer should not
+/// have to trust `PATH` as well.
+///
+/// `OOT_GPG` pins an absolute path. Without it the name is resolved against
+/// `PATH` as before, so nothing changes for anyone who has not set it, and
+/// the env override is the documented answer rather than a silent assumption.
+fn gpg_bin() -> String {
+    std::env::var("OOT_GPG").unwrap_or_else(|_| "gpg".to_string())
+}
+
+/// The tar used for bundle packing and extraction, for the same reason.
+fn tar_bin() -> String {
+    std::env::var("OOT_TAR").unwrap_or_else(|_| "tar".to_string())
+}
+
 fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -2917,7 +2939,7 @@ enum GpgKeyState {
 }
 
 fn gpg_key_state(entry: &str) -> Result<GpgKeyState> {
-    let out = Command::new("gpg")
+    let out = Command::new(gpg_bin())
         .args(["--list-keys", "--with-colons", "--", entry])
         .output()
         .map_err(|e| {
@@ -3177,7 +3199,7 @@ pub fn embargo_verify(
             return Err(e);
         }
     };
-    let decrypt = Command::new("gpg")
+    let decrypt = Command::new(gpg_bin())
         .args([
             "--batch",
             "--yes",
@@ -3283,7 +3305,7 @@ pub fn embargo_verify(
         // unpacked, and extraction refuses to overwrite: hostile tars stay
         // outside and cannot exhaust the recipient's disk.
         check_tar_members(&tmp_tar)?;
-        run(Command::new("tar")
+        run(Command::new(tar_bin())
             .arg("--extract")
             .arg("--keep-old-files")
             .arg("--file")
@@ -3384,7 +3406,7 @@ enum GpgSecretState {
 }
 
 fn gpg_secret_key_state(entry: &str) -> Result<GpgSecretState> {
-    let out = Command::new("gpg")
+    let out = Command::new(gpg_bin())
         .args(["--list-secret-keys", "--with-colons", "--", entry])
         .output()
         .map_err(|e| {
@@ -3611,7 +3633,7 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
     }
     // Then names and types, via tar itself so long-name and pax encodings
     // are interpreted correctly instead of guessed at.
-    let listing = Command::new("tar")
+    let listing = Command::new(tar_bin())
         .arg("--list")
         .arg("--verbose")
         .arg("--numeric-owner")

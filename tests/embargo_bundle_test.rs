@@ -5,45 +5,9 @@
 use std::path::Path;
 use std::process::Command;
 
-fn bin() -> &'static str {
-    env!("CARGO_BIN_EXE_oot")
-}
-
-fn git(repo: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .env("GIT_AUTHOR_NAME", "Kriday")
-        .env("GIT_AUTHOR_EMAIL", "k@oot.dev")
-        .env("GIT_COMMITTER_NAME", "Kriday")
-        .env("GIT_COMMITTER_EMAIL", "k@oot.dev")
-        .output()
-        .expect("git should run");
-    assert!(
-        out.status.success(),
-        "git {:?} failed: {}",
-        args,
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-fn oot(args: &[&str], cwd: &Path) -> (bool, String) {
-    let o = Command::new(bin())
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .expect("oot binary should run");
-    (
-        o.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ),
-    )
-}
+#[path = "embargo_support/mod.rs"]
+mod support;
+use support::*;
 
 #[test]
 fn test_embargo_bundle_holds_what_public_drops() {
@@ -328,24 +292,6 @@ fn test_embargo_bundle_survives_invalid_tag() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
-/// Like `oot`, but with extra env (used to seal with a throwaway key).
-fn oot_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> (bool, String) {
-    let mut cmd = Command::new(bin());
-    cmd.args(args).current_dir(cwd);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    let o = cmd.output().expect("oot binary should run");
-    (
-        o.status.success(),
-        format!(
-            "{}{}",
-            String::from_utf8_lossy(&o.stdout),
-            String::from_utf8_lossy(&o.stderr)
-        ),
-    )
-}
-
 /// A key whose primary signs through a SUBKEY, like most real keys: the
 /// VALIDSIG print is the subkey, while `gpg --fingerprint` and
 /// `visibility.toml` name the primary. Signing here goes through a signing
@@ -445,91 +391,8 @@ fn signing_subkey_fpr(gpg_home: &Path, primary: &str) -> String {
     panic!("no signing subkey fingerprint found");
 }
 
-/// Remove a throwaway keyring and stop its agent, so secret keys do not
-/// pile up in /tmp across runs.
-fn drop_test_key(gpg_home: &Path) {
-    let _ = Command::new("gpgconf")
-        .env("GNUPGHOME", gpg_home)
-        .args(["--kill", "gpg-agent"])
-        .status();
-    let _ = std::fs::remove_dir_all(gpg_home);
-}
-
 /// Make a throwaway GPG home with one signing key. Fast (about 0.1s),
 /// no passphrase. Unique per call: tests run concurrently in one process.
-fn make_test_key() -> (std::path::PathBuf, String) {
-    use std::sync::atomic::{AtomicU32, Ordering};
-    static KEY_SEQ: AtomicU32 = AtomicU32::new(0);
-    let seq = KEY_SEQ.fetch_add(1, Ordering::Relaxed);
-    let home = std::env::temp_dir()
-        .join(format!("oot-embargo-gpg-{}", std::process::id()))
-        .join(format!("key-{seq}"));
-    let _ = std::fs::remove_dir_all(&home);
-    std::fs::create_dir_all(&home).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
-    let out = Command::new("gpg")
-        .env("GNUPGHOME", &home)
-        .args([
-            "--batch",
-            "--pinentry-mode",
-            "loopback",
-            "--passphrase",
-            "",
-            "--quick-generate-key",
-            "oot-test@example.com",
-            "ed25519",
-            "sign",
-            "0",
-        ])
-        .output()
-        .expect("gpg should run");
-    assert!(
-        out.status.success(),
-        "gpg keygen failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let list = Command::new("gpg")
-        .env("GNUPGHOME", &home)
-        .args(["--list-secret-keys", "--with-colons"])
-        .output()
-        .expect("gpg should run");
-    let text = String::from_utf8_lossy(&list.stdout);
-    let fpr = text
-        .lines()
-        .find(|l| l.starts_with("fpr:"))
-        .and_then(|l| l.split(':').nth(9))
-        .expect("keygen must yield a fingerprint")
-        .to_string();
-    assert!(!fpr.is_empty(), "empty fingerprint");
-    // The primary is sign-only; sealing needs an encryption subkey.
-    let add = Command::new("gpg")
-        .env("GNUPGHOME", &home)
-        .args([
-            "--batch",
-            "--pinentry-mode",
-            "loopback",
-            "--passphrase",
-            "",
-            "--quick-add-key",
-            &fpr,
-            "cv25519",
-            "encrypt",
-            "0",
-        ])
-        .output()
-        .expect("gpg should run");
-    assert!(
-        add.status.success(),
-        "gpg add-key failed: {}",
-        String::from_utf8_lossy(&add.stderr)
-    );
-    (home, fpr)
-}
-
 fn gpg_run(gpg_home: &Path, args: &[&str]) -> (bool, String) {
     let out = Command::new("gpg")
         .env("GNUPGHOME", gpg_home)
