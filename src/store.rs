@@ -3420,10 +3420,14 @@ fn find_manifest(out_dir: &Path) -> Result<PathBuf> {
 /// Ceilings on an incoming bundle, not a description of a normal one.
 /// An embargo bundle is a FULL unfiltered history, so it carries every git
 /// object in the store: roughly three per commit, which a 100k-commit
-/// repository blows past. The numbers here refuse absurd floods — a ~3 MB
-/// artifact must not be able to fill a disk — while leaving real histories
-/// alone. They are a last line of defence: GNU tar independently refuses
-/// traversal, absolute and hardlink members.
+/// repository blows past on member count and lands in the low tens of GiB.
+/// These numbers are sized above that so real histories are never refused.
+///
+/// They are a floor against floods, NOT a disk-exhaustion defence: 64 GiB
+/// from a small artifact is enough to fill a volume, and no cap on declared
+/// size can promise otherwise. What holds the line is refusing the member
+/// types whose size field does not mean payload bytes (sparse, pax), plus
+/// GNU tar's own refusal of traversal, absolute and hardlink members.
 const MAX_BUNDLE_MEMBERS: usize = 2_000_000;
 const MAX_BUNDLE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
@@ -3494,6 +3498,31 @@ fn parse_gpg_status(raw: &str) -> GpgStatus {
     out
 }
 
+/// The text after `skip` whitespace-delimited columns, or None if the line
+/// has fewer. Returns the remainder rather than one token, so a name
+/// containing spaces survives intact.
+fn nth_column(line: &str, skip: usize) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut cols = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            return None;
+        }
+        if cols == skip {
+            return Some(line[i..].trim_end().to_string());
+        }
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        cols += 1;
+    }
+    None
+}
+
 /// Whether `s` is a plausible key id: hex only, at least 8 chars. Keeps a
 /// malformed or truncated gpg status field from being used as a fingerprint.
 fn is_hex_keyid(s: &str) -> bool {
@@ -3557,7 +3586,11 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
             Some((head, _target)) => head,
             None => rest,
         };
-        let Some(name) = tail.split_whitespace().nth(4) else {
+        // Skip exactly four columns (owner, size, date, time) and take the
+        // REST, not the fifth token: a filename may contain spaces, and
+        // `nth(4)` judged only the first word of it, so a member named
+        // `bundle/pwn /../../tmp/x` was checked as `bundle/pwn` and allowed.
+        let Some(name) = nth_column(tail, 4) else {
             continue;
         };
         let name = name.trim_end_matches('/');
@@ -3630,8 +3663,23 @@ fn tar_header_totals(tar_path: &Path, max_members: u64, max_bytes: u64) -> Resul
                 .collect();
             u64::from_str_radix(text.trim(), 8).unwrap_or(0)
         };
+        // Offsets 124..136 mean "payload bytes" only for a plain file or a
+        // symlink. For a GNU sparse member ('S') they hold the ARCHIVED
+        // size and the expanded size lives in a sparse map we do not read,
+        // and pax records ('x', 'g') can override the size outright. Both
+        // turn the byte cap into a decoration — a 1.2 KB archive measured
+        // as 128 GiB — so refuse the types rather than guess their size.
+        let typeflag = header[156];
+        if matches!(typeflag, b'S' | b'x' | b'g') {
+            let name: String = header[..100]
+                .iter()
+                .take_while(|b| **b != 0)
+                .map(|b| *b as char)
+                .collect();
+            bail!("bundle tar member has an unsupported type: {name}");
+        }
         // Typeflag '5' is a directory: it declares no payload.
-        if header[156] != b'5' {
+        if typeflag != b'5' {
             bytes = bytes.saturating_add(size);
             // Check as we go, before touching the payload: a sparse member
             // declaring more than the whole cap must be refused without the
@@ -3815,6 +3863,54 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member whose size field does not mean payload bytes defeats the byte
+    /// cap outright: GNU sparse ('S') hides the expanded size in a map we do
+    /// not read, and pax ('x'/'g') can override the size. A 1.2 KB archive
+    /// measured as 128 GiB, so these types are refused rather than guessed.
+    #[test]
+    fn test_tar_header_totals_refuses_sparse_and_pax_members() {
+        let dir = guard_tmp("sparse");
+        for (flag, label) in [(b'S', "sparse"), (b'x', "pax-extended")] {
+            let path = dir.join(format!("{label}.tar"));
+            let mut h = ustar_header_for_tests("bundle/hole.bin", 0);
+            h[156] = flag;
+            // Re-checksum after changing the typeflag.
+            h[148..156].copy_from_slice(b"        ");
+            let sum: u32 = h.iter().map(|b| *b as u32).sum();
+            let chk = format!("{sum:06o}\0 ");
+            h[148..156].copy_from_slice(chk.as_bytes());
+            let mut out: Vec<u8> = h.to_vec();
+            out.extend_from_slice(&[0u8; 1024]);
+            std::fs::write(&path, &out).unwrap();
+
+            let err = tar_header_totals(&path, 1_000, 1_000_000).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported type"),
+                "{label} must be refused: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A member name may contain spaces, and the check used to read only the
+    /// first word of it, so `bundle/pwn /../../tmp/x` was judged on
+    /// `bundle/pwn` and allowed.
+    #[test]
+    fn test_nth_column_keeps_spaces_in_the_name() {
+        let line = "1000/1000         6 1970-01-01 05:30 bundle/pwn /../../tmp/x";
+        assert_eq!(
+            nth_column(line, 4).as_deref(),
+            Some("bundle/pwn /../../tmp/x"),
+            "the whole name must survive"
+        );
+        // A line with too few columns yields nothing rather than a fragment.
+        assert_eq!(nth_column("1000/1000 6 1970-01-01", 4), None);
+        assert_eq!(
+            nth_column("  a b  c d  name with  spaces ", 4).as_deref(),
+            Some("name with  spaces")
+        );
     }
 
     /// A ustar header declaring `size` bytes. Octal, NUL-terminated, with a
