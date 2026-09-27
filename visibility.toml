@@ -27,6 +27,8 @@ private_paths = [".env", "secrets/", ".pem"]
 # `oot embargo-verify --artifact <file> --out <dir> --expect-signer <FPR>`.
 # The pin takes the primary fingerprint, the signing subkey, or a trailing
 # key id of 16+ hex chars; the recipient also needs a secret key.
+# Every authenticity claim here reduces to the `gpg` binary, so set
+# `OOT_GPG` (and `OOT_TAR`) to absolute paths if PATH is not trustworthy.
 #
 # Bundle layout: `--plain` writes the directory itself (repo/ + MANIFEST.json
 # + dockets/ + logs, audit-local only); sealed artifacts unpack to
