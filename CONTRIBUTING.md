@@ -12,7 +12,7 @@ Oot is the court for code. It judges **changes**, not commits or branches. A cha
 
 ## The model in one paragraph
 
-A **Change** is a delta between two snapshots. It has an **Intent** (what it says it means), a **Visibility** policy (private-to, embargo-until, public), and authorship. Oot makes a **Docket**: the disputes it found, a **Verdict** (`adjudicated`, `blocked`, `embargoed`, `cloaked`), and embargo state. The engine is content addressed. It never needs a working tree on disk, so it runs fine in an agent's memory.
+A **Change** is a delta between two snapshots. It has an **Intent** (what it says it means), a **Visibility** policy (`private_paths`, `private_branches`, `embargo_until`), and authorship. Oot makes a **Docket**: the disputes it found, a **Verdict** (`adjudicated`, `blocked`, `embargoed`, `cloaked`), and embargo state. The engine is content addressed. It never needs a working tree on disk, so it runs fine in an agent's memory.
 
 ## Where the work lives
 
@@ -38,8 +38,8 @@ from:       <source: git | jj | memory>
 base:       <ref>
 head:       <ref>
 meaning:    <n> disputes detected
-visibility: <private paths>, <embargoed until date>
-scope:      <areas touched>
+visibility: <n> private path(s)
+intent:     <declared intent, or the areas touched>
 authors:    <list>
 
 dispute-01: <what and where>     [meaning | visibility]
@@ -48,7 +48,7 @@ verdict:    ADJUDICATED | BLOCKED | EMBARGOED | CLOAKED
 embargo:    <held for maintainers until date>
 ```
 
-A dispute has four fields: `id`, `location`, `kind` (`meaning` or `visibility`), and `severity`. Severity feeds the policy threshold. If you add a `kind`, you must say how policy treats it. No magic.
+A dispute has five fields: `id`, `location`, `kind` (`meaning` or `visibility`), `severity`, and `detail`. Severity feeds the policy threshold. If you add a `kind`, you must say how policy treats it. No magic.
 
 ## Dev setup
 
