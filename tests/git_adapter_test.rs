@@ -94,6 +94,36 @@ impl TempGitRepo {
             .expect("git checkout failed");
         assert!(status.success());
     }
+
+    /// Commit under a specific author identity, so docket provenance is real.
+    fn commit_as(&self, msg: &str, name: &str, email: &str) -> String {
+        let prev_name = self.git_config("user.name");
+        let prev_email = self.git_config("user.email");
+        self.set_git_config("user.name", name);
+        self.set_git_config("user.email", email);
+        let sha = self.commit(msg);
+        self.set_git_config("user.name", &prev_name);
+        self.set_git_config("user.email", &prev_email);
+        sha
+    }
+
+    fn git_config(&self, key: &str) -> String {
+        let out = Command::new("git")
+            .args(["config", "--get", key])
+            .current_dir(&self.path)
+            .output()
+            .expect("git config read failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn set_git_config(&self, key: &str, value: &str) {
+        let status = Command::new("git")
+            .args(["config", key, value])
+            .current_dir(&self.path)
+            .status()
+            .expect("git config write failed");
+        assert!(status.success());
+    }
 }
 
 impl Drop for TempGitRepo {
@@ -273,6 +303,38 @@ fn test_git_adapter_visibility_violation_cloaked() {
     assert_eq!(docket.verdict, Verdict::Cloaked);
     assert_eq!(docket.visibility_count(), 1);
     assert!(docket.disputes[0].detail.contains("private path"));
+}
+
+#[test]
+fn test_git_adapter_3way_reports_real_commit_authors() {
+    let repo = TempGitRepo::new("3way_authors");
+
+    repo.write_file("src/lib.rs", "pub fn common() -> i32 { 0 }\n");
+    repo.commit_as("base version", "Base Author", "base@example.com");
+
+    repo.create_and_checkout_branch("feature/auth");
+    repo.write_file("src/lib.rs", "pub fn common() -> i32 { 1 }\n");
+    repo.commit_as("feature commit", "Dana Feature", "dana@example.com");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let engine = Engine::new().expect("valid engine");
+
+    let docket = adapter
+        .adjudicate_3way(
+            "main",
+            "feature/auth",
+            &engine,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &GitAdjudicateOptions::default(),
+        )
+        .expect("adjudicate 3way");
+
+    assert_eq!(
+        docket.authors,
+        vec!["Dana Feature".to_string()],
+        "docket must name the commits' real author, not the @git-author fallback"
+    );
 }
 
 #[test]
