@@ -106,8 +106,11 @@ impl GitAdapter {
 
     /// Extract commit authors across a revision or range (e.g. `base..head`).
     pub fn authors(&self, rev_range: &str) -> Result<Vec<String>> {
+        // The range goes before `--`. After it git reads the range as a
+        // pathspec, which matches nothing and exits 0, so authors came back
+        // empty and every git docket fell through to the @git-author fallback.
         let output = Command::new("git")
-            .args(["log", "--format=%an", "--", rev_range])
+            .args(["log", "--format=%an", rev_range, "--"])
             .current_dir(&self.repo_root)
             .output()
             .with_context(|| format!("Failed to query authors for range '{rev_range}'"))?;
