@@ -20,9 +20,9 @@ One idea. A **Change** is a delta between two snapshots. You can judge it withou
 
 - **Change**. A delta between two snapshots, from anywhere.
 - **Store**. Native history in `.oot/`: a bare git object db plus change records. Parents are change ids, not commit shas. `record`, `log`, `status`, `update`, `export` live here.
-- **Visibility**. The spine. Policy on paths or branches: `private-to`, `embargo-until`, `public`. This fixes `.env`, monorepo privacy, and private branches as policy, not crypto.
-- **Intent**. What the change says it means. We check semantic disputes against this.
-- **Dispute**. A disagreement. Either visibility (you touched a private path) or meaning (two changes clash on intent).
+- **Visibility**. The spine. Policy in a TOML file, not code: `private_paths`, `private_branches`, `embargo_until`, `embargo_recipients`, `resign_key_id`. This fixes `.env`, monorepo privacy, and private branches as policy, not crypto.
+- **Intent**. What the change says it means. Recorded on the docket as the declared intent, or the areas touched when none was given.
+- **Dispute**. A disagreement. Either visibility (you touched a private path) or meaning (the two sides of a 3-way merge clash on the same code).
 - **Docket**. The record: disputes, verdict, visibility, embargo.
 - **Verdict**. `adjudicated`, `blocked`, `embargoed`, or `cloaked`.
 
@@ -57,7 +57,7 @@ $ ./target/release/oot adjudicate --change feature/auth-refactor \
   [a]ccept · [r]eject · [d]ocket
 ```
 
-It exits 1 because it touched `secrets/.env`. Exit 0 is `adjudicated`, everything else is nonzero so CI can gate on it.
+It exits 1 because it touched `secrets/.env`. Exit 0 is `adjudicated`, everything else is nonzero so CI can gate on it. That is `adjudicate`; `--docket` and `oot docket` only print a stored record and always exit 0.
 
 If it breaks policy, we block or cloak the hell out of it. If its a security fix, we can embargo it until a date you set, same way Git and GitHub do it manually ([OSSF guide](https://github.com/ossf/oss-vulnerability-guide), [Git embargo](https://www.kernel.org/pub/software/scm/git/docs/howto/coordinate-embargoed-releases.html)). Detection, blocking, and sealing ship today: `embargo-bundle` seals the full history plus dockets to named recipients with gpg, and `embargo-verify` opens and checks it on their side. Moving the sealed artifact stays the courier's job — Oot never sends.
 
