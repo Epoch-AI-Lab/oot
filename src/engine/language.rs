@@ -214,29 +214,7 @@ const JS_TS_WRAPPED_FUNCTIONS: &[WrappedFunction] = &[
         body_kinds: CALLABLE_KINDS,
     },
     WrappedFunction {
-        node_kind: "field_definition",
-        name_field: "name",
-        name_kinds: &[
-            "property_identifier",
-            "private_property_identifier",
-            "identifier",
-        ],
-        body_field: "value",
-        body_kinds: CALLABLE_KINDS,
-    },
-    WrappedFunction {
         node_kind: "public_field_definition",
-        name_field: "name",
-        name_kinds: &[
-            "property_identifier",
-            "private_property_identifier",
-            "identifier",
-        ],
-        body_field: "value",
-        body_kinds: CALLABLE_KINDS,
-    },
-    WrappedFunction {
-        node_kind: "property_definition",
         name_field: "name",
         name_kinds: &[
             "property_identifier",
