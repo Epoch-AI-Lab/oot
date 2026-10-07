@@ -88,6 +88,19 @@ fn matches_pattern(candidate: &str, pattern: &str) -> bool {
     }
 }
 
+/// Whether `candidate` matches one declared private-branch `pattern`.
+///
+/// The single per-pattern semantic for `private_branches`. Both callers go
+/// through here, so adjudication and export cannot answer differently for
+/// the same policy.
+fn branch_matches(candidate: &str, pattern: &str) -> bool {
+    let pattern = pattern.trim().trim_start_matches('/');
+    !pattern.is_empty()
+        && (matches_pattern(candidate, pattern)
+            || candidate == pattern
+            || candidate.contains(pattern))
+}
+
 impl VisibilityPolicy {
     /// Load a visibility policy from a TOML configuration file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -104,15 +117,13 @@ impl VisibilityPolicy {
     }
 
     /// Whether a branch name matches any declared private branch pattern.
+    ///
+    /// Export filtering and adjudication both go through here, so a branch
+    /// cannot be cloaked at adjudication and still published at export.
     pub fn branch_is_private(&self, branch: &str) -> bool {
-        self.private_branches.iter().any(|pb| {
-            let pb = pb.trim_start_matches('/');
-            matches_pattern(branch, pb)
-                || branch == pb
-                || branch.starts_with(&format!("{pb}/"))
-                || branch.ends_with(&format!("/{pb}"))
-                || branch.contains(&format!("/{pb}/"))
-        })
+        self.private_branches
+            .iter()
+            .any(|pb| branch_matches(branch, pb))
     }
 
     /// Whether a touched path matches any private-path fragment.
@@ -199,17 +210,15 @@ impl VisibilityPolicy {
             }
         }
 
-        // Check private branches
+        // Check private branches. Each pattern is tested against the change's
+        // name and refs by `branch_matches`, the same predicate export
+        // filtering uses, so one policy cannot mean two things.
         for branch in &self.private_branches {
             let branch_clean = branch.trim();
             if !branch_clean.is_empty() {
-                let pb = branch_clean.trim_start_matches('/');
-                let matched = matches_pattern(&change.name, pb)
-                    || matches_pattern(&change.head_ref, pb)
-                    || matches_pattern(&change.base_ref, pb)
-                    || change.name.contains(pb)
-                    || change.head_ref.contains(pb)
-                    || change.base_ref.contains(pb);
+                let matched = [&change.name, &change.head_ref, &change.base_ref]
+                    .iter()
+                    .any(|field| branch_matches(field, branch_clean));
                 if matched {
                     out.push(Dispute {
                         id: format!("V{:03}", n),
