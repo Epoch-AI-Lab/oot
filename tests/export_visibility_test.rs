@@ -243,6 +243,75 @@ fn test_policy_change_invalidates_export_cache() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// A branch adjudication cloaks must not survive export. `private_branches`
+/// had two independent matchers: export filtered on whole-segment equality,
+/// adjudication also matched the bare substring. `private_branches = ["audit"]`
+/// therefore cloaked a change on `feature/audit-fixes` and then published
+/// that same branch. One predicate, one answer.
+#[test]
+fn test_cloaked_branch_is_not_published_by_export() {
+    let tmp = std::env::temp_dir().join(format!("oot-branch-{}-a", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    build_fixture(&src);
+    git(&src, &["checkout", "-b", "feature/audit-fixes"]);
+    std::fs::write(src.join("README.md"), "v2\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "audit work"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = []\nprivate_branches = [\"audit\"]\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+
+    // Adjudication cloaks it: the matcher must still see the pattern in a
+    // longer branch name, or this test asserts nothing.
+    let (cloaked, msg) = oot(
+        &[
+            "adjudicate",
+            "--change",
+            "feature/audit-fixes",
+            "--base-ref",
+            "main",
+            "--head-ref",
+            "feature/audit-fixes",
+            "--repo",
+            src.to_str().unwrap(),
+            "--visibility",
+            proj.join("visibility.toml").to_str().unwrap(),
+        ],
+        &proj,
+    );
+    assert!(!cloaked, "adjudication must still cloak the branch: {msg}");
+    assert!(
+        msg.contains("private branch audit"),
+        "cloak must name the pattern: {msg}"
+    );
+
+    assert!(oot(&["import", "--repo", src.to_str().unwrap()], &proj).0);
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+
+    let refs = git(&out, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+    assert!(
+        !refs.contains("refs/heads/feature/audit-fixes"),
+        "a cloaked branch was published anyway: {refs}"
+    );
+    assert!(
+        refs.contains("refs/heads/main"),
+        "the public branch must still export: {refs}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn test_filtered_export_skips_empty_rebuilt_commits() {
     let tmp = std::env::temp_dir().join(format!("oot-empty-{}", std::process::id()));
