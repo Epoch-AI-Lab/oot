@@ -10,7 +10,10 @@
 #   makes export refuse outright. Every decision lands in
 #   `.oot/export-log.jsonl`.
 #
-# Path fragments are matched by substring against touched paths.
+# Patterns match whole path segments, not substrings. `.env` matches
+# `config/.env` and `config/.env.local`; `secrets/` matches anything below
+# `secrets/`; `*` is the only wildcard and `.pem` matches a file literally
+# named `.pem`, not `server.pem`. Use `*.pem` for a suffix.
 private_paths = [".env", "secrets/", ".pem"]
 
 # No embargo schedule for this repo yet; add `embargo_until = "YYYY-MM-DD"`
