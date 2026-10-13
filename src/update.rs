@@ -605,9 +605,11 @@ fn write_file_atomic(full: &Path, root: &Path, contents: &[u8], executable: bool
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "file".to_string());
-    // Truncate suffix if name is long to prevent ENAMETOOLONG
+    // Truncate suffix if name is long to prevent ENAMETOOLONG. Floor to a
+    // char boundary: a byte index of 128 can land inside a multi-byte char
+    // and panic the whole update mid-materialization.
     let suffix = if full_name.len() > 128 {
-        &full_name[..128]
+        &full_name[..full_name.floor_char_boundary(128)]
     } else {
         &full_name
     };

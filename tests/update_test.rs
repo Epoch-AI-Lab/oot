@@ -664,6 +664,54 @@ fn test_update_branch_with_slashes() {
 }
 
 #[test]
+fn test_update_long_unicode_filename_does_not_panic() {
+    let tmp = unique_tmp("unicode-name");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "main", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    // The long name lives on another branch, so update has to write it.
+    // 127 ASCII bytes then e-acute at bytes 127..129, so byte index 128
+    // lands inside the character.
+    let long_name = format!("{}\u{e9}", "a".repeat(127));
+    assert!(long_name.len() > 128);
+    assert!(!long_name.is_char_boundary(128));
+    std::fs::write(proj.join(&long_name), "payload\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "long name"], &proj);
+    assert!(ok, "{msg}");
+    std::fs::remove_file(proj.join(&long_name)).unwrap();
+
+    let (ok, out) = oot(&["update", "--branch", "feat"], &proj);
+    assert!(
+        ok,
+        "update must not panic on a long unicode filename: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join(&long_name)).unwrap_or_default(),
+        "payload\n",
+        "the long-named file must land on disk: {out}"
+    );
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v1\n");
+
+    // Same path under --force.
+    let (ok, out) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{out}");
+    let (ok, out) = oot(&["update", "--branch", "feat", "--force"], &proj);
+    assert!(ok, "forced update must not panic either: {out}");
+    assert_eq!(
+        std::fs::read_to_string(proj.join(&long_name)).unwrap(),
+        "payload\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_update_3way_conflict_preserves_work() {
     let tmp = unique_tmp("3way-conflict");
     let _ = std::fs::remove_dir_all(&tmp);
