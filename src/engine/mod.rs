@@ -306,11 +306,13 @@ impl Engine {
                             && t_changed.is_empty()
                             && t_gone.is_empty()
                         {
-                            if o_list == t_list {
-                                continue;
-                            }
                             let o_extra = strip_common(o_list, t_list);
                             let t_extra = strip_common(t_list, o_list);
+                            // Convergent same-content additions are clean
+                            // regardless of where in the file they landed.
+                            if o_extra.is_empty() && t_extra.is_empty() {
+                                continue;
+                            }
                             if o_extra.is_empty() && !t_extra.is_empty() {
                                 for d in t_extra {
                                     pending_added.push((name.clone(), d.clone()));
@@ -1467,6 +1469,26 @@ mod tests {
                 &snap("pub fn a() {}\n"),
                 &snap("pub fn a() {}\npub fn f() -> i32 { 7 }\n"),
                 &snap("pub fn a() {}\npub fn f() -> i32 { 7 }\n"),
+            )
+            .unwrap();
+
+        assert!(disputes.is_empty(), "got {:?}", disputes);
+    }
+
+    #[test]
+    fn test_engine_3way_convergent_same_name_addition_at_diff_offsets_is_clean() {
+        let eng = Engine::new().unwrap();
+
+        let snap = |s: &str| {
+            let mut x = Snapshot::default();
+            x.files.insert("src/lib.rs".into(), s.into());
+            x
+        };
+        let disputes = eng
+            .diff_3way(
+                &snap("pub fn a() {}\n"),
+                &snap("pub fn a() {}\npub fn f() -> i32 { 7 }\n"),
+                &snap("pub fn f() -> i32 { 7 }\npub fn a() {}\n"),
             )
             .unwrap();
 
