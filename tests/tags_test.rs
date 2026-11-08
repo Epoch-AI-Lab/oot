@@ -562,3 +562,69 @@ fn test_signed_tag_resigned_on_rebuilt_target_with_key() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// An annotated tag whose target is rebuilt (withheld history fallback) must
+/// keep its original tagger date, not "now" (X-11).
+#[test]
+fn test_recreated_annotated_tag_preserves_tagger_date() {
+    let tmp = std::env::temp_dir().join(format!("oot-tags-date-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    std::fs::create_dir_all(&src).unwrap();
+    git(&src, &["init", "--quiet", "-b", "main"]);
+    std::fs::write(src.join("README.md"), "v1\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "base"]);
+    let base = git(&src, &["rev-parse", "main"]);
+
+    std::fs::write(src.join(".env"), "API_KEY=x\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "secret"]);
+    // Fixed tagger date so the assertion is deterministic.
+    git_env(
+        &src,
+        &[("GIT_COMMITTER_DATE", "1234567890 +0000")],
+        &["tag", "-a", "on-secret", "-m", "secret release"],
+    );
+
+    std::fs::write(src.join("README.md"), "v2\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "followup"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nprivate_branches = []\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+
+    let kind = git(&out, &["cat-file", "-t", "refs/tags/on-secret"]);
+    assert_eq!(
+        kind, "tag",
+        "rebuilt target should recreate the annotated tag"
+    );
+    let got = git(&out, &["rev-parse", "refs/tags/on-secret^{commit}"]);
+    assert_eq!(got, base, "tag should fall back to kept ancestor");
+
+    let tagger_date = git(
+        &out,
+        &[
+            "for-each-ref",
+            "--format=%(taggerdate:raw)",
+            "refs/tags/on-secret",
+        ],
+    );
+    assert_eq!(
+        tagger_date, "1234567890 +0000",
+        "recreated tag must preserve the original tagger date"
+    );
+}
