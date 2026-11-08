@@ -640,26 +640,50 @@ fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
     std::fs::create_dir_all(proj.join("logs")).unwrap();
     std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
     std::fs::write(proj.join("file.txt"), "base\n").unwrap();
-    let (ok, msg) = oot(&["record", "--branch", "main", "-m", "add marker"], &proj);
+    let (ok, msg) = oot(&["record", "-m", "add marker"], &proj);
     assert!(ok, "{msg}");
 
-    // Remove the tracked marker and record on feat.
+    // Remove the tracked marker and record a second change without it.
     std::fs::remove_file(proj.join("logs/.ootkeep")).unwrap();
-    let (ok, msg) = oot(
-        &["record", "--branch", "feat", "-m", "remove marker"],
-        &proj,
-    );
+    let (ok, msg) = oot(&["record", "-m", "remove marker"], &proj);
     assert!(ok, "{msg}");
     assert!(!proj.join("logs/.ootkeep").exists());
 
-    // Cleanly return to main (marker present, tracked).
-    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
-    assert!(ok, "{msg}");
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    // log is newest-first; "add marker" is the older (first) change
+    let with_marker_id = log
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Cleanly move to the change that has the marker (tracked in head).
+    let (ok, msg) = oot(&["update", "--change", &with_marker_id[..7]], &proj);
+    assert!(ok, "update to change with marker should succeed: {msg}");
     assert!(proj.join("logs/.ootkeep").exists());
 
-    // Clean fast-forward to feat (no --force): tracked marker deletion must apply.
-    let (ok, msg) = oot(&["update", "--branch", "feat"], &proj);
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let without_marker_id = log
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Clean fast-forward to the change that deleted the tracked marker (no --force).
+    let (ok, msg) = oot(&["update", "--change", &without_marker_id[..7]], &proj);
     assert!(ok, "update should succeed: {msg}");
+    assert!(
+        !msg.contains("merged"),
+        "expected clean fast-forward path, got: {msg}"
+    );
     assert!(
         !proj.join("logs/.ootkeep").exists(),
         "tracked marker deleted by target must not survive a clean fast-forward: {msg}"
