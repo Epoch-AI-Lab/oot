@@ -104,7 +104,9 @@ fn test_cli_adjudicate_load_docket() {
         .output()
         .expect("Failed to execute oot CLI");
 
-    assert!(output.status.success());
+    // fixtures/example.json is EMBARGOED, so loading it must exit nonzero,
+    // matching the non-docket adjudicate paths. Regression for CLI-01.
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("OOT DOCKET"));
