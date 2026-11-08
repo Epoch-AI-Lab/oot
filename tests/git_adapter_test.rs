@@ -507,3 +507,28 @@ fn test_cli_git_adjudication_respects_authors_flag() {
         "VCS adjudication must honor --authors; stdout was: {stdout}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn test_git_adapter_rejects_non_utf8_path() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    let repo = TempGitRepo::new("non_utf8_path");
+    repo.write_file("src/lib.rs", "pub fn ok() {}\n");
+    // Invalid UTF-8 in the filename: lossy decoding would collapse distinct
+    // byte paths to the same key (SEC-10), so extraction must reject it loudly.
+    let bad_name = OsString::from_vec(b"bad\xff.txt".to_vec());
+    fs::write(repo.path.join(&bad_name), b"secret").expect("failed to write non-utf8 file");
+    let rev = repo.commit("add non-utf8 path");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let err = adapter
+        .extract_snapshot(&rev)
+        .expect_err("non-UTF-8 paths must not be lossily decoded into snapshot keys");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("non-UTF-8 path"),
+        "error should identify the non-UTF-8 path, got: {msg}"
+    );
+}

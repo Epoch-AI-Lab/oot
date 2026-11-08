@@ -158,30 +158,38 @@ impl GitAdapter {
             if entry.is_empty() {
                 continue;
             }
-            let entry_str = String::from_utf8_lossy(entry);
-            if let Some((meta, path)) = entry_str.split_once('\t') {
-                let parts: Vec<&str> = meta.split_whitespace().collect();
-                if parts.len() >= 3 && parts[1] == "blob" {
-                    // Skip symlinks (mode 120000)
-                    if parts[0] == "120000" {
-                        continue;
-                    }
-                    crate::store::validate_tree_path(path)?;
-                    let blob_sha = parts[2];
-                    let blob_output = Command::new("git")
-                        .args(["cat-file", "blob", blob_sha])
-                        .current_dir(&self.repo_root)
-                        .output()
-                        .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
-
-                    if !blob_output.status.success() {
-                        return Err(anyhow!(
-                            "Failed to read blob {blob_sha} for {path}: {}",
-                            String::from_utf8_lossy(&blob_output.stderr).trim()
-                        ));
-                    }
-                    files.insert(path.to_string(), blob_output.stdout);
+            let Some(tab) = entry.iter().position(|&b| b == b'\t') else {
+                continue;
+            };
+            let meta = String::from_utf8_lossy(&entry[..tab]);
+            let path_bytes = &entry[tab + 1..];
+            let path = std::str::from_utf8(path_bytes).map_err(|_| {
+                anyhow!(
+                    "git tree contains a non-UTF-8 path in '{rev}': {} (rejecting to avoid path collisions)",
+                    String::from_utf8_lossy(path_bytes)
+                )
+            })?;
+            let parts: Vec<&str> = meta.split_whitespace().collect();
+            if parts.len() >= 3 && parts[1] == "blob" {
+                // Skip symlinks (mode 120000)
+                if parts[0] == "120000" {
+                    continue;
                 }
+                crate::store::validate_tree_path(path)?;
+                let blob_sha = parts[2];
+                let blob_output = Command::new("git")
+                    .args(["cat-file", "blob", blob_sha])
+                    .current_dir(&self.repo_root)
+                    .output()
+                    .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
+
+                if !blob_output.status.success() {
+                    return Err(anyhow!(
+                        "Failed to read blob {blob_sha} for {path}: {}",
+                        String::from_utf8_lossy(&blob_output.stderr).trim()
+                    ));
+                }
+                files.insert(path.to_string(), blob_output.stdout);
             }
         }
 
