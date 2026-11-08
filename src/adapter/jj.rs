@@ -52,6 +52,30 @@ fn is_conflict_marker_line(line: &str) -> bool {
         || line.trim() == "======="
 }
 
+/// True if file `content` contains a merge conflict (as materialized by jj/git).
+///
+/// A real conflict forms a region with an opening marker (`<<<<<<<`) and a
+/// closing marker (`>>>>>>>`). Requiring both avoids false positives from
+/// legitimate content that happens to contain a marker-like line (for example,
+/// documentation or test fixtures that show what a conflict looks like).
+fn content_has_conflict_markers(content: &str) -> bool {
+    let mut open = false;
+    let mut close = false;
+    for line in content.lines() {
+        if is_conflict_marker_line(line) {
+            if line.starts_with("<<<<<<<") {
+                open = true;
+            } else if line.starts_with(">>>>>>>") {
+                close = true;
+            }
+        }
+        if open && close {
+            return true;
+        }
+    }
+    false
+}
+
 impl JjAdapter {
     /// Create a new `JjAdapter` rooted at the Jujutsu workspace containing `repo_path`.
     pub fn new(repo_path: impl AsRef<Path>) -> Result<Self> {
@@ -228,7 +252,7 @@ impl JjAdapter {
             crate::store::validate_tree_path(path)?;
             let content = self.run_bytes(&["file", "show", "-r", rev, "--", path])?;
             let text = String::from_utf8_lossy(&content);
-            if text.lines().any(is_conflict_marker_line) {
+            if content_has_conflict_markers(&text) {
                 conflicted.push(path.to_string());
             } else {
                 files.insert(path.to_string(), content);
@@ -387,5 +411,29 @@ mod tests {
         assert!(!is_conflict_marker_line("========="));
         assert!(!is_conflict_marker_line("let marker = \"<<<<<<<\";"));
         assert!(!is_conflict_marker_line(""));
+    }
+
+    #[test]
+    fn test_literal_marker_text_is_not_a_conflicted_file() {
+        // Legitimate content (docs, fixtures) may contain a conflict-marker
+        // string; that does not mean the file is in a conflicted state.
+        let content = "example:\n<<<<<<< HEAD\nsome text\n";
+        assert!(
+            !content_has_conflict_markers(content),
+            "a lone marker line in normal content must not flag the file as conflicted"
+        );
+    }
+
+    #[test]
+    fn test_real_conflict_block_is_detected() {
+        let content =
+            "before\n<<<<<<< ConflictMarker\nleft\n=======\nright\n>>>>>>> ConflictMarker\nafter\n";
+        assert!(content_has_conflict_markers(content));
+    }
+
+    #[test]
+    fn test_diff3_conflict_block_is_detected() {
+        let content = "<<<<<<< ConflictMarker\nleft\n||||||| ConflictMarker\nbase\n=======\nright\n>>>>>>> ConflictMarker\n";
+        assert!(content_has_conflict_markers(content));
     }
 }
