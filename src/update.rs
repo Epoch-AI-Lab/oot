@@ -684,3 +684,35 @@ fn random_hex() -> String {
     std::thread::current().id().hash(&mut h);
     format!("{:016x}", h.finish())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_file_atomic_handles_long_non_ascii_basename() {
+        // 127 ASCII bytes + a 4-byte emoji = 131 bytes; byte 128 falls
+        // inside the emoji. Byte-truncation at 128 would panic.
+        let name = format!("{}😀", "a".repeat(127));
+        assert!(name.len() > 128);
+        assert!(!name.is_char_boundary(128));
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "oot-update-nonascii-{}-{nanos}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.clone();
+        let full = dir.join(&name);
+
+        write_file_atomic(&full, &root, b"hello", false).unwrap();
+
+        assert_eq!(std::fs::read(&full).unwrap(), b"hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
