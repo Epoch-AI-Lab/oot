@@ -627,6 +627,55 @@ fn test_update_keep_marker_exact_vs_suffix() {
 }
 
 #[test]
+fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
+    // UPDATE-08: a tracked .ootkeep/.oothave deleted by the target must be
+    // removed on a clean fast-forward. Preserving it makes a successful update
+    // leave the worktree dirty.
+    let tmp = unique_tmp("tracked-keepmarker-ff");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::create_dir_all(proj.join("logs")).unwrap();
+    std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
+    std::fs::write(proj.join("file.txt"), "base\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "main", "-m", "add marker"], &proj);
+    assert!(ok, "{msg}");
+
+    // Remove the tracked marker and record on feat.
+    std::fs::remove_file(proj.join("logs/.ootkeep")).unwrap();
+    let (ok, msg) = oot(
+        &["record", "--branch", "feat", "-m", "remove marker"],
+        &proj,
+    );
+    assert!(ok, "{msg}");
+    assert!(!proj.join("logs/.ootkeep").exists());
+
+    // Cleanly return to main (marker present, tracked).
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("logs/.ootkeep").exists());
+
+    // Clean fast-forward to feat (no --force): tracked marker deletion must apply.
+    let (ok, msg) = oot(&["update", "--branch", "feat"], &proj);
+    assert!(ok, "update should succeed: {msg}");
+    assert!(
+        !proj.join("logs/.ootkeep").exists(),
+        "tracked marker deleted by target must not survive a clean fast-forward: {msg}"
+    );
+
+    let (ok, status) = oot(&["status"], &proj);
+    assert!(ok, "{status}");
+    assert!(
+        !status.contains(".ootkeep"),
+        "status must not report the deleted tracked marker: {status}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_update_branch_with_slashes() {
     let tmp = unique_tmp("branch-slashes");
     let _ = std::fs::remove_dir_all(&tmp);

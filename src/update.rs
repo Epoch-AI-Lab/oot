@@ -189,11 +189,11 @@ pub fn run(
     // delete precious untracked work.
     //
     // .ootkeep / .oothave: marker files that keep a placeholder dir alive.
-    // If work contains `logs/.ootkeep` and target has no `logs/`, we keep the
-    // marker (and thus the dir) instead of deleting it. This lets you keep
-    // empty dirs like `logs/` or `tmp/` across updates.
+    // Preserve untracked markers (not in the current head) so empty dirs like
+    // `logs/` or `tmp/` survive across updates. Tracked markers follow the
+    // target like any other file — if the target deletes them, delete them.
     for path in work.keys() {
-        if !force && is_keep_marker(path) {
+        if !force && is_keep_marker(path) && !head_filtered.contains_key(path) {
             continue;
         }
         if !target_files.contains_key(path) {
@@ -417,12 +417,13 @@ fn materialize_merge(
 
     // 1) Delete: only delete work files that are take-target and target has no entry
     //    (i.e., target deleted it and work didn't change it).
-    //    Keep-work files are never deleted, including .ootkeep markers.
+    //    Keep-work files are never deleted. Preserve untracked .ootkeep/.oothave
+    //    markers, but honor explicit tracked deletions from the target.
     for path in work.keys() {
         if keep_work.contains(path) {
             continue;
         }
-        if is_keep_marker(path) {
+        if is_keep_marker(path) && !head_filtered.contains_key(path) {
             continue;
         }
         if !take_target.contains(path) {
