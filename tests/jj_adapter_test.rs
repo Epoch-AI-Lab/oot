@@ -205,6 +205,7 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
 /// the base tip. When head already is the ancestor but the base tip has
 /// moved on, diffing the tip against head reports files touched even though
 /// ancestor..head changed nothing.
+#[ignore = "requires jj"]
 #[test]
 #[ignore = "requires jj"]
 fn test_jj_docket_diff_uses_ancestor() {
@@ -251,6 +252,7 @@ fn test_jj_docket_diff_uses_ancestor() {
     assert_eq!(docket.intent, "no files changed");
 }
 
+#[ignore = "requires jj"]
 #[test]
 #[ignore = "requires jj"]
 fn test_jj_adjudicate_3way_respects_explicit_authors_override() {
@@ -317,6 +319,7 @@ fn test_jj_conflicted_commit_detected_not_parsed() {
     );
 }
 
+#[ignore = "requires jj"]
 #[test]
 #[ignore = "requires jj"]
 fn test_jj_authors_bogus_revset_errors() {
