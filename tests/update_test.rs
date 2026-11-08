@@ -684,7 +684,12 @@ fn test_update_long_unicode_filename_does_not_panic() {
     std::fs::write(proj.join(&long_name), "payload\n").unwrap();
     let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "long name"], &proj);
     assert!(ok, "{msg}");
-    std::fs::remove_file(proj.join(&long_name)).unwrap();
+
+    // Return to main (clean) so updating to feat is a clean fast-forward that
+    // materializes the long-named file through the straight write path.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    let _ = std::fs::remove_file(proj.join(&long_name));
 
     let (ok, out) = oot(&["update", "--branch", "feat"], &proj);
     assert!(
