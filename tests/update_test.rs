@@ -627,6 +627,66 @@ fn test_update_keep_marker_exact_vs_suffix() {
 }
 
 #[test]
+fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
+    // UPDATE-08: a tracked .ootkeep/.oothave deleted by the target must be
+    // removed on a clean fast-forward. Preserving it makes a successful update
+    // leave the worktree dirty.
+    let tmp = unique_tmp("tracked-keepmarker-ff");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::create_dir_all(proj.join("logs")).unwrap();
+    std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
+    std::fs::write(proj.join("file.txt"), "base\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "add marker"], &proj);
+    assert!(ok, "{msg}");
+
+    // Remove the tracked marker and record its deletion on a separate branch.
+    std::fs::remove_file(proj.join("logs/.ootkeep")).unwrap();
+    let (ok, msg) = oot(
+        &["record", "--branch", "feat", "-m", "remove marker"],
+        &proj,
+    );
+    assert!(ok, "{msg}");
+    assert!(!proj.join("logs/.ootkeep").exists());
+
+    let (ok, log) = oot(&["log", "--branch", "feat"], &proj);
+    assert!(ok, "{log}");
+    let without_marker_id = log
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Return to main (marker present, tracked) as a clean single-branch state.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("logs/.ootkeep").exists());
+    // Keep only main so resolve_branch(None) can infer the head/base.
+    // oot stores branch refs as flat files in .oot/refs/ (not refs/heads/).
+    let _ = std::fs::remove_file(proj.join(".oot/refs/feat"));
+
+    // Clean fast-forward to the change that deleted the tracked marker (no --force).
+    let (ok, msg) = oot(&["update", "--change", &without_marker_id[..7]], &proj);
+    assert!(ok, "update should succeed: {msg}");
+    assert!(
+        !msg.contains("merged"),
+        "expected clean fast-forward path, got: {msg}"
+    );
+    assert!(
+        !proj.join("logs/.ootkeep").exists(),
+        "tracked marker deleted by target must not survive a clean fast-forward: {msg}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_update_branch_with_slashes() {
     let tmp = unique_tmp("branch-slashes");
     let _ = std::fs::remove_dir_all(&tmp);
