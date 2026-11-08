@@ -163,15 +163,44 @@ fn test_meaning_policy_mixed_disputes() {
     assert_eq!(policy.review_count(&disputes), 1);
 }
 
+#[test]
+fn test_temp_file_guard_appends_across_writes() {
+    let mut temp_file = tempfile_named("meaning_policy_multi_chunk.toml");
+
+    // Regression test for TST2-02: every write used to reopen with
+    // truncate(true), so each call wiped the file and only the last chunk
+    // survived. Multiple writes must accumulate instead.
+    temp_file
+        .write_all(b"block_on = [\"high\"]\n")
+        .expect("first chunk write");
+    temp_file
+        .write_all(b"review_on = [\"low\"]\n")
+        .expect("second chunk write");
+    temp_file.write_all(b"# tail\n").expect("third chunk write");
+    temp_file.flush().expect("flush");
+
+    let contents = std::fs::read_to_string(temp_file.path()).expect("read back file");
+    assert_eq!(
+        contents,
+        "block_on = [\"high\"]\nreview_on = [\"low\"]\n# tail\n"
+    );
+
+    // The accumulated file must still parse as a valid policy.
+    let loaded = MeaningPolicy::load(temp_file.path()).expect("load policy written in chunks");
+    assert_eq!(loaded.block_on, vec!["high"]);
+    assert_eq!(loaded.review_on, vec!["low"]);
+}
+
 fn tempfile_named(name: &str) -> TempFileGuard {
     let dir = std::env::temp_dir().join(format!("oot_test_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
-    TempFileGuard { path }
+    TempFileGuard { path, file: None }
 }
 
 struct TempFileGuard {
     path: std::path::PathBuf,
+    file: Option<std::fs::File>,
 }
 
 impl TempFileGuard {
@@ -182,21 +211,31 @@ impl TempFileGuard {
 
 impl std::io::Write for TempFileGuard {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        file.write(buf)
+        if self.file.is_none() {
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&self.path)?,
+            );
+        }
+        self.file.as_mut().unwrap().write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
+        match self.file.as_mut() {
+            Some(file) => file.flush(),
+            None => Ok(()),
+        }
     }
 }
 
 impl Drop for TempFileGuard {
     fn drop(&mut self) {
+        // Drop the open handle first so the unlink works on Windows too,
+        // where the file cannot be removed while a handle is open.
+        self.file.take();
         let _ = std::fs::remove_file(&self.path);
     }
 }
