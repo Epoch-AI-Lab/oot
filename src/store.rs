@@ -2927,11 +2927,28 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
+        let from = entry.path();
         let to = dst.join(entry.file_name());
-        if entry.path().is_dir() {
-            copy_dir(&entry.path(), &to)?;
+        let meta = std::fs::symlink_metadata(&from)
+            .with_context(|| format!("failed to stat {}", from.display()))?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            bail!(
+                "refusing to bundle symlink {} (nothing outside the repo may enter a bundle)",
+                from.display()
+            );
+        }
+        if ft.is_dir() {
+            copy_dir(&from, &to)?;
+        } else if ft.is_file() {
+            std::fs::copy(&from, &to).with_context(|| {
+                format!("failed to copy {} -> {}", from.display(), to.display())
+            })?;
         } else {
-            std::fs::copy(entry.path(), &to)?;
+            bail!(
+                "refusing to bundle unsupported file type {}",
+                from.display()
+            );
         }
     }
     Ok(())
@@ -3815,8 +3832,8 @@ fn is_hex_keyid(s: &str) -> bool {
 /// Reject a bundle tar before extraction: unsafe member names (absolute or
 /// `..`), member counts or sizes past the caps, and member types an
 /// embargo bundle never contains. Oot-made bundles hold exactly one top
-/// dir with a git repo, dockets, logs, and MANIFEST.json — all regular
-/// files, directories, and symlinks Oot never writes.
+/// dir with a git repo, dockets, logs, and MANIFEST.json, all regular
+/// files and directories.
 ///
 /// Names are only part of the defense: GNU tar itself refuses `..`
 /// traversal, absolute members, and cross-device hard links. This check
@@ -3884,10 +3901,14 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
             bail!("bundle tar has unsafe member (refusing to open): {name}");
         }
         match meta.chars().next().unwrap_or('-') {
-            // Regular files, directories, and symlinks only. FIFOs, block
-            // and character devices have no place in a code bundle and are
-            // a way to make a recipient's tooling misbehave.
-            '-' | 'd' | 'l' => {}
+            // Regular files and directories only. Symlinks are rejected:
+            // a hostile target can escape the extraction tree, and Oot
+            // never writes symlinks into an embargo bundle. FIFOs, block
+            // and character devices have no place in a code bundle.
+            '-' | 'd' => {}
+            'l' => {
+                bail!("bundle tar has symlink member (refusing to open): {name}")
+            }
             other => {
                 bail!("bundle tar has unsupported member type '{other}' (refusing to open): {name}")
             }
@@ -4194,6 +4215,61 @@ mod tests {
             nth_column("  a b  c d  name with  spaces ", 4).as_deref(),
             Some("name with  spaces")
         );
+    }
+
+    /// STORE-03: embargo bundle tars must not contain symlinks. A hostile
+    /// symlink target can escape the extraction tree even when the member
+    /// name is safe.
+    #[test]
+    fn test_check_tar_members_refuses_symlink_with_escaping_target() {
+        let dir = guard_tmp("tar-symlink");
+        let root = dir.join("bundle");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("ok.txt"), "ok\n").unwrap();
+        std::os::unix::fs::symlink("../../../tmp/outside", root.join("escape")).unwrap();
+        let tar_path = dir.join("bundle.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&dir)
+            .arg("bundle")
+            .status()
+            .expect("tar should run");
+        assert!(status.success(), "failed to create test tar with symlink");
+
+        let err = check_tar_members(&tar_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("symlink member"),
+            "expected symlink refusal, got: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_check_tar_members_refuses_symlink_with_absolute_target() {
+        let dir = guard_tmp("tar-symlink-abs");
+        let root = dir.join("bundle");
+        std::fs::create_dir_all(&root).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link")).unwrap();
+        let tar_path = dir.join("bundle.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&dir)
+            .arg("bundle")
+            .status()
+            .expect("tar should run");
+        assert!(status.success(), "failed to create test tar with symlink");
+
+        let err = check_tar_members(&tar_path).unwrap_err();
+        assert!(
+            err.to_string().contains("symlink member"),
+            "expected symlink refusal, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A ustar header declaring `size` bytes. Octal, NUL-terminated, with a
