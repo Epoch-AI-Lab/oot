@@ -423,6 +423,21 @@ fn test_git_adapter_3way_respects_explicit_authors_override() {
 }
 
 #[test]
+fn test_git_adapter_authors_bogus_range_errors() {
+    let repo = TempGitRepo::new("authors_bogus");
+    repo.write_file("src/lib.rs", "pub fn common() -> i32 { 0 }\n");
+    repo.commit("base version");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let result = adapter.authors("no-such-ref-xyz");
+    assert!(
+        result.is_err(),
+        "authors() must propagate git failures instead of returning an empty list, got: {:?}",
+        result
+    );
+}
+
+#[test]
 fn test_cli_git_adjudication_flags() {
     let repo = TempGitRepo::new("cli_git");
     repo.write_file("src/lib.rs", "pub fn base() {}\n");

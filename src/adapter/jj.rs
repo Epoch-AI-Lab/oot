@@ -192,17 +192,16 @@ impl JjAdapter {
     /// Extract commit authors across the range `ancestor..head`.
     pub fn authors(&self, ancestor: &str, head: &str) -> Result<Vec<String>> {
         let revset = format!("{ancestor}..{head}");
-        let out = match self.run(&[
-            "log",
-            "--no-graph",
-            "-T",
-            "author.name() ++ \"\\n\"",
-            "-r",
-            &revset,
-        ]) {
-            Ok(o) => o,
-            Err(_) => return Ok(Vec::new()),
-        };
+        let out = self
+            .run(&[
+                "log",
+                "--no-graph",
+                "-T",
+                "author.name() ++ \"\\n\"",
+                "-r",
+                &revset,
+            ])
+            .with_context(|| format!("Failed to query authors for range '{revset}'"))?;
 
         let mut authors: Vec<String> = out
             .lines()
