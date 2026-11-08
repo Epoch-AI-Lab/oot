@@ -4,6 +4,7 @@
 //! or visibility violation). A [`Docket`] is the complete, rendered adjudication
 //! record containing disputes, verdict, intent, and embargo metadata.
 
+use crate::policy::MeaningPolicy;
 use serde::{Deserialize, Serialize};
 
 /// The category of dispute raised during adjudication.
@@ -92,7 +93,7 @@ pub fn finalize_adjudication(
     user_intent: Option<String>,
     cloaked: bool,
     embargo_active: bool,
-    meaning_policy: &crate::policy::MeaningPolicy,
+    meaning_policy: &MeaningPolicy,
 ) -> (Vec<Dispute>, String, Verdict) {
     let mut touched_paths: Vec<String> = base
         .keys()
@@ -184,23 +185,18 @@ impl Docket {
             .count()
     }
 
-    /// Return the number of disputes requiring human review.
-    pub fn review_count(&self) -> usize {
-        self.disputes
-            .iter()
-            .filter(|d| {
-                d.kind == Kind::Meaning && matches!(d.severity, Severity::Review | Severity::High)
-            })
-            .count()
+    /// Return the number of disputes requiring human review under `policy`.
+    pub fn review_count(&self, policy: &MeaningPolicy) -> usize {
+        policy.review_count(&self.disputes)
     }
 
-    /// Check if any dispute in the docket requires human review.
-    pub fn requires_review(&self) -> bool {
-        self.review_count() > 0
+    /// Check if any dispute in the docket requires human review under `policy`.
+    pub fn requires_review(&self, policy: &MeaningPolicy) -> bool {
+        policy.requires_review(&self.disputes)
     }
 
     /// Render the docket as human-readable terminal output.
-    pub fn render(&self) -> String {
+    pub fn render(&self, policy: &MeaningPolicy) -> String {
         let mut out = String::new();
         out.push_str("  OOT DOCKET\n");
         out.push_str("  ─────────────────────────────────────────\n");
@@ -249,7 +245,7 @@ impl Docket {
         };
         out.push_str(&format!("  verdict:    ▶ {} ", label));
         let mut notes = Vec::new();
-        let reviews = self.review_count();
+        let reviews = policy.review_count(&self.disputes);
         if reviews > 0 {
             notes.push(format!("{} requires review", reviews));
         }
@@ -315,15 +311,59 @@ mod tests {
             embargo: Some("patch held for maintainers until 2026-12-31".into()),
         };
 
+        let policy = MeaningPolicy::default();
         assert_eq!(docket.meaning_count(), 1);
         assert_eq!(docket.visibility_count(), 1);
-        assert_eq!(docket.review_count(), 1);
-        assert!(docket.requires_review());
+        assert_eq!(docket.review_count(&policy), 1);
+        assert!(docket.requires_review(&policy));
 
-        let rendered = docket.render();
+        let rendered = docket.render(&policy);
         assert!(rendered.contains("OOT DOCKET"));
         assert!(rendered.contains("feature/auth"));
         assert!(rendered.contains("1 requires review"));
         assert!(rendered.contains("2026-12-31"));
+    }
+
+    #[test]
+    fn test_docket_review_count_follows_policy() {
+        fn single(severity: Severity) -> Docket {
+            Docket {
+                change: "feature/x".into(),
+                source: "git".into(),
+                base: "main".into(),
+                head: "feature/x".into(),
+                disputes: vec![Dispute {
+                    id: "D001".into(),
+                    location: "src/lib.rs:1".into(),
+                    kind: Kind::Meaning,
+                    severity,
+                    detail: "added function".into(),
+                }],
+                intent: "add helper".into(),
+                authors: vec!["@alice".into()],
+                verdict: Verdict::Adjudicated,
+                embargo: None,
+            }
+        }
+
+        let low_policy = MeaningPolicy {
+            block_on: vec!["high".into()],
+            review_on: vec!["low".into()],
+            rename_min_score: 100,
+        };
+        let low_docket = single(Severity::Low);
+        assert_eq!(low_docket.review_count(&low_policy), 1);
+        assert!(low_docket.requires_review(&low_policy));
+        assert!(low_docket.render(&low_policy).contains("1 requires review"));
+
+        let default_policy = MeaningPolicy::default();
+        assert_eq!(low_docket.review_count(&default_policy), 0);
+        assert!(!low_docket
+            .render(&default_policy)
+            .contains("requires review"));
+
+        let high_docket = single(Severity::High);
+        assert_eq!(high_docket.review_count(&low_policy), 0);
+        assert!(!high_docket.render(&low_policy).contains("requires review"));
     }
 }

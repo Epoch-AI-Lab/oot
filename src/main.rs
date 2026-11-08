@@ -265,16 +265,16 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             output,
             no_save,
         } => {
-            if let Some(path) = docket {
-                let d = docket::load(std::path::Path::new(&path))?;
-                print!("{}", d.render());
-                return Ok(std::process::ExitCode::SUCCESS);
-            }
-
             let meaning_policy = match policy {
                 Some(p) => MeaningPolicy::load(std::path::Path::new(&p))?,
                 None => MeaningPolicy::default(),
             };
+
+            if let Some(path) = docket {
+                let d = docket::load(std::path::Path::new(&path))?;
+                print!("{}", d.render(&meaning_policy));
+                return Ok(std::process::ExitCode::SUCCESS);
+            }
             let visibility_policy = match visibility {
                 Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
                 None => VisibilityPolicy::default(),
@@ -316,7 +316,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                     intent.clone(),
                     authors_list,
                 )?;
-                print!("{}", persisted.docket.render());
+                print!("{}", persisted.docket.render(&meaning_policy));
                 if !no_save {
                     court::save_docket(&store, &persisted)?;
                     court::log_adjudication(&store, &persisted)?;
@@ -380,7 +380,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                     )?
                 };
 
-                print!("{}", doc.render());
+                print!("{}", doc.render(&meaning_policy));
 
                 if let Some(out_path) = output {
                     docket::save(&doc, std::path::Path::new(&out_path))?;
@@ -459,7 +459,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 },
             };
 
-            print!("{}", docket.render());
+            print!("{}", docket.render(&meaning_policy));
 
             if let Some(out_path) = output {
                 docket::save(&docket, std::path::Path::new(&out_path))?;
@@ -781,7 +781,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let store = Store::open(".")?;
             let change_id = store.resolve_change(&target_id)?;
             let persisted = court::load_docket(&store, &change_id)?;
-            print!("{}", persisted.docket.render());
+            print!("{}", persisted.docket.render(&MeaningPolicy::default()));
             Ok(std::process::ExitCode::SUCCESS)
         }
         Commands::EmbargoStatus { visibility } => {
