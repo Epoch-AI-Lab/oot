@@ -219,6 +219,59 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
     assert!(rendered.contains("OOT DOCKET"));
 }
 
+/// Regression test (X-09): the docket intent/empty notice must be diffed
+/// against the common ancestor (same as visibility and 3-way analysis), not
+/// the base tip. When head already is the ancestor but the base tip has
+/// moved on, diffing the tip against head reports files touched even though
+/// ancestor..head changed nothing.
+#[test]
+fn test_jj_docket_diff_uses_ancestor() {
+    if !jj_available() {
+        return;
+    }
+    let repo = init_repo(false);
+    write_lib(&repo.path, "hello");
+    jj(&repo.path, &["commit", "-m", "base"]);
+    jj(&repo.path, &["bookmark", "create", "main", "-r", "@-"]);
+
+    // Head commit: "hello world".
+    write_lib(&repo.path, "hello world");
+    jj(&repo.path, &["commit", "-m", "change"]);
+    jj(&repo.path, &["bookmark", "create", "head", "-r", "@-"]);
+
+    // The base tip then advances past the head commit with different content,
+    // so the common ancestor of main..head is the head commit itself.
+    write_lib(&repo.path, "main change");
+    jj(&repo.path, &["commit", "-m", "main-change"]);
+    jj(&repo.path, &["bookmark", "set", "main", "-r", "@-"]);
+
+    let adapter = JjAdapter::new(&repo.path).expect("adapter should discover jj repo");
+    let eng = Engine::new().unwrap();
+
+    let docket = adapter
+        .adjudicate_3way(
+            "bookmarks(exact:main)",
+            "bookmarks(exact:head)",
+            &eng,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &JjAdjudicateOptions::default(),
+        )
+        .expect("adjudication succeeds");
+
+    // Ancestor..head is empty, so the docket must say so. Diffing the base
+    // tip against head would (wrongly) list src/lib.rs as touched.
+    assert!(
+        docket
+            .disputes
+            .iter()
+            .any(|d| d.id == oot::dispute::EMPTY_CHANGE_ID),
+        "EMPTY_CHANGE notice expected: ancestor..head changed nothing, got disputes: {:?}",
+        docket.disputes
+    );
+    assert_eq!(docket.intent, "no files changed");
+}
+
 #[test]
 fn test_jj_conflicted_commit_detected_not_parsed() {
     if !jj_available() {
