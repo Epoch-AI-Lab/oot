@@ -431,3 +431,92 @@ fn test_plain_bundle_refuses_symlinked_output_dir() {
     drop_key(Path::new(&gpg_home));
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// STORE-02: a symlink inside `.oot/dockets/` must not be followed while
+/// building an embargo bundle. Following it would pull host files into the
+/// sealed artifact.
+#[test]
+fn test_embargo_bundle_refuses_symlinked_docket_file() {
+    let tmp = scratch("docket-symlink-file");
+    let (gpg_home, key_id) = make_test_key();
+    let (_src, proj) = project(&tmp, &key_id);
+    let gpg_home = gpg_home.to_str().unwrap().to_string();
+
+    let victim = tmp.join("victim.txt");
+    std::fs::write(&victim, "HOST SECRET\n").unwrap();
+    let dockets = proj.join(".oot").join("dockets");
+    std::fs::create_dir_all(&dockets).unwrap();
+    std::os::unix::fs::symlink(&victim, dockets.join("leak.txt")).unwrap();
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", &gpg_home)],
+    );
+    assert!(!ok, "bundle must refuse a symlinked docket file: {msg}");
+    assert!(
+        msg.contains("refusing to bundle symlink")
+            || msg.contains("symlink")
+            || msg.contains("nothing outside the repo"),
+        "error must explain the refusal: {msg}"
+    );
+    assert!(
+        !artifact.exists(),
+        "refused bundle must not create an artifact"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "HOST SECRET\n",
+        "victim must be untouched"
+    );
+
+    drop_key(Path::new(&gpg_home));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// STORE-02: a symlinked directory inside `.oot/dockets/` must not be
+/// traversed into an embargo bundle.
+#[test]
+fn test_embargo_bundle_refuses_symlinked_docket_dir() {
+    let tmp = scratch("docket-symlink-dir");
+    let (gpg_home, key_id) = make_test_key();
+    let (_src, proj) = project(&tmp, &key_id);
+    let gpg_home = gpg_home.to_str().unwrap().to_string();
+
+    let victim_dir = tmp.join("victim-dir");
+    std::fs::create_dir_all(&victim_dir).unwrap();
+    std::fs::write(victim_dir.join("secret.txt"), "HOST SECRET\n").unwrap();
+    let dockets = proj.join(".oot").join("dockets");
+    std::fs::create_dir_all(&dockets).unwrap();
+    std::os::unix::fs::symlink(&victim_dir, dockets.join("escape")).unwrap();
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", &gpg_home)],
+    );
+    assert!(
+        !ok,
+        "bundle must refuse a symlinked docket directory: {msg}"
+    );
+    assert!(
+        msg.contains("refusing to bundle symlink")
+            || msg.contains("symlink")
+            || msg.contains("nothing outside the repo"),
+        "error must explain the refusal: {msg}"
+    );
+    assert!(
+        !artifact.exists(),
+        "refused bundle must not create an artifact"
+    );
+    assert_eq!(
+        std::fs::read_to_string(victim_dir.join("secret.txt")).unwrap(),
+        "HOST SECRET\n",
+        "victim directory must be untouched"
+    );
+
+    drop_key(Path::new(&gpg_home));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
