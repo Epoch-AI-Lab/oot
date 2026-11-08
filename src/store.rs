@@ -3239,7 +3239,10 @@ pub fn embargo_verify(
 ///
 /// The audit path defaults to a log beside the output tree and can be moved
 /// with `--audit-log`. Both outcomes are recorded: a refusal is exactly the
-/// event a maintainer will want to be able to show afterwards.
+/// event a maintainer will want to be able to show afterwards. If a successful
+/// open cannot be recorded, this returns an error so an audited verify never
+/// silently loses its audit trail; the refusal path still reports the original
+/// verification error.
 ///
 /// This log is written by the recipient, so it is a local record and not an
 /// authenticated one — it is evidence someone ran this, not proof from the
@@ -3263,7 +3266,7 @@ pub fn embargo_verify_audited(
     });
     match embargo_verify_inner(artifact, out_dir, expect_signer) {
         Ok(v) => {
-            let _ = write_verify_record(
+            write_verify_record(
                 &log_path,
                 serde_json::json!({
                     "event": "embargo-verified",
@@ -3277,11 +3280,18 @@ pub fn embargo_verify_audited(
                     "changes": v.changes,
                     "tree": out_dir.display().to_string(),
                 }),
-            );
+            )
+            .with_context(|| {
+                format!(
+                    "embargo bundle verified and unpacked to {}, but could not record the open in {}",
+                    out_dir.display(),
+                    log_path.display()
+                )
+            })?;
             Ok(v)
         }
         Err(e) => {
-            let _ = write_verify_record(
+            if let Err(audit_err) = write_verify_record(
                 &log_path,
                 serde_json::json!({
                     "event": "embargo-verify-refused",
@@ -3290,15 +3300,18 @@ pub fn embargo_verify_audited(
                     "signer_pinned": expect_signer.is_some(),
                     "reason": e.to_string(),
                 }),
-            );
+            ) {
+                eprintln!(
+                    "warning: could not record embargo verification refusal in {}: {audit_err:#}",
+                    log_path.display()
+                );
+            }
             Err(e)
         }
     }
 }
 
-/// Append one line to the recipient's audit log. A failure to record is
-/// reported but never turns a good open into a bad one: the bundle is already
-/// verified by then, and refusing it would leave the recipient with nothing.
+/// Append one line to the recipient's audit log.
 fn write_verify_record(path: &Path, mut entry: serde_json::Value) -> Result<()> {
     use std::io::Write;
     if let Some(obj) = entry.as_object_mut() {
