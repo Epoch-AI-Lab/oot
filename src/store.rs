@@ -1272,22 +1272,11 @@ impl Store {
         // Export mappings are only valid for the policy they were produced
         // under: a filtered export's shas mean nothing to an unfiltered one
         // and vice versa. A changed policy wipes the cache before anything
-        // can silently mix decisions from two regimes.
+        // can silently mix decisions from two regimes. The key is canonical
+        // (sorted lists, every visibility field) so reordering semantically
+        // identical entries does not invalidate the cache.
         let filter_key = match policy {
-            Some(p) if filtering => {
-                let resign = p
-                    .resign_key_id
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default();
-                format!(
-                    "{}\u{1f}{}\u{1f}{}\u{1f}{}",
-                    p.private_paths.join(","),
-                    p.private_branches.join(","),
-                    p.embargo_until.as_deref().unwrap_or_default(),
-                    resign
-                )
-            }
+            Some(p) if filtering => p.canonical_fields(),
             _ => String::new(),
         };
         self.reset_export_cache_if_policy_changed(&filter_key)?;
