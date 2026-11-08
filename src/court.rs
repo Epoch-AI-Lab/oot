@@ -141,7 +141,8 @@ pub fn save_docket(store: &Store, persisted: &PersistedDocket) -> Result<()> {
     let dir = store.path().join(DOCKETS_DIR);
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", persisted.change));
-    std::fs::write(&path, serde_json::to_vec_pretty(persisted)?)
+    let bytes = serde_json::to_vec_pretty(persisted)?;
+    crate::docket::atomic_write(&path, &bytes)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
@@ -336,6 +337,15 @@ mod tests {
         // Unknown id fails loudly with the next-step hint.
         let err = load_docket(&store, "ffffffff").unwrap_err().to_string();
         assert!(err.contains("no persisted docket"), "{err}");
+
+        // Atomic save leaves no temp file behind in the dockets dir.
+        let leftovers: Vec<_> = std::fs::read_dir(store.path().join(DOCKETS_DIR))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
     }
 
     #[test]
