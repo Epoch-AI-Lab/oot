@@ -62,10 +62,12 @@ fn content_has_conflict_markers(content: &str) -> bool {
     let mut open = false;
     let mut close = false;
     for line in content.lines() {
-        if line.starts_with("<<<<<<<") {
-            open = true;
-        } else if line.starts_with(">>>>>>>") {
-            close = true;
+        if is_conflict_marker_line(line) {
+            if line.starts_with("<<<<<<<") {
+                open = true;
+            } else if line.starts_with(">>>>>>>") {
+                close = true;
+            }
         }
         if open && close {
             return true;
@@ -424,7 +426,8 @@ mod tests {
 
     #[test]
     fn test_real_conflict_block_is_detected() {
-        let content = "before\n<<<<<<< ConflictMarker\nleft\n=======\nright\n>>>>>>> ConflictMarker\nafter\n";
+        let content =
+            "before\n<<<<<<< ConflictMarker\nleft\n=======\nright\n>>>>>>> ConflictMarker\nafter\n";
         assert!(content_has_conflict_markers(content));
     }
 
