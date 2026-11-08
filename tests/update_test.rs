@@ -313,6 +313,14 @@ fn test_update_ignores_symlink_and_restores_file() {
         assert!(ok, "{msg}");
         // Symlink survives because it is not in work's tracked set — we verify it was not followed
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside\n");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "symlink entry must survive update"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), outside);
     }
 
     let _ = std::fs::remove_dir_all(&tmp);
