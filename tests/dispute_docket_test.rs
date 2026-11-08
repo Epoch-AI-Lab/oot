@@ -1,5 +1,6 @@
 use oot::dispute::{Dispute, Docket, Kind, Severity, Verdict};
 use oot::docket;
+use oot::policy::MeaningPolicy;
 use std::path::Path;
 
 fn sample_docket() -> Docket {
@@ -42,10 +43,11 @@ fn sample_docket() -> Docket {
 fn test_dispute_classification_and_counts() {
     let docket = sample_docket();
 
+    let policy = MeaningPolicy::default();
     assert_eq!(docket.meaning_count(), 2);
     assert_eq!(docket.visibility_count(), 1);
-    assert_eq!(docket.review_count(), 1);
-    assert!(docket.requires_review());
+    assert_eq!(docket.review_count(&policy), 1);
+    assert!(docket.requires_review(&policy));
 
     let clean_docket = Docket {
         change: "docs".into(),
@@ -61,8 +63,8 @@ fn test_dispute_classification_and_counts() {
 
     assert_eq!(clean_docket.meaning_count(), 0);
     assert_eq!(clean_docket.visibility_count(), 0);
-    assert_eq!(clean_docket.review_count(), 0);
-    assert!(!clean_docket.requires_review());
+    assert_eq!(clean_docket.review_count(&policy), 0);
+    assert!(!clean_docket.requires_review(&policy));
 }
 
 #[test]
@@ -162,23 +164,24 @@ fn test_docket_load_from_example_fixture() {
 
 #[test]
 fn test_docket_render_verdicts() {
+    let policy = MeaningPolicy::default();
     // 1. Cloaked verdict
     let mut cloaked = sample_docket();
     cloaked.verdict = Verdict::Cloaked;
-    let rendered_cloaked = cloaked.render();
+    let rendered_cloaked = cloaked.render(&policy);
     assert!(rendered_cloaked.contains("verdict:    ▶ CLOAKED . 1 requires review, cloaked"));
 
     // 2. Blocked verdict
     let mut blocked = sample_docket();
     blocked.verdict = Verdict::Blocked;
-    let rendered_blocked = blocked.render();
+    let rendered_blocked = blocked.render(&policy);
     assert!(rendered_blocked.contains("verdict:    ▶ BLOCKED . 1 requires review"));
 
     // 3. Adjudicated verdict with no reviews
     let mut adjudicated = sample_docket();
     adjudicated.disputes.clear();
     adjudicated.verdict = Verdict::Adjudicated;
-    let rendered_adjudicated = adjudicated.render();
+    let rendered_adjudicated = adjudicated.render(&policy);
     assert!(rendered_adjudicated.contains("verdict:    ▶ ADJUDICATED \n"));
     assert!(rendered_adjudicated.contains("dispute:    none"));
 }

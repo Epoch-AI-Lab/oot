@@ -215,7 +215,7 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
         .any(|d| d.detail.contains("hello") && d.kind == oot::dispute::Kind::Meaning));
     assert_eq!(docket.verdict, oot::dispute::Verdict::Adjudicated);
 
-    let rendered = docket.render();
+    let rendered = docket.render(&MeaningPolicy::default());
     assert!(rendered.contains("OOT DOCKET"));
 }
 
