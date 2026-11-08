@@ -184,7 +184,9 @@ pub fn log_adjudication(store: &Store, persisted: &PersistedDocket) -> Result<()
 /// Stable fingerprint of the two policies an adjudication ran under — the
 /// export cache key's trick applied to governance: canonical serialization,
 /// then hash. Any new policy field MUST join the canonical string or stale
-/// keys will look equal after a policy change.
+/// keys will look equal after a policy change. List fields are sorted and
+/// every visibility-policy field is included so semantically identical policies
+/// produce the same key regardless of file order.
 pub fn policy_key(meaning: &MeaningPolicy, visibility: &VisibilityPolicy) -> String {
     let mut canon = String::new();
     canon.push_str("block_on=");
@@ -193,12 +195,8 @@ pub fn policy_key(meaning: &MeaningPolicy, visibility: &VisibilityPolicy) -> Str
     push_list(&mut canon, &meaning.review_on);
     canon.push_str(";rename_min=");
     canon.push_str(&meaning.rename_min_score.to_string());
-    canon.push_str(";private_paths=");
-    push_list(&mut canon, &visibility.private_paths);
-    canon.push_str(";private_branches=");
-    push_list(&mut canon, &visibility.private_branches);
-    canon.push_str(";embargo_until=");
-    canon.push_str(visibility.embargo_until.as_deref().unwrap_or(""));
+    canon.push(';');
+    canon.push_str(&visibility.canonical_fields());
     fnv1a(canon.as_bytes())
 }
 
@@ -411,6 +409,26 @@ mod tests {
             ..Default::default()
         };
         assert_ne!(base, policy_key(&MeaningPolicy::default(), &extra_path));
+    }
+
+    // Regression (X-12): reordering semantically identical list entries must not
+    // change the court policy key (and must agree with visibility/export keys).
+    #[test]
+    fn test_policy_key_canonicalizes_list_order() {
+        let meaning = MeaningPolicy::default();
+        let a = VisibilityPolicy {
+            private_paths: vec!["secrets/".into(), ".env".into()],
+            private_branches: vec!["internal".into(), "audit".into()],
+            embargo_recipients: vec!["bob@example.com".into(), "alice@example.com".into()],
+            ..Default::default()
+        };
+        let b = VisibilityPolicy {
+            private_paths: vec![".env".into(), "secrets/".into()],
+            private_branches: vec!["audit".into(), "internal".into()],
+            embargo_recipients: vec!["alice@example.com".into(), "bob@example.com".into()],
+            ..Default::default()
+        };
+        assert_eq!(policy_key(&meaning, &a), policy_key(&meaning, &b));
     }
 
     #[test]

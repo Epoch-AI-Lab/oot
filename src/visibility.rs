@@ -61,20 +61,39 @@ impl Default for VisibilityPolicy {
 }
 
 impl VisibilityPolicy {
-    /// A stable fingerprint of the fields that decide who may receive a
-    /// bundle, recorded with the seal event so a later edit to
-    /// `embargo_recipients` or `embargo_until` is detectable afterwards.
-    pub fn audit_key(&self) -> String {
+    /// Canonical form of every visibility-policy field: list fields are sorted
+    /// so semantically identical policies hash the same regardless of file
+    /// order, and every field is included so no policy change can hide behind
+    /// an unchanged fingerprint. Shared by `audit_key`, export filter-keying,
+    /// and court adjudication keys so they genuinely agree.
+    pub fn canonical_fields(&self) -> String {
         let mut canon = String::new();
         canon.push_str("embargo_until=");
         canon.push_str(self.embargo_until.as_deref().unwrap_or(""));
-        canon.push_str(";recipients=");
-        canon.push_str(&self.embargo_recipients.join(","));
+        canon.push_str(";resign_key_id=");
+        canon.push_str(self.resign_key_id.as_deref().unwrap_or(""));
         canon.push_str(";private_paths=");
-        canon.push_str(&self.private_paths.join(","));
+        push_canonical_list(&mut canon, &self.private_paths);
         canon.push_str(";private_branches=");
-        canon.push_str(&self.private_branches.join(","));
-        crate::court::fnv1a(canon.as_bytes())
+        push_canonical_list(&mut canon, &self.private_branches);
+        canon.push_str(";embargo_recipients=");
+        push_canonical_list(&mut canon, &self.embargo_recipients);
+        canon
+    }
+
+    /// A stable fingerprint of the visibility policy, recorded with seal events
+    /// and embargo bundles so later edits are detectable afterwards.
+    pub fn audit_key(&self) -> String {
+        crate::court::fnv1a(self.canonical_fields().as_bytes())
+    }
+}
+
+fn push_canonical_list(out: &mut String, items: &[String]) {
+    let mut sorted = items.to_vec();
+    sorted.sort();
+    for item in sorted {
+        out.push_str(&item);
+        out.push('\u{1f}');
     }
 }
 
@@ -476,5 +495,27 @@ mod tests {
         assert!(msg.contains("visibility.toml"), "{msg}");
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    // Regression (X-12): reordering list fields is semantically a no-op, so the
+    // visibility fingerprint must not change and invalidate caches/keys.
+    #[test]
+    fn test_visibility_fingerprint_canonicalizes_list_order() {
+        let a = VisibilityPolicy {
+            private_paths: vec!["secrets/".into(), ".env".into(), "vault/".into()],
+            private_branches: vec!["internal".into(), "audit".into()],
+            embargo_recipients: vec!["bob@example.com".into(), "alice@example.com".into()],
+            embargo_until: Some("2026-10-01".into()),
+            resign_key_id: Some("KEY1".into()),
+        };
+        let b = VisibilityPolicy {
+            private_paths: vec![".env".into(), "vault/".into(), "secrets/".into()],
+            private_branches: vec!["audit".into(), "internal".into()],
+            embargo_recipients: vec!["alice@example.com".into(), "bob@example.com".into()],
+            embargo_until: Some("2026-10-01".into()),
+            resign_key_id: Some("KEY1".into()),
+        };
+        assert_eq!(a.canonical_fields(), b.canonical_fields());
+        assert_eq!(a.audit_key(), b.audit_key());
     }
 }
