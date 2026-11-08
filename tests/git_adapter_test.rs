@@ -338,6 +338,41 @@ fn test_git_adapter_3way_reports_real_commit_authors() {
 }
 
 #[test]
+fn test_git_adapter_3way_respects_explicit_authors_override() {
+    let repo = TempGitRepo::new("3way_authors_override");
+
+    repo.write_file("src/lib.rs", "pub fn common() -> i32 { 0 }\n");
+    repo.commit_as("base version", "Base Author", "base@example.com");
+
+    repo.create_and_checkout_branch("feature/auth-override");
+    repo.write_file("src/lib.rs", "pub fn common() -> i32 { 1 }\n");
+    repo.commit_as("feature commit", "Commit Author", "commit@example.com");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let engine = Engine::new().expect("valid engine");
+
+    let docket = adapter
+        .adjudicate_3way(
+            "main",
+            "feature/auth-override",
+            &engine,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &GitAdjudicateOptions {
+                authors: Some(vec!["CLI Bob".to_string(), "CLI Alice".to_string()]),
+                ..Default::default()
+            },
+        )
+        .expect("adjudicate 3way");
+
+    assert_eq!(
+        docket.authors,
+        vec!["CLI Alice".to_string(), "CLI Bob".to_string()],
+        "explicit --authors override must win over commit-derived authors"
+    );
+}
+
+#[test]
 fn test_cli_git_adjudication_flags() {
     let repo = TempGitRepo::new("cli_git");
     repo.write_file("src/lib.rs", "pub fn base() {}\n");
@@ -367,4 +402,43 @@ fn test_cli_git_adjudication_flags() {
         .expect("failed to run CLI command");
 
     assert!(status.success());
+}
+
+#[test]
+fn test_cli_git_adjudication_respects_authors_flag() {
+    let repo = TempGitRepo::new("cli_git_authors");
+    repo.write_file("src/lib.rs", "pub fn base() {}\n");
+    repo.commit("initial base");
+
+    repo.create_and_checkout_branch("feature/cli-authors");
+    repo.write_file("src/lib.rs", "pub fn base() {}\npub fn extra() {}\n");
+    repo.commit("feature commit");
+
+    repo.checkout("main");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oot"))
+        .args([
+            "adjudicate",
+            "--repo",
+            repo.path.to_str().unwrap(),
+            "--base-ref",
+            "main",
+            "--head-ref",
+            "feature/cli-authors",
+            "--authors",
+            "CLI Alice,CLI Bob",
+        ])
+        .output()
+        .expect("failed to run CLI command");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("CLI Alice") && stdout.contains("CLI Bob"),
+        "VCS adjudication must honor --authors; stdout was: {stdout}"
+    );
 }

@@ -25,6 +25,8 @@ pub struct GitAdjudicateOptions {
     pub change_name: Option<String>,
     /// Declared intent or purpose of the change.
     pub intent: Option<String>,
+    /// Explicit authors override. When set, replaces commit-derived authors.
+    pub authors: Option<Vec<String>>,
 }
 
 impl GitAdapter {
@@ -210,7 +212,14 @@ impl GitAdapter {
         let base_snapshot = self.extract_snapshot(&base_sha)?;
         let head_snapshot = self.extract_snapshot(&head_sha)?;
 
-        let mut authors = self.authors(&format!("{merge_base_sha}..{head_sha}"))?;
+        let mut authors = if let Some(explicit) = options.authors.clone() {
+            let mut normalized = explicit;
+            normalized.sort();
+            normalized.dedup();
+            normalized
+        } else {
+            self.authors(&format!("{merge_base_sha}..{head_sha}"))?
+        };
         if authors.is_empty() {
             authors = vec!["@git-author".to_string()];
         }

@@ -220,6 +220,35 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
 }
 
 #[test]
+fn test_jj_adjudicate_3way_respects_explicit_authors_override() {
+    if !jj_available() {
+        return;
+    }
+    let (_repo, adapter) = setup_base_and_head(false);
+    let eng = Engine::new().unwrap();
+
+    let docket = adapter
+        .adjudicate_3way(
+            "bookmarks(exact:main)",
+            "@-",
+            &eng,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &JjAdjudicateOptions {
+                authors: Some(vec!["CLI Bob".to_string(), "CLI Alice".to_string()]),
+                ..Default::default()
+            },
+        )
+        .expect("adjudication succeeds");
+
+    assert_eq!(
+        docket.authors,
+        vec!["CLI Alice".to_string(), "CLI Bob".to_string()],
+        "explicit --authors override must win over commit-derived authors"
+    );
+}
+
+#[test]
 fn test_jj_conflicted_commit_detected_not_parsed() {
     if !jj_available() {
         return;

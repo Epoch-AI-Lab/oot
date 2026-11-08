@@ -328,6 +328,11 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             // VCS 3-way In-Memory Adjudication (git or jj)
             if let (Some(b_ref), Some(h_ref)) = (base_ref, head_ref) {
                 let wants_jj = matches!(source.as_deref(), Some("jj") | Some("jujutsu"));
+                let authors_list = authors.as_ref().map(|a| {
+                    a.split(',')
+                        .map(|s| s.trim().to_string())
+                        .collect::<Vec<_>>()
+                });
 
                 let doc = if wants_jj {
                     let jj_adapter = match repo {
@@ -339,6 +344,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                         custom_ancestor: merge_base,
                         change_name: change,
                         intent,
+                        authors: authors_list,
                     };
 
                     jj_adapter.adjudicate_3way(
@@ -359,6 +365,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                         custom_merge_base: merge_base,
                         change_name: change,
                         intent,
+                        authors: authors_list,
                     };
 
                     git_adapter.adjudicate_3way(

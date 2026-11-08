@@ -30,6 +30,8 @@ pub struct JjAdjudicateOptions {
     pub change_name: Option<String>,
     /// Declared intent or purpose of the change.
     pub intent: Option<String>,
+    /// Explicit authors override. When set, replaces commit-derived authors.
+    pub authors: Option<Vec<String>>,
 }
 
 /// Shorten a commit ID for display (commit IDs are ASCII hex, so slicing is safe).
@@ -258,7 +260,14 @@ impl JjAdapter {
         let (base_snapshot, _) = self.extract_snapshot_with_conflicts(&base_id)?;
         let (head_snapshot, head_conflicts) = self.extract_snapshot_with_conflicts(&head_id)?;
 
-        let mut authors = self.authors(&ancestor_id, &head_id)?;
+        let mut authors = if let Some(explicit) = options.authors.clone() {
+            let mut normalized = explicit;
+            normalized.sort();
+            normalized.dedup();
+            normalized
+        } else {
+            self.authors(&ancestor_id, &head_id)?
+        };
         if authors.is_empty() {
             authors = vec!["@jj-author".to_string()];
         }
