@@ -206,10 +206,8 @@ fn test_jj_adjudicate_3way_clean_unilateral_change() {
 /// moved on, diffing the tip against head reports files touched even though
 /// ancestor..head changed nothing.
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_docket_diff_uses_ancestor() {
-    if !jj_available() {
-        return;
-    }
     let repo = init_repo(false);
     write_lib(&repo.path, "hello");
     jj(&repo.path, &["commit", "-m", "base"]);
@@ -254,10 +252,8 @@ fn test_jj_docket_diff_uses_ancestor() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_adjudicate_3way_respects_explicit_authors_override() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(false);
     let eng = Engine::new().unwrap();
 
@@ -322,10 +318,8 @@ fn test_jj_conflicted_commit_detected_not_parsed() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_authors_bogus_revset_errors() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(false);
 
     let result = adapter.authors("no-such-revset-xyz", "also-no-such-revset-xyz");
