@@ -2038,11 +2038,12 @@ impl Store {
     }
 
     /// Point branches and tags at their exported shas in a freshly replayed
-    /// repo. `keep_branch` filters whole branches: public export drops private
-    /// branches, the embargo bundle keeps everything. Omissions land in the
-    /// audit log and on stderr and never abort the run — one bad tag must not
-    /// sink a whole history replay. Returns what was pointed, for reporting
-    /// and HEAD selection.
+    /// repo. `keep_branch` filters whole branches and tags: public export drops
+    /// private branches and any tag whose ref name is private or whose target
+    /// sits on a private branch. The embargo bundle keeps everything. Omissions
+    /// land in the audit log and on stderr and never abort the run — one bad
+    /// tag must not sink a whole history replay. Returns what was pointed, for
+    /// reporting and HEAD selection.
     pub fn point_branches_and_tags(
         &self,
         repo_dir: &Path,
@@ -2050,23 +2051,37 @@ impl Store {
         resign_key: Option<&str>,
     ) -> Result<PointedRefs> {
         let mut pointed = PointedRefs::default();
-        for (branch, head_id) in self.refs()? {
-            if !keep_branch(&branch) {
-                self.log_branch_omitted(&branch, &head_id)?;
+        let refs = self.refs()?;
+        for (branch, head_id) in &refs {
+            if !keep_branch(branch) {
+                self.log_branch_omitted(branch, head_id)?;
                 continue;
             }
-            match self.branch_head_sha(&head_id)? {
+            match self.branch_head_sha(head_id)? {
                 Some(sha) => {
-                    self.point_ref(repo_dir, &branch, &sha)?;
-                    pointed.branches.push((branch, sha));
+                    self.point_ref(repo_dir, branch, &sha)?;
+                    pointed.branches.push((branch.clone(), sha));
                 }
                 None => {
-                    self.log_branch_omitted(&branch, &head_id)?;
+                    self.log_branch_omitted(branch, head_id)?;
                     eprintln!("warning: branch {branch} omitted (entire history withheld)");
                 }
             }
         }
         for (tag, head_id) in self.tags()? {
+            if !keep_branch(&tag) {
+                self.log_tag_omitted(&tag, &head_id)?;
+                eprintln!("warning: tag {tag} omitted (private ref)");
+                continue;
+            }
+            let targets_private_branch = refs
+                .iter()
+                .any(|(branch, hid)| hid == &head_id && !keep_branch(branch));
+            if targets_private_branch {
+                self.log_tag_omitted(&tag, &head_id)?;
+                eprintln!("warning: tag {tag} omitted (target history is private)");
+                continue;
+            }
             if !Self::valid_tag_ref(&tag) {
                 self.log_tag_omitted(&tag, &head_id)?;
                 eprintln!("warning: tag {tag} omitted (invalid refname)");

@@ -312,6 +312,58 @@ fn test_cloaked_branch_is_not_published_by_export() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+/// A tag whose target sits on a private branch must not be published. The
+/// branch ref is filtered, but the tag still resolves to the same exported
+/// commit and would make the private history reachable by name.
+#[test]
+fn test_tag_targeting_private_branch_is_omitted_from_export() {
+    let tmp = std::env::temp_dir().join(format!("oot-tag-priv-{}-b", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&proj).unwrap();
+
+    build_fixture(&src);
+    git(&src, &["checkout", "-b", "secret/topic"]);
+    std::fs::write(src.join("README.md"), "secret work\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "secret topic"]);
+    git(&src, &["tag", "v1"]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = []\nprivate_branches = [\"secret/topic\"]\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    assert!(oot(&["import", "--repo", src.to_str().unwrap()], &proj).0);
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+    assert!(
+        msg.contains("tag v1 omitted") || msg.contains("warning: tag v1 omitted"),
+        "export should report the omitted tag: {msg}"
+    );
+
+    let heads = git(&out, &["for-each-ref", "--format=%(refname)", "refs/heads"]);
+    assert!(
+        !heads.contains("refs/heads/secret/topic"),
+        "private branch must not export: {heads}"
+    );
+    let tags = git(&out, &["for-each-ref", "--format=%(refname)", "refs/tags"]);
+    assert!(
+        !tags.contains("refs/tags/v1"),
+        "tag on a private branch must not export: {tags}"
+    );
+    assert!(
+        heads.contains("refs/heads/main"),
+        "public branch must still export: {heads}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 #[test]
 fn test_filtered_export_skips_empty_rebuilt_commits() {
     let tmp = std::env::temp_dir().join(format!("oot-empty-{}", std::process::id()));
