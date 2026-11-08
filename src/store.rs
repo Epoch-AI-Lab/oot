@@ -1212,10 +1212,32 @@ impl Store {
                         }
                     }
                 }
-                let empty_over_ancestry =
-                    !ps.is_empty() && ps.iter().all(|p| tree_of.get(p) == Some(&stripped_tree));
+                // A commit the identity fast path below can keep verbatim
+                // (untouched tree, exact parents, original object present)
+                // was already empty in the source, not emptied by stripping.
+                // Exempt it from the skip so its SHA and signature survive.
+                let preserves_identity = match &record.source_sha {
+                    Some(orig) => {
+                        let parents_exact = record.parents.iter().all(|p| {
+                            sha_of
+                                .get(p)
+                                .is_some_and(|e| source_sha_of.get(p) == Some(e))
+                        });
+                        stripped_tree == record.tree
+                            && parents_exact
+                            && self.commit_object_exists(orig)?
+                    }
+                    None => false,
+                };
+                let empty_over_ancestry = !preserves_identity
+                    && !ps.is_empty()
+                    && ps.iter().all(|p| tree_of.get(p) == Some(&stripped_tree));
                 if empty_over_ancestry {
-                    let why = "empty after private-path stripping".to_string();
+                    let why = if stripped_tree == record.tree {
+                        "no net change over exported ancestry".to_string()
+                    } else {
+                        "empty after private-path stripping".to_string()
+                    };
                     self.log_withheld(&id, record.source_sha.as_deref(), &why)?;
                     continue;
                 }
