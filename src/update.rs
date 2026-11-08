@@ -196,7 +196,9 @@ pub fn run(
         anyhow::bail!(hint);
     }
 
-    // Materialize: delete files not in target, then write target files.
+    // Materialize: validate untracked collisions before any delete, then delete
+    // files not in target, then write target files. This ordering prevents a
+    // bail from leaving a half-mutated tree (deletions applied, writes undone).
     // Atomicity: deletes propagate errors (except NotFound); writes use
     // temp-file + rename so a crash never leaves a truncated file.
     // --force is required to delete untracked files not in target
@@ -207,6 +209,9 @@ pub fn run(
     // Preserve untracked markers (not in the current head) so empty dirs like
     // `logs/` or `tmp/` survive across updates. Tracked markers follow the
     // target like any other file — if the target deletes them, delete them.
+    if !force {
+        validate_untracked_writes(&root, &snapshot.files, &work)?;
+    }
     for path in work.keys() {
         if !force && is_keep_marker(path) && !head_filtered.contains_key(path) {
             continue;
@@ -270,16 +275,7 @@ pub fn run(
 
     for (path, contents) in &snapshot.files {
         let full = root.join(path);
-        if !force && full.exists() && !work.contains_key(path) {
-            if let Ok(existing_bytes) = std::fs::read(&full) {
-                if existing_bytes != *contents {
-                    anyhow::bail!(
-                        "untracked working file '{path}' would be overwritten by update; commit, move, or pass --force"
-                    );
-                }
-            }
-        }
-        // Preserve exec bits from tree.
+        // Untracked collisions are validated before deletes (and skipped with --force).
         let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         write_file_atomic(&full, &root, contents, executable)?;
     }
@@ -430,6 +426,24 @@ fn materialize_merge(
         }
     }
 
+    // Validate untracked collisions before any delete so a bail leaves the tree
+    // untouched. Check any path we will write that is not in the working copy.
+    for (path, contents) in &snapshot.files {
+        if keep_work.contains(path) {
+            continue;
+        }
+        let is_filtered_path = target_filtered.contains_key(path)
+            || head_filtered.contains_key(path)
+            || work.contains_key(path);
+        if is_filtered_path && !take_target.contains(path) {
+            continue;
+        }
+        // Collision is only possible when the working copy does not track this path.
+        if !work.contains_key(path) {
+            check_untracked_overwrite(&root.join(path), path, contents)?;
+        }
+    }
+
     // 1) Delete: only delete work files that are take-target and target has no entry
     //    (i.e., target deleted it and work didn't change it).
     //    Keep-work files are never deleted. Preserve untracked .ootkeep/.oothave
@@ -538,16 +552,7 @@ fn materialize_merge(
         }
 
         let full = root.join(path);
-        if !is_filtered_path && full.exists() && !work.contains_key(path) {
-            if let Ok(existing_bytes) = std::fs::read(&full) {
-                if existing_bytes != *contents {
-                    anyhow::bail!(
-                        "untracked working file '{path}' would be overwritten by update; commit, move, or pass --force"
-                    );
-                }
-            }
-        }
-
+        // Untracked collisions are validated before deletes.
         let executable = target_files.get(path).map(|(_, e)| *e).unwrap_or(false);
         write_file_atomic(&full, root, contents, executable)?;
     }
@@ -586,6 +591,40 @@ fn is_keep_marker(path: &str) -> bool {
         .file_name()
         .and_then(|n| n.to_str())
         .is_some_and(|name| name == ".ootkeep" || name == ".oothave")
+}
+
+fn check_untracked_overwrite(full: &Path, path: &str, contents: &[u8]) -> Result<()> {
+    if !full.exists() {
+        return Ok(());
+    }
+    let meta = std::fs::symlink_metadata(full)
+        .with_context(|| format!("failed to inspect existing path '{path}' before update"))?;
+    if meta.file_type().is_dir() {
+        anyhow::bail!(
+            "cannot overwrite existing directory '{path}' with a file during update; remove it or pass --force"
+        );
+    }
+    let existing_bytes = std::fs::read(full)
+        .with_context(|| format!("failed to read existing path '{path}' to check for overwrite"))?;
+    if existing_bytes != contents {
+        anyhow::bail!(
+            "untracked working file '{path}' would be overwritten by update; commit, move, or pass --force"
+        );
+    }
+    Ok(())
+}
+
+fn validate_untracked_writes(
+    root: &Path,
+    snapshot_files: &std::collections::HashMap<String, Vec<u8>>,
+    work: &std::collections::HashMap<String, (String, bool)>,
+) -> Result<()> {
+    for (path, contents) in snapshot_files {
+        if !work.contains_key(path) {
+            check_untracked_overwrite(&root.join(path), path, contents)?;
+        }
+    }
+    Ok(())
 }
 
 fn write_file_atomic(full: &Path, root: &Path, contents: &[u8], executable: bool) -> Result<()> {
