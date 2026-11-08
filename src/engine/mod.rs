@@ -709,10 +709,20 @@ fn rename_score(candidate: &str, original: &str) -> u8 {
 /// token boundaries like the space between a lifetime (`'a`) and its type
 /// (`str`) are preserved; the result is squashed for stable comparison.
 fn strip_param_names(sig: &str) -> (String, bool) {
-    let Some(open) = sig.find('(') else {
+    // The function name is blanked to \0 in rename signatures; the param
+    // list follows it. Searching from \0 skips decorator/attribute parens
+    // that appear earlier in the text (e.g. `@dec(1) def f(a):`).
+    let open = if let Some(blank) = sig.find('\u{0}') {
+        sig[blank..]
+            .find('(')
+            .map(|byte_offset| blank + byte_offset)
+    } else {
+        sig.find('(')
+    };
+    let Some(open) = open else {
         return (squash_ws(sig), false);
     };
-    // Find the `)` that closes the first `(`.
+    // Find the `)` that closes the param list.
     let mut depth = 0;
     let mut close = None;
     for (i, c) in sig[open..].char_indices() {
@@ -734,18 +744,46 @@ fn strip_param_names(sig: &str) -> (String, bool) {
     out.push_str(&sig[..=open]);
     let mut had_names = false;
     let mut segment = String::new();
-    let mut seg_depth = 0;
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
     for c in params.chars() {
+        let at_top = paren_depth == 0 && angle_depth == 0 && brace_depth == 0 && bracket_depth == 0;
         match c {
             '(' => {
-                seg_depth += 1;
+                paren_depth += 1;
                 segment.push(c);
             }
             ')' => {
-                seg_depth -= 1;
+                paren_depth -= 1;
                 segment.push(c);
             }
-            ',' if seg_depth == 0 => {
+            '<' => {
+                angle_depth += 1;
+                segment.push(c);
+            }
+            '>' => {
+                angle_depth -= 1;
+                segment.push(c);
+            }
+            '{' => {
+                brace_depth += 1;
+                segment.push(c);
+            }
+            '}' => {
+                brace_depth -= 1;
+                segment.push(c);
+            }
+            '[' => {
+                bracket_depth += 1;
+                segment.push(c);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                segment.push(c);
+            }
+            ',' if at_top => {
                 let (s, h) = strip_segment(&segment);
                 out.push_str(&s);
                 out.push(',');
@@ -1192,6 +1230,36 @@ mod tests {
             details,
             vec!["renamed function `fact` to `factorial`"],
             "recursive rename must pair as one rename, got {details:?}"
+        );
+    }
+
+    #[test]
+    fn test_decorated_python_param_rename_detected() {
+        // ENGINE-05: decorator parens appear before the function's param list.
+        // The body must not reference the renamed param, or rename scoring
+        // (which requires word-for-word body match) rejects it independently.
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "lib.py".into(),
+            "@register(1)\ndef alpha(a):\n    return 42\n".into(),
+        );
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "lib.py".into(),
+            "@register(1)\ndef beta(b):\n    return 42\n".into(),
+        );
+
+        let loose = Engine::new().unwrap().with_rename_min_score(80);
+        let details: Vec<String> = loose
+            .diff_snapshots(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
+        assert_eq!(
+            details,
+            vec!["renamed function `alpha` to `beta`"],
+            "decorated param rename must pair at threshold 80, got {details:?}"
         );
     }
 
@@ -1750,6 +1818,22 @@ mod tests {
         assert_eq!(
             rename_score("fn \0(a: Foo<A, B>) { x }", "fn \0(c: Foo<A, B>) { x }"),
             80
+        );
+        // ENGINE-04: commas inside generics/braces/brackets must not split params.
+        assert_eq!(
+            rename_score("fn \0(a: Foo<A, B>) { x }", "fn \0(c: Foo<A, C>) { x }"),
+            0,
+            "different generic type args must not be erased as param names"
+        );
+        // ENGINE-05: the param list follows the blanked name; decorator/attribute
+        // parens earlier in the signature must not be mistaken for it.
+        assert_eq!(
+            rename_score(
+                "@register(1)\ndef \0(a):\n    return 42\n",
+                "@register(1)\ndef \0(b):\n    return 42\n"
+            ),
+            80,
+            "decorator parens must not hide the real param list"
         );
         assert_eq!(
             rename_score("fn \0(x: &'a str) { y }", "fn \0(x: &'b str) { y }"),
