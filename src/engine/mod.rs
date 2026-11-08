@@ -1491,6 +1491,14 @@ mod tests {
             "refactor + unrelated edit must not produce High conflicts, got {:?}",
             disputes
         );
+        assert!(
+            disputes.iter().any(|d| {
+                d.detail == "incoming branch modified function `run`"
+                    && d.severity == Severity::Review
+            }),
+            "impl move + in-place edit must report the incoming modification, got {:?}",
+            disputes
+        );
     }
 
     #[test]
