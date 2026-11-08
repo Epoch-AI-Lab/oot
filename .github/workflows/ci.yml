@@ -58,7 +58,7 @@ jobs:
           jj config set --user user.name "Oot CI"
           jj config set --user user.email "oot-ci@example.com"
       - name: Run Tests
-        run: cargo test --all-targets --all-features --verbose
+        run: cargo test --all-targets --all-features --verbose -- --include-ignored
 
   build:
     name: Release Build

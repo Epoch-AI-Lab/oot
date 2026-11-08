@@ -1,7 +1,8 @@
 //! Integration tests for the Jujutsu adapter.
 //!
 //! These run against hermetic `jj` repositories created in the system temp dir.
-//! They skip (pass trivially) when the `jj` binary is not installed.
+//! They require the `jj` binary and are ignored unless `--include-ignored` is passed.
+//! CI installs `jj` and runs all targets with `--include-ignored`.
 
 use oot::adapter::{JjAdapter, JjAdjudicateOptions};
 use oot::engine::Engine;
@@ -12,14 +13,6 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static COUNTER: AtomicUsize = AtomicUsize::new(0);
-
-fn jj_available() -> bool {
-    Command::new("jj")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
 
 struct TempRepo {
     path: PathBuf,
@@ -99,10 +92,8 @@ fn setup_base_and_head(colocate: bool) -> (TempRepo, JjAdapter) {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_adapter_discover_and_root() {
-    if !jj_available() {
-        return;
-    }
     for colocate in [true, false] {
         let (repo, adapter) = setup_base_and_head(colocate);
         assert!(adapter.repo_root().exists());
@@ -112,10 +103,8 @@ fn test_jj_adapter_discover_and_root() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_resolve_commit_id() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(false);
 
     let id = adapter.resolve_commit_id("@-").expect("head resolves");
@@ -130,10 +119,8 @@ fn test_jj_resolve_commit_id() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_ancestor_of_base_and_head_is_base() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(true);
 
     let base = adapter.resolve_commit_id("bookmarks(exact:main)").unwrap();
@@ -143,10 +130,8 @@ fn test_jj_ancestor_of_base_and_head_is_base() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_extract_snapshot() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(false);
 
     let snap = adapter.extract_snapshot("@-").expect("snapshot extracts");
@@ -160,10 +145,8 @@ fn test_jj_extract_snapshot() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_extract_snapshot_binary_exact_bytes() {
-    if !jj_available() {
-        return;
-    }
     let repo = init_repo(false);
     write_lib(&repo.path, "hello");
     jj(&repo.path, &["commit", "-m", "base"]);
@@ -182,10 +165,8 @@ fn test_jj_extract_snapshot_binary_exact_bytes() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_adjudicate_3way_clean_unilateral_change() {
-    if !jj_available() {
-        return;
-    }
     let (_repo, adapter) = setup_base_and_head(false);
     let eng = Engine::new().unwrap();
 
@@ -302,10 +283,8 @@ fn test_jj_adjudicate_3way_respects_explicit_authors_override() {
 }
 
 #[test]
+#[ignore = "requires jj"]
 fn test_jj_conflicted_commit_detected_not_parsed() {
-    if !jj_available() {
-        return;
-    }
     let repo = init_repo(false);
     write_lib(&repo.path, "original");
 
