@@ -155,8 +155,7 @@ impl Engine {
                     // top-level injection hiding beside a function edit still
                     // gets its own dispute, while whitespace-only churn and
                     // pure function-body edits stay silent here.
-                    let top_changed = squash_ws(&without_defs(&b, &base_fns))
-                        != squash_ws(&without_defs(&h, &head_fns));
+                    let top_changed = top_level_changed(&b, &base_fns, &h, &head_fns);
                     if top_changed {
                         disputes.push(meaning(
                             &mut n,
@@ -516,8 +515,7 @@ impl Engine {
                     // trusted target side, so ours-only drift stays silent,
                     // and identical changes on both sides count as converged.
                     if t_src != b_src && o_src != t_src {
-                        let top_changed = squash_ws(&without_defs(&b_src, &b_fns))
-                            != squash_ws(&without_defs(&t_src, &t_fns));
+                        let top_changed = top_level_changed(&b_src, &b_fns, &t_src, &t_fns);
                         if top_changed {
                             disputes.push(meaning(
                                 &mut n,
@@ -639,6 +637,23 @@ fn without_defs(src: &str, fns: &FunctionMap) -> String {
 /// Strip all whitespace for churn-insensitive comparison.
 fn squash_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// Whether top-level (non-function) content differs between two snapshots.
+/// Under the size cap this blanks defs and ignores whitespace. Oversize
+/// files skip AST extraction, so their def maps are empty anyway; fall back
+/// to a plain byte comparison instead of allocating blanked and squashed
+/// copies several times the file size.
+fn top_level_changed(
+    base: &str,
+    base_fns: &FunctionMap,
+    head: &str,
+    head_fns: &FunctionMap,
+) -> bool {
+    if base.len() > MAX_AST_PARSE_SIZE_BYTES || head.len() > MAX_AST_PARSE_SIZE_BYTES {
+        return base != head;
+    }
+    squash_ws(&without_defs(base, base_fns)) != squash_ws(&without_defs(head, head_fns))
 }
 
 /// Align two def lists for one name: identical source text pairs first
@@ -922,7 +937,10 @@ fn find_divergent_renames(
 
 /// Maximum file size in bytes to subject to full Tree-Sitter AST extraction.
 /// Files exceeding this cap skip recursive AST parsing to prevent denial of
-/// service on massive generated or bundled assets.
+/// service on massive generated or bundled assets. Top-level change
+/// detection falls back to a byte comparison for such files (see
+/// [`top_level_changed`]) instead of copying them into blanked/squashed
+/// buffers.
 pub const MAX_AST_PARSE_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
@@ -2100,6 +2118,42 @@ mod tests {
             disputes.is_empty(),
             "convergent add/add must be clean, got {:?}",
             disputes
+        );
+    }
+
+    #[test]
+    fn test_top_level_changed_oversize_uses_byte_comparison() {
+        // Oversize files skip AST extraction, so `top_level_changed` must
+        // not blank/squash-copy them: it falls back to byte inequality.
+        // A whitespace-only diff therefore counts as changed, while the
+        // old always-squash path stayed silent for it.
+        let big = "x".repeat(MAX_AST_PARSE_SIZE_BYTES + 16);
+        let empty = FunctionMap::new();
+
+        assert!(!top_level_changed(&big, &empty, &big, &empty));
+        assert!(top_level_changed(&big, &empty, &format!("{big} "), &empty));
+
+        // Same fallback through the public 2-way diff: identical oversize
+        // files stay silent, a changed oversize file is reported.
+        let eng = Engine::new().unwrap();
+        let mut base = Snapshot::default();
+        base.files
+            .insert("src/lib.rs".into(), big.clone().into_bytes());
+        let mut same = Snapshot::default();
+        same.files
+            .insert("src/lib.rs".into(), big.clone().into_bytes());
+        assert!(eng.diff_snapshots(&base, &same).unwrap().is_empty());
+
+        let mut changed = Snapshot::default();
+        changed
+            .files
+            .insert("src/lib.rs".into(), format!("{big}y").into_bytes());
+        let disputes = eng.diff_snapshots(&base, &changed).unwrap();
+        assert!(
+            disputes
+                .iter()
+                .any(|d| d.detail.contains("file content modified")),
+            "oversize change must still be reported, got {disputes:?}"
         );
     }
 }
