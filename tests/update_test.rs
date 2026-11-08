@@ -388,18 +388,13 @@ fn test_update_unknown_and_ambiguous_prefix() {
 
 #[test]
 fn test_update_rejects_path_traversal() {
-    // Git's own fsck already rejects trees containing `..` (hasDotdot),
-    // so we verify the defense-in-depth validation in Store::snapshot_from_tree
-    // and Update's path check would catch it if it somehow got in.
-    // Here we just verify normal update does NOT falsely reject valid paths
-    // and that the Store validation for traversal exists (unit-tested in store).
     let tmp = unique_tmp("traversal");
     let _ = std::fs::remove_dir_all(&tmp);
     let proj = tmp.join("proj");
     std::fs::create_dir_all(&proj).unwrap();
     assert!(oot(&["init"], &proj).0);
 
-    // Valid nested path must be accepted
+    // Valid nested path must be accepted (no false rejection).
     std::fs::create_dir_all(proj.join("a/b")).unwrap();
     std::fs::write(proj.join("a/b/c.txt"), "ok\n").unwrap();
     let (ok, msg) = oot(&["record", "-m", "valid nested"], &proj);
@@ -416,26 +411,102 @@ fn test_update_rejects_path_traversal() {
     let (ok, out) = oot(&["update", "--change", &id[..7], "--force"], &proj);
     assert!(ok, "valid nested path should not be rejected: {out}");
 
-    // Verify that `..` in a direct PutRecord would be rejected at the store layer
-    // (hash-object -t tree with `..` is rejected by git fsck, so store never stores it)
-    let probe = Command::new("git")
-        .args(["hash-object", "-t", "tree", "-w", "--stdin"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn();
-    if let Ok(mut child) = probe {
+    // Defense-in-depth: a tree carrying a traversal path must never be
+    // materialized by `oot update`, even if git --literally was used to
+    // smuggle it into the odb past fsck.
+    use oot::store::validate_tree_path;
+    assert!(validate_tree_path("../evil.txt").is_err());
+    assert!(validate_tree_path("a/../evil.txt").is_err());
+    assert!(validate_tree_path("/abs/evil.txt").is_err());
+    assert!(validate_tree_path("a//b.txt").is_err());
+    assert!(validate_tree_path(".git/config").is_err());
+
+    let store = oot::store::Store::open(&proj).expect("store should open");
+    let valid = store.get_change(id).expect("valid change should load");
+    let blob_sha = {
         use std::io::Write;
-        let raw = b"040000 ..\0\x4b\x82\x5d\xc6\x42\xcb\x6e\xb9\xa0\x60\xe5\x4b\xf8\xd6\x92\x88\xfb\xee\x49\x04";
-        let _ = child.stdin.take().unwrap().write_all(raw);
-        let out = child.wait_with_output().unwrap();
-        assert!(!out.status.success(), "git should reject hasDotdot");
+        let mut child = Command::new("git")
+            .args(["--git-dir"])
+            .arg(store.git_dir())
+            .args(["hash-object", "-t", "blob", "-w", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("git hash-object blob should spawn");
+        child
+            .stdin
+            .take()
+            .expect("blob stdin should exist")
+            .write_all(b"evil\n")
+            .expect("write blob");
+        let out = child.wait_with_output().expect("wait for blob");
         assert!(
-            String::from_utf8_lossy(&out.stderr).contains("hasDotdot"),
-            "{:?}",
+            out.status.success(),
+            "git hash-object blob failed: {}",
             String::from_utf8_lossy(&out.stderr)
         );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let blob_bytes: Vec<u8> = (0..blob_sha.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&blob_sha[i..i + 2], 16).expect("blob sha hex"))
+        .collect();
+    assert_eq!(blob_bytes.len(), 20);
+
+    // Each entry would escape or enter a VCS dir if written verbatim.
+    let escape_outside = tmp.join("evil.txt");
+    for evil_name in ["../evil.txt", ".git/evil.txt", "a//b.txt"] {
+        let mut tree_bytes = Vec::new();
+        tree_bytes.extend_from_slice(b"100644 ");
+        tree_bytes.extend_from_slice(evil_name.as_bytes());
+        tree_bytes.push(0);
+        tree_bytes.extend_from_slice(&blob_bytes);
+        let tree_sha = {
+            use std::io::Write;
+            let mut child = Command::new("git")
+                .args(["--git-dir"])
+                .arg(store.git_dir())
+                .args(["hash-object", "-t", "tree", "-w", "--literally", "--stdin"])
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("git hash-object tree should spawn");
+            child
+                .stdin
+                .take()
+                .expect("tree stdin should exist")
+                .write_all(&tree_bytes)
+                .expect("write tree");
+            let out = child.wait_with_output().expect("wait for tree");
+            assert!(
+                out.status.success(),
+                "git hash-object --literally failed for {evil_name}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let mut evil = valid.clone();
+        evil.tree = tree_sha;
+        evil.message = format!("evil {evil_name}");
+        let evil_id = store.put_record(&evil).expect("put evil record");
+        let (ok, out) = oot(&["update", "--change", evil_id.as_str(), "--force"], &proj);
+        assert!(!ok, "update must reject tree path '{evil_name}': {out}");
+        assert!(
+            out.contains("invalid path in tree"),
+            "rejection must name the invalid path: {out}"
+        );
+        assert!(
+            !escape_outside.exists(),
+            "traversal must not write outside the repo"
+        );
     }
+    assert!(!proj.join(".git/evil.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(proj.join("a/b/c.txt")).unwrap(),
+        "ok\n"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
@@ -587,40 +658,81 @@ fn test_update_keep_marker_exact_vs_suffix() {
     std::fs::create_dir_all(&proj).unwrap();
     assert!(oot(&["init"], &proj).0);
 
-    std::fs::create_dir_all(proj.join("logs")).unwrap();
-    std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
-    std::fs::write(proj.join("doc.ootkeep"), "regular text file\n").unwrap();
+    // First tree has NEITHER marker; second adds both the exact marker and
+    // a suffix lookalike. A clean update back to first must therefore guard
+    // only the exact `.ootkeep` — the suffix file must be deleted.
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
     let (ok, msg) = oot(&["record", "-m", "first"], &proj);
     assert!(ok, "{msg}");
 
-    // Target change has neither
-    std::fs::write(proj.join("other.txt"), "hello\n").unwrap();
-    let _ = std::fs::remove_file(proj.join("doc.ootkeep"));
+    std::fs::create_dir_all(proj.join("logs")).unwrap();
+    std::fs::write(proj.join("logs/.ootkeep"), "").unwrap();
+    std::fs::write(proj.join("doc.ootkeep"), "regular text file\n").unwrap();
     let (ok, msg) = oot(&["record", "-m", "second"], &proj);
     assert!(ok, "{msg}");
 
     let (ok, log) = oot(&["log"], &proj);
     assert!(ok, "{log}");
-    let lines: Vec<&str> = log.lines().collect();
-    let second_id = lines[0].split_whitespace().next().unwrap();
-    let first_id = lines[1].split_whitespace().next().unwrap();
+    let first_id = log
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
 
-    // Restore first change
-    let (ok, msg) = oot(&["update", "--change", &first_id[..7], "--force"], &proj);
-    assert!(ok, "{msg}");
-    assert!(proj.join("logs/.ootkeep").exists());
-    assert!(proj.join("doc.ootkeep").exists());
-
-    // Update to second change with --force: logs/.ootkeep must survive, doc.ootkeep must be deleted
-    let (ok, msg) = oot(&["update", "--change", &second_id[..7], "--force"], &proj);
+    // Clean fast-forward without --force hits the keep-marker guard:
+    // work == head == second, target (first) lacks both files.
+    let (ok, msg) = oot(&["update", "--change", first_id], &proj);
     assert!(ok, "{msg}");
     assert!(
         proj.join("logs/.ootkeep").exists(),
-        ".ootkeep marker must survive across updates"
+        "exact .ootkeep must survive when target lacks it"
     );
     assert!(
         !proj.join("doc.ootkeep").exists(),
-        "regular file ending with .ootkeep must be deleted when not in target"
+        "suffix doc.ootkeep must be deleted when not in target"
+    );
+
+    // --force disables the guard: the preserved marker must now be deleted.
+    let (ok, msg) = oot(&["update", "--change", first_id, "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(
+        !proj.join("logs/.ootkeep").exists(),
+        "--force must delete the preserved marker"
+    );
+
+    // Second project: neither tree contains the marker. A fresh untracked
+    // marker must survive a non-force update while tracked content moves.
+    let proj2 = tmp.join("proj2");
+    std::fs::create_dir_all(&proj2).unwrap();
+    assert!(oot(&["init"], &proj2).0);
+    std::fs::write(proj2.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj2);
+    assert!(ok, "{msg}");
+    std::fs::write(proj2.join("a.txt"), "v2\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "second"], &proj2);
+    assert!(ok, "{msg}");
+    std::fs::create_dir_all(proj2.join("logs")).unwrap();
+    std::fs::write(proj2.join("logs/.ootkeep"), "").unwrap();
+    let (ok, log2) = oot(&["log"], &proj2);
+    assert!(ok, "{log2}");
+    let first2_id = log2
+        .lines()
+        .last()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    let (ok, msg) = oot(&["update", "--change", first2_id], &proj2);
+    assert!(ok, "untracked marker update should merge: {msg}");
+    assert!(
+        proj2.join("logs/.ootkeep").exists(),
+        "untracked .ootkeep must survive a non-force update"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj2.join("a.txt")).unwrap(),
+        "v1\n"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);
