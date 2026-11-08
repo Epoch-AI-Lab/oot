@@ -90,6 +90,16 @@ fn oot_with_env(args: &[&str], cwd: &Path, extra_env: &[(&str, &str)]) -> (bool,
     )
 }
 
+/// Removes the dir on drop so tests clean up their temp dirs and GPG
+/// homes on success and leave no `/tmp` litter behind.
+struct TempGuard(PathBuf);
+
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Make a throwaway GPG home with one signing key. Fast (about 0.1s),
 /// no passphrase. Unique per call: tests run concurrently in one process.
 fn make_test_key() -> (std::path::PathBuf, String) {
@@ -163,6 +173,7 @@ fn build_tagged_source(path: &PathBuf) {
 fn test_tags_roundtrip_byte_identical() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-rt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -196,6 +207,14 @@ fn test_tags_roundtrip_byte_identical() {
         let got = git(&out, &["rev-parse", &format!("refs/tags/{tag}^{{commit}}")]);
         assert_eq!(got, want, "tag {tag} moved");
     }
+    // Unpeeled ref: the annotated tag must reuse the source tag object,
+    // not merely peel to the same commit (a recreated object with the
+    // same message and target would still pass the checks above).
+    for tag in ["v0.1", "v0.2", "release/rc1"] {
+        let want = git(&src, &["rev-parse", &format!("refs/tags/{tag}")]);
+        let got = git(&out, &["rev-parse", &format!("refs/tags/{tag}")]);
+        assert_eq!(got, want, "tag {tag} object must be reused");
+    }
 }
 
 /// Base commit, secret commit, clean follow-up. A tag on the withheld
@@ -204,6 +223,7 @@ fn test_tags_roundtrip_byte_identical() {
 fn test_tags_follow_withheld_history_to_kept_ancestor() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-fb-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -244,6 +264,7 @@ fn test_tags_follow_withheld_history_to_kept_ancestor() {
 fn test_tags_omitted_when_all_history_withheld() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-om-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -295,6 +316,7 @@ fn test_tags_omitted_when_all_history_withheld() {
 fn test_tags_skip_non_commit_targets_and_reimport() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-sk-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -340,6 +362,7 @@ fn test_tags_skip_non_commit_targets_and_reimport() {
 fn test_signed_annotated_tag_survives_clean_export() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-signed-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -347,6 +370,7 @@ fn test_signed_annotated_tag_survives_clean_export() {
     std::fs::create_dir_all(&proj).unwrap();
 
     let (gpg_home, key_id) = make_test_key();
+    let _gpg_cleanup = TempGuard(gpg_home.clone());
 
     git(&src, &["init", "--quiet", "-b", "main"]);
     std::fs::write(src.join("README.md"), "v1\n").unwrap();
@@ -402,6 +426,7 @@ fn test_signed_annotated_tag_survives_clean_export() {
 fn test_signed_tag_demotes_with_audit_when_target_rebuilt() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-sigdrop-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -409,6 +434,7 @@ fn test_signed_tag_demotes_with_audit_when_target_rebuilt() {
     std::fs::create_dir_all(&proj).unwrap();
 
     let (gpg_home, key_id) = make_test_key();
+    let _gpg_cleanup = TempGuard(gpg_home.clone());
 
     git(&src, &["init", "--quiet", "-b", "main"]);
     std::fs::write(src.join("README.md"), "base\n").unwrap();
@@ -477,6 +503,7 @@ fn test_signed_tag_demotes_with_audit_when_target_rebuilt() {
 fn test_signed_tag_resigned_on_rebuilt_target_with_key() {
     let tmp = std::env::temp_dir().join(format!("oot-tags-rezi-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
+    let _cleanup = TempGuard(tmp.clone());
     let src = tmp.join("src");
     let proj = tmp.join("proj");
     let out = tmp.join("out");
@@ -484,6 +511,7 @@ fn test_signed_tag_resigned_on_rebuilt_target_with_key() {
     std::fs::create_dir_all(&proj).unwrap();
 
     let (gpg_home, key_id) = make_test_key();
+    let _gpg_cleanup = TempGuard(gpg_home.clone());
 
     git(&src, &["init", "--quiet", "-b", "main"]);
     std::fs::write(src.join("README.md"), "base\n").unwrap();
