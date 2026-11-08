@@ -301,6 +301,9 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             };
             if let Some(store) = store {
                 let change_flag = change.as_deref().expect("checked above");
+                // Saving a docket mutates the store: hold the lock across
+                // the whole read-modify-write, like every other writer.
+                let _lock = if no_save { None } else { Some(store.lock()?) };
                 let id = store.resolve_change(change_flag)?;
                 let authors_list = authors.as_ref().map(|a| {
                     a.split(',')
@@ -478,6 +481,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 None => GitAdapter::discover()?,
             };
             let store = Store::open(".")?;
+            let _lock = store.lock()?;
             let branches = store.fetch_branches(source.repo_root())?;
             if branches.is_empty() {
                 anyhow::bail!("source repository has no branches");
@@ -728,6 +732,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             run_git(&["init", "--quiet"], &out_path)?;
 
             let store = Store::open(".")?;
+            let _lock = store.lock()?;
             let refs = store.refs()?;
             if refs.is_empty() {
                 anyhow::bail!("store has no imported history (run `oot import` first)");
@@ -815,6 +820,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             let policy = load_policy_arg(visibility)?
                 .ok_or_else(|| anyhow::anyhow!("embargo bundle needs ./visibility.toml"))?;
             let store = Store::open(".")?;
+            let _lock = store.lock()?;
             if store.refs()?.is_empty() {
                 anyhow::bail!("store has no imported history (run `oot import` first)");
             }
@@ -895,6 +901,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
         } => {
             let root = std::env::current_dir()?;
             let store = Store::open(&root)?;
+            let _lock = store.lock()?;
 
             let inferred_branch = resolve_branch(&store, None).ok();
             let mut extra_roots = Vec::new();
