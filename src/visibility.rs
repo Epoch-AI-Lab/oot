@@ -101,11 +101,39 @@ fn matches_pattern(candidate: &str, pattern: &str) -> bool {
     if pattern == "*" {
         return true;
     }
-    if let Some((prefix, suffix)) = pattern.split_once('*') {
-        candidate.starts_with(prefix) && candidate[prefix.len()..].ends_with(suffix)
-    } else {
-        candidate == pattern
+    if !pattern.contains('*') {
+        return candidate == pattern;
     }
+
+    let parts: Vec<&str> = pattern.split('*').collect();
+    let first = parts[0];
+    let last = parts[parts.len() - 1];
+
+    if !candidate.starts_with(first) || !candidate.ends_with(last) {
+        return false;
+    }
+
+    let mut rest = &candidate[first.len()..];
+    let Some(tail_start) = rest.len().checked_sub(last.len()) else {
+        return false;
+    };
+    if tail_start == 0 && parts.len() == 2 {
+        return true;
+    }
+    // Consume the fixed tail so middle segments cannot overlap it.
+    rest = &rest[..tail_start];
+
+    for segment in &parts[1..parts.len() - 1] {
+        if segment.is_empty() {
+            continue;
+        }
+        let Some(pos) = rest.find(segment) else {
+            return false;
+        };
+        rest = &rest[pos + segment.len()..];
+    }
+
+    true
 }
 
 /// Whether `candidate` matches one declared private-branch `pattern`.
@@ -517,5 +545,52 @@ mod tests {
         };
         assert_eq!(a.canonical_fields(), b.canonical_fields());
         assert_eq!(a.audit_key(), b.audit_key());
+    }
+
+    #[test]
+    fn test_path_globs_support_multiple_wildcards_and_pem_suffix() {
+        // SEC-02: multi-* globs like *key* must match real paths/branches.
+        // SEC-01 (documented intent): *.pem is the suffix form for key files.
+        let policy = VisibilityPolicy {
+            private_paths: vec!["*.pem".into(), "*key*".into(), "a*b*c".into()],
+            embargo_until: None,
+            private_branches: vec!["*audit*".into(), "wip/*/secret".into()],
+            resign_key_id: None,
+            embargo_recipients: vec![],
+        };
+
+        for path in [
+            "key.pem",
+            "deploy/id.pem",
+            "certs/server.pem",
+            "src/secret-key",
+            "keyring/data.txt",
+            "aXbYc",
+        ] {
+            assert!(
+                policy.path_is_private(path),
+                "path {path} must match a private glob"
+            );
+        }
+        assert!(
+            !policy.path_is_private("src/main.rs"),
+            "unrelated path must not match"
+        );
+        // Single-* glob still works.
+        let single = VisibilityPolicy {
+            private_paths: vec!["logs/*.log".into()],
+            embargo_until: None,
+            private_branches: vec!["private/*".into()],
+            resign_key_id: None,
+            embargo_recipients: vec![],
+        };
+        assert!(single.path_is_private("logs/app.log"));
+        assert!(single.branch_is_private("private/feature"));
+        assert!(!single.branch_is_private("public/feature"));
+
+        assert!(policy.branch_is_private("feature-audit"));
+        assert!(policy.branch_is_private("my-audit-branch"));
+        assert!(policy.branch_is_private("wip/team/secret"));
+        assert!(!policy.branch_is_private("feature/public"));
     }
 }
