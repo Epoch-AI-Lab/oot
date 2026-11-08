@@ -685,15 +685,18 @@ fn rename_score(candidate: &str, original: &str) -> u8 {
 /// Same text with param names erased, plus whether any names existed.
 /// A typed piece (`name: Type`, `name = 1`) keeps its type part, a bare
 /// name (`a`) goes away fully. Empty stays empty.
+///
+/// Parses params from the original signature (not whitespace-squashed) so
+/// token boundaries like the space between a lifetime (`'a`) and its type
+/// (`str`) are preserved; the result is squashed for stable comparison.
 fn strip_param_names(sig: &str) -> (String, bool) {
-    let squashed = squash_ws(sig);
-    let Some(open) = squashed.find('(') else {
-        return (squashed, false);
+    let Some(open) = sig.find('(') else {
+        return (squash_ws(sig), false);
     };
     // Find the `)` that closes the first `(`.
     let mut depth = 0;
     let mut close = None;
-    for (i, c) in squashed[open..].char_indices() {
+    for (i, c) in sig[open..].char_indices() {
         if c == '(' {
             depth += 1;
         } else if c == ')' {
@@ -705,11 +708,11 @@ fn strip_param_names(sig: &str) -> (String, bool) {
         }
     }
     let Some(close) = close else {
-        return (squashed, false);
+        return (squash_ws(sig), false);
     };
-    let params = &squashed[open + 1..close];
-    let mut out = String::with_capacity(squashed.len());
-    out.push_str(&squashed[..=open]);
+    let params = &sig[open + 1..close];
+    let mut out = String::with_capacity(sig.len());
+    out.push_str(&sig[..=open]);
     let mut had_names = false;
     let mut segment = String::new();
     let mut seg_depth = 0;
@@ -736,8 +739,8 @@ fn strip_param_names(sig: &str) -> (String, bool) {
     let (s, h) = strip_segment(&segment);
     out.push_str(&s);
     had_names |= h;
-    out.push_str(&squashed[close..]);
-    (out, had_names)
+    out.push_str(&sig[close..]);
+    (squash_ws(&out), had_names)
 }
 
 /// One param with its name erased. A name at the end counts as
@@ -1653,6 +1656,11 @@ mod tests {
         assert_eq!(
             rename_score("fn \0(x: &'a str) { y }", "fn \0(x: &'b str) { y }"),
             80
+        );
+        // ENGINE-07: lifetime must not swallow the following type.
+        assert_eq!(
+            rename_score("fn \0(x: &'a i32) { y }", "fn \0(x: &'a u32) { y }"),
+            0
         );
     }
 
