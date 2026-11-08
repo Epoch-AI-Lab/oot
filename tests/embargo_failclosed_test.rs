@@ -709,3 +709,56 @@ fn test_verify_records_opens_and_refusals() {
     drop_key(&gpg_home);
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+/// A bundle that verifies but cannot be recorded must not look like a
+/// successful audited verify: the command fails and must not claim the open
+/// was recorded. (X-07)
+#[test]
+fn test_verify_fails_closed_when_audit_log_unwritable() {
+    let tmp = scratch("verify-audit-unwritable");
+    let (gpg_home, key_id) = make_test_key();
+    let (_src, proj) = project(&tmp, &key_id);
+    let gpg_home_str = gpg_home.to_str().unwrap().to_string();
+
+    let artifact = tmp.join("bundle.tar.gpg");
+    let (ok, msg) = oot_with_env(
+        &["embargo-bundle", "--out", artifact.to_str().unwrap()],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(ok, "seal failed: {msg}");
+
+    // /dev/null is a file, so /dev/null/<name> is unwritable for any user.
+    let audit_log = std::path::PathBuf::from("/dev/null/oot-verify-log.jsonl");
+    let received = tmp.join("received");
+    let (ok, msg) = oot_with_env(
+        &[
+            "embargo-verify",
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            received.to_str().unwrap(),
+            "--expect-signer",
+            &key_id,
+            "--audit-log",
+            audit_log.to_str().unwrap(),
+        ],
+        &proj,
+        &[("GNUPGHOME", &gpg_home_str)],
+    );
+    assert!(
+        !ok,
+        "an audited verify that cannot record the open must not succeed: {msg}"
+    );
+    assert!(
+        !msg.contains("recorded this open"),
+        "must not claim the open was recorded: {msg}"
+    );
+    assert!(
+        msg.contains("record") || msg.contains("audit"),
+        "must report the audit failure honestly: {msg}"
+    );
+
+    drop_key(&gpg_home);
+    let _ = std::fs::remove_dir_all(&tmp);
+}
