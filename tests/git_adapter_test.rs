@@ -1,7 +1,7 @@
 //! Integration tests for the Git 3-Way Snapshot Ingestion Adapter.
 
 use oot::adapter::{GitAdapter, GitAdjudicateOptions};
-use oot::dispute::{Kind, Severity, Verdict};
+use oot::dispute::{Kind, Severity, Verdict, EMPTY_CHANGE_ID};
 use oot::engine::Engine;
 use oot::policy::MeaningPolicy;
 use oot::visibility::VisibilityPolicy;
@@ -335,6 +335,55 @@ fn test_git_adapter_3way_reports_real_commit_authors() {
         vec!["Dana Feature".to_string()],
         "docket must name the commits' real author, not the @git-author fallback"
     );
+}
+
+/// Regression test (X-09): the docket intent/empty notice must be diffed
+/// against the merge-base (same as visibility and 3-way analysis), not the
+/// base-branch tip. When base tip and head converge to identical trees,
+/// diffing the tip against head reports "no file differences" even though
+/// merge-base..head clearly changed a file.
+#[test]
+fn test_git_adapter_docket_diff_uses_merge_base() {
+    let repo = TempGitRepo::new("docket_diff_base");
+
+    // Base commit on main
+    repo.write_file("src/lib.rs", "pub fn target() -> i32 { 0 }\n");
+    repo.commit("base version");
+
+    // Feature branch changes target to 1.
+    repo.create_and_checkout_branch("feature/converged");
+    repo.write_file("src/lib.rs", "pub fn target() -> i32 { 1 }\n");
+    repo.commit("feature change");
+
+    // Main converges on the exact same tree as the feature branch.
+    repo.checkout("main");
+    repo.write_file("src/lib.rs", "pub fn target() -> i32 { 1 }\n");
+    repo.commit("main converged change");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let engine = Engine::new().expect("valid engine");
+
+    let docket = adapter
+        .adjudicate_3way(
+            "main",
+            "feature/converged",
+            &engine,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &GitAdjudicateOptions::default(),
+        )
+        .expect("adjudicate 3way");
+
+    // Merge-base..head touches src/lib.rs, so the docket must list it as
+    // intent and must not claim there are no file differences. Diffing the
+    // base-branch tip against head would (wrongly) produce "no files
+    // changed" plus an EMPTY_CHANGE notice for this identical-tree pair.
+    assert!(
+        !docket.disputes.iter().any(|d| d.id == EMPTY_CHANGE_ID),
+        "no EMPTY_CHANGE notice expected: merge-base..head changed files, got disputes: {:?}",
+        docket.disputes
+    );
+    assert_eq!(docket.intent, "src/lib.rs");
 }
 
 #[test]

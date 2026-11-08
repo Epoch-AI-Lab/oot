@@ -241,7 +241,7 @@ impl GitAdapter {
         let is_embargoed = visibility_policy.is_under_embargo();
         let (disputes, intent, verdict) = finalize_adjudication(
             disputes,
-            &base_snapshot.files,
+            &mb_snapshot.files,
             &head_snapshot.files,
             options.intent.clone(),
             cloaked,
