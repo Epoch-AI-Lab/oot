@@ -322,6 +322,12 @@ fn test_filtered_export_skips_empty_rebuilt_commits() {
     std::fs::create_dir_all(&proj).unwrap();
 
     build_fixture(&src);
+    // Secret commit, then an empty commit on top of it. The empty commit
+    // is stripped down to the base tree, so it is empty over the exported
+    // ancestry only because stripping removed the secret under it.
+    std::fs::write(src.join(".env"), "API_KEY=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "-m", "add config"]);
     git(&src, &["commit", "--allow-empty", "-m", "empty churn"]);
     std::fs::write(
         proj.join("visibility.toml"),

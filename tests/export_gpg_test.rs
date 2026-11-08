@@ -259,6 +259,70 @@ fn test_filtered_export_preserves_gpg_signatures_on_clean_commits() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn test_filtered_export_preserves_signed_empty_commit() {
+    let tmp = std::env::temp_dir().join(format!("oot-gpg-empty-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    let src = tmp.join("src");
+    let proj = tmp.join("proj");
+    let out = tmp.join("out");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::create_dir_all(&proj).unwrap();
+
+    git(&src, &["init", "--quiet", "-b", "main"]);
+
+    std::fs::write(src.join("README.md"), "# Public Project\n").unwrap();
+    git(&src, &["add", "."]);
+    let root_tree = git(&src, &["write-tree"]);
+    let signed_root = forge_signed(&src, &root_tree, None, "iQDummyRoot", "signed root");
+    git(&src, &["update-ref", "refs/heads/main", &signed_root]);
+
+    // Empty signed commit: same tree as its parent and no private paths
+    // touched, so the identity fast path must keep it verbatim instead of
+    // withholding it as "empty after private-path stripping".
+    let signed_empty = forge_signed(
+        &src,
+        &root_tree,
+        Some(&signed_root),
+        "iQDummyEmpty",
+        "signed empty",
+    );
+    git(&src, &["update-ref", "refs/heads/main", &signed_empty]);
+
+    std::fs::write(
+        proj.join("visibility.toml"),
+        "private_paths = [\".env\"]\nprivate_branches = []\n",
+    )
+    .unwrap();
+
+    assert!(oot(&["init"], &proj).0);
+    let (ok, msg) = oot(&["import", "--repo", src.to_str().unwrap()], &proj);
+    assert!(ok, "import failed: {msg}");
+    let (ok, msg) = oot(&["export", "--out", out.to_str().unwrap()], &proj);
+    assert!(ok, "export failed: {msg}");
+
+    assert_eq!(git(&out, &["rev-parse", "main"]), signed_empty);
+    assert_eq!(git(&out, &["rev-list", "--count", "main"]), "2");
+
+    let empty_cat = git(&out, &["cat-file", "commit", &signed_empty]);
+    assert!(
+        empty_cat.contains("BEGIN PGP SIGNATURE"),
+        "signed empty commit lost its signature"
+    );
+    assert!(
+        empty_cat.contains("DummyEmpty"),
+        "signed empty payload altered"
+    );
+
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap_or_default();
+    assert!(
+        !log.contains("empty after private-path stripping"),
+        "clean signed empty must not be logged as stripped: {log}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
 fn forge_signed(
     repo: &Path,
     tree: &str,
