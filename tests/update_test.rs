@@ -762,3 +762,90 @@ fn test_update_3way_conflict_preserves_work() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_update_multi_branch_clean_ff_advances_head_update01_02() {
+    let tmp = unique_tmp("multi-ff-head");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "v1-main"], &proj);
+    assert!(ok, "{msg}");
+
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "v2-feat"], &proj);
+    assert!(ok, "{msg}");
+
+    // Clean checkout at main.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v1\n");
+    let head = std::fs::read_to_string(proj.join(".oot/HEAD")).unwrap();
+    assert!(
+        head.contains("refs/heads/main"),
+        "HEAD should point to main after force update: {head}"
+    );
+
+    // UPDATE-01: clean fast-forward to feat in a multi-branch store must take
+    // target content, not report a false conflict.
+    let (ok, out) = oot(&["update", "--branch", "feat"], &proj);
+    assert!(ok, "clean ff to feat should succeed: {out}");
+    assert!(
+        !out.contains("conflict"),
+        "UPDATE-01: clean fast-forward reported false conflict: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("a.txt")).unwrap(),
+        "v2\n",
+        "UPDATE-01: feat content not materialized"
+    );
+
+    // UPDATE-02: HEAD must advance on merge/materialized branch update paths.
+    let head = std::fs::read_to_string(proj.join(".oot/HEAD")).unwrap();
+    assert!(
+        head.contains("refs/heads/feat"),
+        "UPDATE-02: HEAD not advanced to feat: {head}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_already_up_to_date_advances_head_update02() {
+    let tmp = unique_tmp("uptodate-head");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "v1"], &proj);
+    assert!(ok, "{msg}");
+
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "v2"], &proj);
+    assert!(ok, "{msg}");
+
+    // HEAD is feat (record set it). Make work identical to main without moving HEAD.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    std::fs::write(proj.join(".oot/HEAD"), "ref: refs/heads/feat\n").unwrap();
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v1\n");
+
+    let (ok, out) = oot(&["update", "--branch", "main"], &proj);
+    assert!(ok, "{out}");
+    assert!(
+        out.contains("already up to date"),
+        "expected already up to date: {out}"
+    );
+    let head = std::fs::read_to_string(proj.join(".oot/HEAD")).unwrap();
+    assert!(
+        head.contains("refs/heads/main"),
+        "UPDATE-02: already-up-to-date did not advance HEAD: {head}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
