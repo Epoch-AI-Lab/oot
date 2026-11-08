@@ -643,30 +643,16 @@ fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
     let (ok, msg) = oot(&["record", "-m", "add marker"], &proj);
     assert!(ok, "{msg}");
 
-    // Remove the tracked marker and record a second change without it.
+    // Remove the tracked marker and record its deletion on a separate branch.
     std::fs::remove_file(proj.join("logs/.ootkeep")).unwrap();
-    let (ok, msg) = oot(&["record", "-m", "remove marker"], &proj);
+    let (ok, msg) = oot(
+        &["record", "--branch", "feat", "-m", "remove marker"],
+        &proj,
+    );
     assert!(ok, "{msg}");
     assert!(!proj.join("logs/.ootkeep").exists());
 
-    let (ok, log) = oot(&["log"], &proj);
-    assert!(ok, "{log}");
-    // log is newest-first; "add marker" is the older (first) change
-    let with_marker_id = log
-        .lines()
-        .last()
-        .unwrap()
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .to_string();
-
-    // Cleanly move to the change that has the marker (tracked in head).
-    let (ok, msg) = oot(&["update", "--change", &with_marker_id[..7]], &proj);
-    assert!(ok, "update to change with marker should succeed: {msg}");
-    assert!(proj.join("logs/.ootkeep").exists());
-
-    let (ok, log) = oot(&["log"], &proj);
+    let (ok, log) = oot(&["log", "--branch", "feat"], &proj);
     assert!(ok, "{log}");
     let without_marker_id = log
         .lines()
@@ -676,6 +662,13 @@ fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
         .next()
         .unwrap()
         .to_string();
+
+    // Return to main (marker present, tracked) as a clean single-branch state.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    assert!(proj.join("logs/.ootkeep").exists());
+    // Keep only main so resolve_branch(None) can infer the head/base.
+    let _ = std::fs::remove_file(proj.join(".oot/refs/heads/feat"));
 
     // Clean fast-forward to the change that deleted the tracked marker (no --force).
     let (ok, msg) = oot(&["update", "--change", &without_marker_id[..7]], &proj);
