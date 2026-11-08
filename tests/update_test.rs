@@ -181,10 +181,10 @@ fn test_update_already_up_to_date() {
 
     let (ok, out) = oot(&["update"], &proj);
     assert!(ok, "{out}");
-    // Already at head should succeed without rewriting; may say updated or already
+    // Already at head must take the fast path and not rewrite.
     assert!(
-        out.contains("updated") || out.contains("up to date"),
-        "{out}"
+        out.contains("already up to date"),
+        "clean update at head should be a no-op: {out}"
     );
 
     let (ok, out) = oot(&["update", "--dry-run"], &proj);
@@ -473,8 +473,16 @@ fn test_update_status_agrees_after_force() {
     assert!(ok, "{out}");
     let (ok, out) = oot(&["status"], &proj);
     assert!(ok, "{out}");
-    // After update to old change, status should report dirty vs current head (main is second)
-    // Force update to old change leaves working copy at first, so status vs head is dirty.
+    // After downgrading to the old change, the working copy differs from the
+    // branch head (second). Status must report the files as modified.
+    assert!(
+        out.contains("M a.txt"),
+        "status should report M a.txt: {out}"
+    );
+    assert!(
+        out.contains("M sub/b.txt"),
+        "status should report M sub/b.txt: {out}"
+    );
     // Now update back to head and status must be clean.
     let (ok, out) = oot(&["update", "--branch", "main", "--force"], &proj);
     assert!(ok, "{out}");
