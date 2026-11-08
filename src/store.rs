@@ -3829,6 +3829,33 @@ fn is_hex_keyid(s: &str) -> bool {
     s.len() >= 8 && s.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// True when a symlink target is absolute or resolves outside the
+/// extraction tree relative to the member's directory.
+fn symlink_target_escapes(member_name: &str, target: &str) -> bool {
+    if target.is_empty() || target.starts_with('/') {
+        return true;
+    }
+    let parent = match member_name.rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    };
+    let mut parts: Vec<&str> = Vec::new();
+    for seg in parent
+        .split('/')
+        .chain(target.split('/'))
+        .filter(|s| !s.is_empty() && *s != ".")
+    {
+        if seg == ".." {
+            if parts.pop().is_none() {
+                return true;
+            }
+        } else {
+            parts.push(seg);
+        }
+    }
+    false
+}
+
 /// Reject a bundle tar before extraction: unsafe member names (absolute or
 /// `..`), member counts or sizes past the caps, and member types an
 /// embargo bundle never contains. Oot-made bundles hold exactly one top
@@ -3881,10 +3908,11 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
         // the target and never the name, so a bundle with an ordinary
         // `-> ../shared` link is refused while a hostile name sails past.
         // Split the arrow off first, then read the fixed columns:
-        // owner, size, date, time, name.
-        let tail = match rest.split_once(" -> ") {
-            Some((head, _target)) => head,
-            None => rest,
+        // owner, size, date, time, name. For symlinks, keep the target so
+        // it can be validated too.
+        let (tail, symlink_target) = match rest.split_once(" -> ") {
+            Some((head, target)) => (head, Some(target)),
+            None => (rest, None),
         };
         // Skip exactly four columns (owner, size, date, time) and take the
         // REST, not the fifth token: a filename may contain spaces, and
@@ -3901,13 +3929,16 @@ fn check_tar_members(tar_path: &Path) -> Result<()> {
             bail!("bundle tar has unsafe member (refusing to open): {name}");
         }
         match meta.chars().next().unwrap_or('-') {
-            // Regular files and directories only. Symlinks are rejected:
-            // a hostile target can escape the extraction tree, and Oot
-            // never writes symlinks into an embargo bundle. FIFOs, block
-            // and character devices have no place in a code bundle.
+            // Regular files and directories are fine. FIFOs, block and
+            // character devices have no place in a code bundle.
             '-' | 'd' => {}
             'l' => {
-                bail!("bundle tar has symlink member (refusing to open): {name}")
+                let target = symlink_target.unwrap_or_default();
+                if symlink_target_escapes(name, target) {
+                    bail!(
+                        "bundle tar has symlink with unsafe target (refusing to open): {name} -> {target}"
+                    );
+                }
             }
             other => {
                 bail!("bundle tar has unsupported member type '{other}' (refusing to open): {name}")
@@ -4241,7 +4272,7 @@ mod tests {
         let err = check_tar_members(&tar_path).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("symlink member"),
+            msg.contains("unsafe target") || msg.contains("symlink"),
             "expected symlink refusal, got: {msg}"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4266,7 +4297,7 @@ mod tests {
 
         let err = check_tar_members(&tar_path).unwrap_err();
         assert!(
-            err.to_string().contains("symlink member"),
+            err.to_string().contains("unsafe target"),
             "expected symlink refusal, got: {err}"
         );
         let _ = std::fs::remove_dir_all(&dir);
