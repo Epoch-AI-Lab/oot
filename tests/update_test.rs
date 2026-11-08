@@ -1054,3 +1054,78 @@ fn test_update_already_up_to_date_advances_head_update02() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_update_fails_when_head_branch_cannot_be_written() {
+    let tmp = unique_tmp("head-write-fails");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    // Make the update actually materialize: dirty work that --force overwrites.
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+
+    // Replace .oot/HEAD with a directory so writing it fails even as root.
+    let head = proj.join(".oot").join("HEAD");
+    std::fs::remove_file(&head).unwrap();
+    std::fs::create_dir_all(&head).unwrap();
+
+    let (ok, out) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(
+        !ok,
+        "update must fail when HEAD cannot be written, not report success: {out}"
+    );
+    assert!(!out.contains("updated to"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_fails_when_current_head_change_is_corrupt() {
+    let tmp = unique_tmp("corrupt-head");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "second"], &proj);
+    assert!(ok, "{msg}");
+
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let first_line = log.lines().last().unwrap();
+    let first_id = first_line.split_whitespace().next().unwrap();
+    let prefix = &first_id[..4];
+
+    // Corrupt the current head (main) change record. The update target is the
+    // intact first change, so only the current-head load can fail.
+    let head_id = std::fs::read_to_string(proj.join(".oot").join("refs").join("main"))
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(
+        proj.join(".oot")
+            .join("changes")
+            .join(format!("{head_id}.json")),
+        "this is not json\n",
+    )
+    .unwrap();
+
+    let (ok, out) = oot(&["update", "--change", prefix, "--force"], &proj);
+    assert!(
+        !ok,
+        "update must fail on a corrupt current head, not merge against an empty base: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
