@@ -37,6 +37,19 @@ fn short(id: &str) -> &str {
     &id[..id.len().min(7)]
 }
 
+/// True if `line` is a merge-conflict marker line as materialized by jj (or git).
+///
+/// Each marker kind stands on its own: the opening, closing, and diff3 base
+/// markers are recognized by their leading `<<<<<<<` / `>>>>>>>` / `|||||||`
+/// (any label after them, e.g. `ConflictMarker`), and the separator is the
+/// bare `=======` line. No line needs to also contain another marker kind.
+fn is_conflict_marker_line(line: &str) -> bool {
+    line.starts_with("<<<<<<<")
+        || line.starts_with(">>>>>>>")
+        || line.starts_with("|||||||")
+        || line.trim() == "======="
+}
+
 impl JjAdapter {
     /// Create a new `JjAdapter` rooted at the Jujutsu workspace containing `repo_path`.
     pub fn new(repo_path: impl AsRef<Path>) -> Result<Self> {
@@ -214,10 +227,7 @@ impl JjAdapter {
             crate::store::validate_tree_path(path)?;
             let content = self.run_bytes(&["file", "show", "-r", rev, "--", path])?;
             let text = String::from_utf8_lossy(&content);
-            if text.lines().any(|l| {
-                l.starts_with("<<<<<<<")
-                    && (l.contains("conflict") || l.contains("===") || l.ends_with(">>>>>>>"))
-            }) {
+            if text.lines().any(is_conflict_marker_line) {
                 conflicted.push(path.to_string());
             } else {
                 files.insert(path.to_string(), content);
@@ -347,5 +357,27 @@ mod tests {
         assert_eq!(short("0123456789abcdef"), "0123456");
         assert_eq!(short("abc"), "abc");
         assert_eq!(short(""), "");
+    }
+
+    #[test]
+    fn test_conflict_marker_line_canonical_forms() {
+        // jj's materialized conflict block, each marker line on its own.
+        assert!(is_conflict_marker_line("<<<<<<< ConflictMarker"));
+        assert!(is_conflict_marker_line("||||||| ConflictMarker"));
+        assert!(is_conflict_marker_line("======="));
+        assert!(is_conflict_marker_line(">>>>>>> ConflictMarker"));
+        // Other common label spellings and the bare forms.
+        assert!(is_conflict_marker_line("<<<<<<< HEAD"));
+        assert!(is_conflict_marker_line("<<<<<<<"));
+        assert!(is_conflict_marker_line(">>>>>>>"));
+        assert!(is_conflict_marker_line("  =======  "));
+    }
+
+    #[test]
+    fn test_conflict_marker_line_rejects_clean_lines() {
+        assert!(!is_conflict_marker_line("pub fn hello() {}"));
+        assert!(!is_conflict_marker_line("========="));
+        assert!(!is_conflict_marker_line("let marker = \"<<<<<<<\";"));
+        assert!(!is_conflict_marker_line(""));
     }
 }
