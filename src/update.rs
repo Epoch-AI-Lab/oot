@@ -49,13 +49,10 @@ pub fn run(
             .flatten()
             .or_else(|| crate::resolve_branch(&store, None).ok());
         let inferred_tree = match &inferred_branch {
-            Some(b) => store
-                .head_id(b)
-                .ok()
-                .flatten()
-                .and_then(|h| store.get_change(&h).ok())
-                .map(|r| r.tree)
-                .unwrap_or_default(),
+            Some(b) => match store.head_id(b)? {
+                Some(h) => store.get_change(&h)?.tree,
+                None => String::new(),
+            },
             None => String::new(),
         };
         (inferred_branch, inferred_tree)
@@ -284,9 +281,8 @@ pub fn run(
     }
 
     if !is_change_target {
-        if let Ok(b) = crate::resolve_branch(&store, branch) {
-            let _ = store.set_head_branch(&b);
-        }
+        let b = crate::resolve_branch(&store, branch)?;
+        store.set_head_branch(&b)?;
     }
 
     println!("updated to {target_desc}");

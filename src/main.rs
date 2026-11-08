@@ -273,7 +273,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             if let Some(path) = docket {
                 let d = docket::load(std::path::Path::new(&path))?;
                 print!("{}", d.render(&meaning_policy));
-                return Ok(std::process::ExitCode::SUCCESS);
+                return Ok(exit_code_for(d.verdict));
             }
             let visibility_policy = match visibility {
                 Some(v) => VisibilityPolicy::load(std::path::Path::new(&v))?,
