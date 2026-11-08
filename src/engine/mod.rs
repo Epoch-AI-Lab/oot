@@ -1050,11 +1050,6 @@ fn insert(
     if key.is_empty() {
         return false;
     }
-    let Ok(src) = body.utf8_text(source.as_bytes()) else {
-        return false;
-    };
-    let src = src.to_string();
-    let row = body.start_position().row + 1;
     // Blanking span: climb through single-statement wrappers so an added
     // `const f = ...;` leaves no `const ;` crumbs that fake a top-level
     // dispute. Multi-declarator parents (`const a=.., b=..`) stay put so a
@@ -1087,19 +1082,29 @@ fn insert(
     }
     let start_byte = span_node.start_byte();
     let end_byte = span_node.end_byte();
-    // Signature: the body with its own name blanked wherever it
-    // appears, so two functions that differ only by what they are
-    // called compare equal and pair as a rename. Blanking only the
-    // definition would leave recursive self-calls holding the old
-    // name, and a rename that updates them would never match.
+    // Source comes from the full span, not the inner body, so an
+    // `export_statement` wrapper (e.g. `export const f = ...`) is part of
+    // what is compared. Taking the inner text alone made adding or
+    // removing `export` invisible to both function alignment and the
+    // blanked top-level residue.
+    let Ok(src) = span_node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let src = src.to_string();
+    let row = body.start_position().row + 1;
+    // Signature: the span with its own name blanked wherever it appears,
+    // so two functions that differ only by what they are called compare
+    // equal and pair as a rename. Blanking only the definition would leave
+    // recursive self-calls holding the old name, and a rename that updates
+    // them would never match.
     let signature = match name_node {
         Some(n)
-            if n.start_byte() >= body.start_byte()
-                && n.end_byte() <= body.end_byte()
+            if n.start_byte() >= span_node.start_byte()
+                && n.end_byte() <= span_node.end_byte()
                 && n.start_byte() <= n.end_byte() =>
         {
-            let rel_start = n.start_byte() - body.start_byte();
-            let rel_end = n.end_byte() - body.start_byte();
+            let rel_start = n.start_byte() - span_node.start_byte();
+            let rel_end = n.end_byte() - span_node.start_byte();
             if rel_end <= src.len()
                 && src.is_char_boundary(rel_start)
                 && src.is_char_boundary(rel_end)
@@ -1414,6 +1419,77 @@ mod tests {
         assert!(
             !disputes.iter().any(|d| d.detail.contains("`handle`")),
             "member-expression assignment should not be treated as a named function"
+        );
+    }
+
+    #[test]
+    fn test_engine_js_export_visibility_change_is_reported() {
+        // ENGINE-08: adding `export` changes the public API surface and
+        // must be reported as a change to the exported function.
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("index.js".into(), "const f = () => 1;\n".into());
+
+        let mut head = Snapshot::default();
+        head.files
+            .insert("index.js".into(), "export const f = () => 1;\n".into());
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert!(
+            disputes.iter().any(|d| d.detail.contains("`f`")),
+            "export addition must be reported, got {:?}",
+            disputes
+        );
+
+        let mut base2 = Snapshot::default();
+        base2
+            .files
+            .insert("index.js".into(), "function f() {}\n".into());
+
+        let mut head2 = Snapshot::default();
+        head2
+            .files
+            .insert("index.js".into(), "export function f() {}\n".into());
+
+        let disputes2 = eng.diff_snapshots(&base2, &head2).unwrap();
+        assert!(
+            disputes2.iter().any(|d| d.detail.contains("`f`")),
+            "export addition must be reported, got {:?}",
+            disputes2
+        );
+    }
+
+    #[test]
+    fn test_engine_js_call_with_callback_is_not_a_function() {
+        // ENGINE-09: `const sorted = items.sort(...)` holds a call
+        // result, not a function. A comparator edit must surface as a
+        // top-level change, not a phantom named function `sorted`.
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "const sorted = items.sort((a, b) => a - b);\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "const sorted = items.sort((a, b) => a + b);\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert!(
+            !disputes.iter().any(|d| d.detail.contains("`sorted`")),
+            "call result must not be tracked as function `sorted`, got {:?}",
+            disputes
+        );
+        assert!(
+            disputes.iter().any(|d| d.detail.contains("top-level")),
+            "comparator edit should surface as a top-level change, got {:?}",
+            disputes
         );
     }
 

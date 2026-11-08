@@ -122,25 +122,7 @@ pub fn unwrap_callable<'a>(mut node: Node<'a>) -> Node<'a> {
         || node.kind() == "type_assertion"
         || node.kind() == "parenthesized_expression"
         || node.kind() == "non_null_expression"
-        || node.kind() == "call_expression"
     {
-        if node.kind() == "call_expression" {
-            if let Some(args) = node.child_by_field_name("arguments") {
-                let mut found = None;
-                let mut cursor = args.walk();
-                for child in args.children(&mut cursor) {
-                    if child.kind() == "arrow_function" || child.kind() == "function_expression" {
-                        found = Some(child);
-                        break;
-                    }
-                }
-                if let Some(c) = found {
-                    node = c;
-                    continue;
-                }
-            }
-            break;
-        }
         if let Some(child) = node.child_by_field_name("expression") {
             node = child;
         } else if let Some(child) = node.child_by_field_name("value") {
