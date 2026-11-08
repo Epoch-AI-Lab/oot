@@ -1235,11 +1235,37 @@ fn rule_matches(rel: &str, base: &str, rule: &str) -> bool {
 
 /// Glob matching with `*` only (no `?`, no character classes).
 fn wildcard_match(pattern: &str, text: &str) -> bool {
-    match pattern.split_once('*') {
-        None => pattern == text,
-        Some((head, tail)) => text
-            .strip_prefix(head)
-            .is_some_and(|rest| rest.len() >= tail.len() && rest.ends_with(tail)),
+    if pattern.is_empty() {
+        return text.is_empty();
+    }
+    if !pattern.starts_with('*') {
+        let Some(pc) = pattern.chars().next() else {
+            return text.is_empty();
+        };
+        let Some(tc) = text.chars().next() else {
+            return false;
+        };
+        if pc != tc {
+            return false;
+        }
+        return wildcard_match(&pattern[pc.len_utf8()..], &text[tc.len_utf8()..]);
+    }
+    let mut rest_pattern = &pattern['*'.len_utf8()..];
+    while rest_pattern.starts_with('*') {
+        rest_pattern = &rest_pattern['*'.len_utf8()..];
+    }
+    if rest_pattern.is_empty() {
+        return true;
+    }
+    let mut rest_text = text;
+    loop {
+        if wildcard_match(rest_pattern, rest_text) {
+            return true;
+        }
+        let Some(tc) = rest_text.chars().next() else {
+            return false;
+        };
+        rest_text = &rest_text[tc.len_utf8()..];
     }
 }
 
@@ -1374,6 +1400,19 @@ mod tests {
     }
 
     #[test]
+    fn test_simple_ignored_multi_star_patterns() {
+        let rules: Vec<String> = ["*test*", "build-*-v*"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(simple_ignored("mytestfile", &rules));
+        assert!(simple_ignored("deep/nested/mytestfile", &rules));
+        assert!(simple_ignored("build-foo-v1", &rules));
+        assert!(!simple_ignored("src/main.rs", &rules));
+        assert!(!simple_ignored("build-foo-x1", &rules));
+    }
+
+    #[test]
     fn test_wildcard_match() {
         assert!(wildcard_match("*.log", "a.log"));
         assert!(wildcard_match("*", "anything"));
@@ -1381,5 +1420,15 @@ mod tests {
         assert!(wildcard_match("*bar", "foobar"));
         assert!(!wildcard_match("*.log", "a.txt"));
         assert!(!wildcard_match("foo*", "barfoo"));
+        // Multiple * segments.
+        assert!(wildcard_match("*test*", "mytestfile"));
+        assert!(wildcard_match("*test*", "test"));
+        assert!(wildcard_match("*test*", "testing"));
+        assert!(!wildcard_match("*test*", "tset"));
+        assert!(wildcard_match("build-*-v*", "build-foo-v1"));
+        assert!(!wildcard_match("build-*-v*", "build-foo-x1"));
+        assert!(wildcard_match("*a*b*", "zzzaXXXbYYY"));
+        assert!(wildcard_match("*a*b*", "ab"));
+        assert!(!wildcard_match("*a*b*", "ba"));
     }
 }
