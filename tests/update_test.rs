@@ -668,25 +668,15 @@ fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
     assert!(ok, "{msg}");
     assert!(proj.join("logs/.ootkeep").exists());
     // Keep only main so resolve_branch(None) can infer the head/base.
-    let _ = std::fs::remove_file(proj.join(".oot/refs/heads/feat"));
-
-    let (st_ok, st_msg) = oot(&["status"], &proj);
-    let refs_dir = proj.join(".oot/refs/heads");
-    let refs: Vec<String> = std::fs::read_dir(&refs_dir)
-        .map(|rd| {
-            rd.filter_map(|e| e.ok())
-                .map(|e| e.file_name().to_string_lossy().to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    // oot stores branch refs as flat files in .oot/refs/ (not refs/heads/).
+    let _ = std::fs::remove_file(proj.join(".oot/refs/feat"));
 
     // Clean fast-forward to the change that deleted the tracked marker (no --force).
     let (ok, msg) = oot(&["update", "--change", &without_marker_id[..7]], &proj);
     assert!(ok, "update should succeed: {msg}");
     assert!(
         !msg.contains("merged"),
-        "expected clean fast-forward path, got: {msg}; status_ok={st_ok} status={st_msg}; refs={refs:?}; refs_dir={}",
-        refs_dir.display()
+        "expected clean fast-forward path, got: {msg}"
     );
     assert!(
         !proj.join("logs/.ootkeep").exists(),
