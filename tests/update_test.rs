@@ -422,7 +422,9 @@ fn test_update_rejects_path_traversal() {
     assert!(validate_tree_path(".git/config").is_err());
 
     let store = oot::store::Store::open(&proj).expect("store should open");
-    let valid = store.get_change(id).expect("valid change should load");
+    let valid = store
+        .get_change(&store.resolve_change(id).expect("resolve valid prefix"))
+        .expect("valid change should load");
     let blob_sha = {
         use std::io::Write;
         let mut child = Command::new("git")
