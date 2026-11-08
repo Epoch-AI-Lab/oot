@@ -530,24 +530,28 @@ impl Engine {
                     }
                 }
                 // File deleted in target, modified in incoming
-                (Some(_), None, Some(_)) => {
-                    disputes.push(meaning(
-                        &mut n,
-                        path,
-                        0,
-                        "3-way conflict: file deleted in target branch but modified in incoming branch".to_string(),
-                        Severity::High,
-                    ));
+                (Some(b), None, Some(t)) => {
+                    if t != b {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            "3-way conflict: file deleted in target branch but modified in incoming branch".to_string(),
+                            Severity::High,
+                        ));
+                    }
                 }
                 // File modified in target, deleted in incoming
-                (Some(_), Some(_), None) => {
-                    disputes.push(meaning(
-                        &mut n,
-                        path,
-                        0,
-                        "3-way conflict: file modified in target branch but deleted in incoming branch".to_string(),
-                        Severity::High,
-                    ));
+                (Some(b), Some(o), None) => {
+                    if o != b {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            "3-way conflict: file modified in target branch but deleted in incoming branch".to_string(),
+                            Severity::High,
+                        ));
+                    }
                 }
                 // File added only in incoming
                 (None, None, Some(t)) => {
@@ -568,6 +572,21 @@ impl Engine {
                 (Some(_), None, None) => {
                     // Both deleted it, clean
                 }
+                // File added in both branches
+                (None, Some(o), Some(t)) => {
+                    if o != t {
+                        disputes.push(meaning(
+                            &mut n,
+                            path,
+                            0,
+                            "3-way conflict: file added in both branches with different content"
+                                .to_string(),
+                            Severity::High,
+                        ));
+                    }
+                }
+                // File added only in target (ours trusted)
+                (None, Some(_), None) => {}
                 _ => {}
             }
         }
@@ -1744,6 +1763,104 @@ mod tests {
                 theirs_new_name: "k".into(),
                 theirs_row: 7,
             }]
+        );
+    }
+
+    #[test]
+    fn test_engine_3way_delete_vs_untouched_is_clean() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("src/lib.rs".into(), "fn a() { 1 }\n".into());
+        let ours = Snapshot::default();
+        let mut theirs = Snapshot::default();
+        theirs
+            .files
+            .insert("src/lib.rs".into(), "fn a() { 1 }\n".into());
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert!(
+            disputes.is_empty(),
+            "clean delete must not conflict, got {:?}",
+            disputes
+        );
+    }
+
+    #[test]
+    fn test_engine_3way_untouched_vs_delete_is_clean() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("src/lib.rs".into(), "fn a() { 1 }\n".into());
+        let mut ours = Snapshot::default();
+        ours.files
+            .insert("src/lib.rs".into(), "fn a() { 1 }\n".into());
+        let theirs = Snapshot::default();
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert!(
+            disputes.is_empty(),
+            "clean delete must not conflict, got {:?}",
+            disputes
+        );
+    }
+
+    #[test]
+    fn test_engine_3way_delete_vs_modified_still_conflicts() {
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("src/lib.rs".into(), "fn a() { 1 }\n".into());
+        let ours = Snapshot::default();
+        let mut theirs = Snapshot::default();
+        theirs
+            .files
+            .insert("src/lib.rs".into(), "fn a() { 2 }\n".into());
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert_eq!(disputes.len(), 1);
+        assert_eq!(disputes[0].severity, Severity::High);
+        assert!(disputes[0].detail.contains("deleted in target"));
+    }
+
+    #[test]
+    fn test_engine_3way_add_add_divergent_file_conflicts() {
+        let eng = Engine::new().unwrap();
+
+        let base = Snapshot::default();
+        let mut ours = Snapshot::default();
+        ours.files.insert("new.rs".into(), "fn f() { 1 }\n".into());
+        let mut theirs = Snapshot::default();
+        theirs
+            .files
+            .insert("new.rs".into(), "fn f() { 2 }\n".into());
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert_eq!(disputes.len(), 1, "got {:?}", disputes);
+        assert_eq!(disputes[0].severity, Severity::High);
+        assert!(disputes[0].detail.contains("added in both branches"));
+    }
+
+    #[test]
+    fn test_engine_3way_add_add_identical_file_is_clean() {
+        let eng = Engine::new().unwrap();
+
+        let base = Snapshot::default();
+        let mut ours = Snapshot::default();
+        ours.files.insert("new.rs".into(), "fn f() { 1 }\n".into());
+        let mut theirs = Snapshot::default();
+        theirs
+            .files
+            .insert("new.rs".into(), "fn f() { 1 }\n".into());
+
+        let disputes = eng.diff_3way(&base, &ours, &theirs).unwrap();
+        assert!(
+            disputes.is_empty(),
+            "convergent add/add must be clean, got {:?}",
+            disputes
         );
     }
 }
