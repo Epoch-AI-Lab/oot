@@ -49,6 +49,7 @@ fn test_cli_adjudicate_fixtures_repo() {
 fn test_cli_adjudicate_embargoed_clean() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_embargo_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
     let vis_path = temp_root.join("embargo_only.toml");
@@ -104,7 +105,9 @@ fn test_cli_adjudicate_load_docket() {
         .output()
         .expect("Failed to execute oot CLI");
 
-    assert!(output.status.success());
+    // fixtures/example.json is EMBARGOED, so loading it must exit nonzero,
+    // matching the non-docket adjudicate paths. Regression for CLI-01.
+    assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(stdout.contains("OOT DOCKET"));
@@ -121,6 +124,7 @@ fn test_cli_adjudicate_load_docket() {
 fn test_cli_custom_meaning_policy_and_temp_dirs() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
     let policy_path = temp_root.join("strict_policy.toml");
@@ -182,6 +186,7 @@ fn test_cli_custom_meaning_policy_and_temp_dirs() {
 fn test_cli_exit_code_zero_for_adjudicated() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_clean_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
 
@@ -225,6 +230,7 @@ fn test_cli_exit_code_zero_for_adjudicated() {
 fn test_cli_binary_file_does_not_crash() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_bin_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
 
@@ -270,6 +276,7 @@ fn test_cli_binary_file_does_not_crash() {
 fn test_cli_empty_change_is_flagged_but_not_blocked() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_empty_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
     let policy_path = temp_root.join("low_blocks.toml");
@@ -320,6 +327,7 @@ fn test_cli_empty_change_is_flagged_but_not_blocked() {
 fn test_cli_intent_wins_over_touched_paths() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_intent_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
 
@@ -369,6 +377,7 @@ fn test_cli_intent_wins_over_touched_paths() {
 fn test_cli_distinct_binaries_are_not_collapsed() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_bincmp_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
 
@@ -412,6 +421,7 @@ fn test_cli_distinct_binaries_are_not_collapsed() {
 fn test_cli_symlink_loop_is_skipped() {
     let bin = get_bin_path();
     let temp_root = std::env::temp_dir().join(format!("oot_cli_link_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_root);
     let base_dir = temp_root.join("base");
     let head_dir = temp_root.join("head");
 

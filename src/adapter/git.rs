@@ -171,10 +171,9 @@ impl GitAdapter {
             })?;
             let parts: Vec<&str> = meta.split_whitespace().collect();
             if parts.len() >= 3 && parts[1] == "blob" {
-                // Skip symlinks (mode 120000)
-                if parts[0] == "120000" {
-                    continue;
-                }
+                // Include symlinks (mode 120000): their blob is the target path
+                // bytes. Skipping them hid symlink changes from visibility checks
+                // and 3-way adjudication (SEC-05, X-08).
                 crate::store::validate_tree_path(path)?;
                 let blob_sha = parts[2];
                 let blob_output = Command::new("git")

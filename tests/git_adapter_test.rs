@@ -508,6 +508,72 @@ fn test_cli_git_adjudication_respects_authors_flag() {
     );
 }
 
+#[test]
+fn test_git_adapter_extract_snapshot_includes_symlinks() {
+    let repo = TempGitRepo::new("symlink_snapshot");
+    repo.write_file("src/lib.rs", "pub fn ok() {}\n");
+    std::os::unix::fs::symlink("target.txt", repo.path.join("link")).expect("create symlink");
+    let sha = repo.commit("with symlink");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let snapshot = adapter.extract_snapshot(&sha).expect("extract snapshot");
+
+    assert!(
+        snapshot.files.contains_key("link"),
+        "symlink must be present in snapshot for adjudication/visibility parity: keys={:?}",
+        snapshot.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        snapshot.files.get("link").unwrap(),
+        b"target.txt",
+        "symlink snapshot content must be the target path bytes"
+    );
+}
+
+#[test]
+fn test_git_adapter_symlink_visible_to_visibility() {
+    let repo = TempGitRepo::new("symlink_visibility");
+
+    repo.write_file("src/lib.rs", "pub fn ok() {}\n");
+    repo.commit("initial");
+
+    repo.create_and_checkout_branch("feature/symlink-secret");
+    fs::create_dir_all(repo.path.join("secrets")).expect("mkdir");
+    std::os::unix::fs::symlink("/etc/passwd", repo.path.join("secrets/creds"))
+        .expect("create symlink");
+    repo.commit("add symlink in private path");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let engine = Engine::new().expect("valid engine");
+    let meaning_policy = MeaningPolicy::default();
+    let visibility_policy = VisibilityPolicy::default(); // secrets/ is private by default
+
+    let docket = adapter
+        .adjudicate_3way(
+            "main",
+            "feature/symlink-secret",
+            &engine,
+            &meaning_policy,
+            &visibility_policy,
+            &GitAdjudicateOptions::default(),
+        )
+        .expect("adjudicate 3way");
+
+    assert_eq!(
+        docket.verdict,
+        Verdict::Cloaked,
+        "symlink at a private path must trigger visibility cloaking: {:?}",
+        docket.disputes
+    );
+    assert!(
+        docket.disputes.iter().any(|d| d.kind == Kind::Visibility
+            && d.severity == Severity::High
+            && d.detail.contains("private path")),
+        "expected a High visibility dispute for the private symlink: {:?}",
+        docket.disputes
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn test_git_adapter_rejects_non_utf8_path() {

@@ -1019,6 +1019,67 @@ fn test_update_multi_branch_clean_ff_advances_head_update01_02() {
 }
 
 #[test]
+fn test_update_untracked_collision_does_not_delete_before_bail() {
+    // Regression for UPDATE-04 (straight path): validate untracked collisions
+    // before deleting, so a bail leaves the tree untouched.
+    let tmp = unique_tmp("collision-no-delete");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    // Target change (change 1): has a file that will collide and omits victim.
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    std::fs::write(proj.join("blocker"), "target\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "target"], &proj);
+    assert!(ok, "{msg}");
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let target_id = log
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Current head (change 2): removes blocker, adds victim (clean work).
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let _ = std::fs::remove_file(proj.join("blocker"));
+    std::fs::write(proj.join("victim.txt"), "doomed\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "head"], &proj);
+    assert!(ok, "{msg}");
+
+    // Create an untracked blocker that conflicts with the target. Use an empty
+    // directory on all platforms: collect_worktree does not record empty dirs,
+    // so work stays clean (straight path) and the target's file collides.
+    std::fs::create_dir_all(proj.join("blocker")).unwrap();
+
+    let (ok, out) = oot(&["update", "--change", &target_id[..7]], &proj);
+    assert!(!ok, "untracked collision should fail: {out}");
+    assert!(
+        out.contains("cannot overwrite existing directory")
+            || out.contains("would be overwritten")
+            || out.contains("blocker"),
+        "{out}"
+    );
+    // victim.txt must survive: no deletes before the collision bail.
+    assert!(
+        proj.join("victim.txt").exists(),
+        "victim.txt deleted despite collision bail: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("victim.txt")).unwrap(),
+        "doomed\n"
+    );
+    // a.txt must not have been rewritten to the target.
+    assert_eq!(std::fs::read_to_string(proj.join("a.txt")).unwrap(), "v2\n");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_update_already_up_to_date_advances_head_update02() {
     let tmp = unique_tmp("uptodate-head");
     let _ = std::fs::remove_dir_all(&tmp);
@@ -1050,6 +1111,205 @@ fn test_update_already_up_to_date_advances_head_update02() {
     assert!(
         head.contains("refs/heads/main"),
         "UPDATE-02: already-up-to-date did not advance HEAD: {head}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_fails_when_head_branch_cannot_be_written() {
+    let tmp = unique_tmp("head-write-fails");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    // Make the update actually materialize: dirty work that --force overwrites.
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+
+    // Replace .oot/HEAD with a directory so writing it fails even as root.
+    let head = proj.join(".oot").join("HEAD");
+    std::fs::remove_file(&head).unwrap();
+    std::fs::create_dir_all(&head).unwrap();
+
+    let (ok, out) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(
+        !ok,
+        "update must fail when HEAD cannot be written, not report success: {out}"
+    );
+    assert!(!out.contains("updated to"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_fails_when_current_head_change_is_corrupt() {
+    let tmp = unique_tmp("corrupt-head");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "first"], &proj);
+    assert!(ok, "{msg}");
+
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "second"], &proj);
+    assert!(ok, "{msg}");
+
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let first_line = log.lines().last().unwrap();
+    let first_id = first_line.split_whitespace().next().unwrap();
+    let prefix = &first_id[..4];
+
+    // Corrupt the current head (main) change record. The update target is the
+    // intact first change, so only the current-head load can fail.
+    let head_id = std::fs::read_to_string(proj.join(".oot").join("refs").join("main"))
+        .unwrap()
+        .trim()
+        .to_string();
+    std::fs::write(
+        proj.join(".oot")
+            .join("changes")
+            .join(format!("{head_id}.json")),
+        "this is not json\n",
+    )
+    .unwrap();
+
+    let (ok, out) = oot(&["update", "--change", prefix, "--force"], &proj);
+    assert!(
+        !ok,
+        "update must fail on a corrupt current head, not merge against an empty base: {out}"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_update_untracked_symlink_collision_does_not_delete_before_bail() {
+    // Regression for UPDATE-04 with a symlink collision: collect_worktree skips
+    // symlinks, so the symlink is not in work and collides with the target file.
+    let tmp = unique_tmp("collision-symlink");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
+    std::fs::write(proj.join("blocker"), "target\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "target"], &proj);
+    assert!(ok, "{msg}");
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let target_id = log
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    std::fs::write(proj.join("a.txt"), "v2\n").unwrap();
+    let _ = std::fs::remove_file(proj.join("blocker"));
+    std::fs::write(proj.join("victim.txt"), "doomed\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "head"], &proj);
+    assert!(ok, "{msg}");
+
+    let elsewhere = tmp.join("elsewhere");
+    std::fs::write(&elsewhere, "different\n").unwrap();
+    std::os::unix::fs::symlink(&elsewhere, proj.join("blocker")).unwrap();
+
+    let (ok, out) = oot(&["update", "--change", &target_id[..7]], &proj);
+    assert!(!ok, "untracked symlink collision should fail: {out}");
+    assert!(out.contains("would be overwritten"), "{out}");
+    assert!(
+        proj.join("victim.txt").exists(),
+        "victim.txt deleted despite symlink collision bail: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("victim.txt")).unwrap(),
+        "doomed\n"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn test_update_merge_untracked_collision_does_not_delete_before_bail() {
+    // Regression for UPDATE-04/UPDATE-07 (merge path): validate untracked
+    // collisions before deleting so a dirty merge bail leaves the tree intact.
+    let tmp = unique_tmp("collision-merge");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    // Base/current head state.
+    std::fs::write(proj.join("shared.txt"), "base\n").unwrap();
+    std::fs::write(proj.join("victim.txt"), "doomed\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "base"], &proj);
+    assert!(ok, "{msg}");
+
+    // Target change: deletes victim and adds blocker (regular file).
+    std::fs::write(proj.join("shared.txt"), "target\n").unwrap();
+    let _ = std::fs::remove_file(proj.join("victim.txt"));
+    std::fs::write(proj.join("blocker"), "target\n").unwrap();
+    let (ok, msg) = oot(&["record", "-m", "target"], &proj);
+    assert!(ok, "{msg}");
+    let (ok, log) = oot(&["log"], &proj);
+    assert!(ok, "{log}");
+    let target_id = log
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Restore base state (clean), then make work dirty so update takes the
+    // merge path while an untracked blocker directory collides with target.
+    let (ok, msg) = oot(&["update", "--change", &target_id[..7], "--force"], &proj);
+    assert!(ok, "{msg}");
+    // Go back to base by recording/using log - easier: reconstruct base state.
+    // (we know base had shared.txt=base, victim.txt=doomed, no blocker)
+    std::fs::write(proj.join("shared.txt"), "base\n").unwrap();
+    std::fs::write(proj.join("victim.txt"), "doomed\n").unwrap();
+    let _ = std::fs::remove_file(proj.join("blocker"));
+    let (ok, msg) = oot(&["record", "-m", "base2"], &proj);
+    assert!(ok, "{msg}");
+
+    // Dirty work (kept by merge) + untracked colliding directory.
+    std::fs::write(proj.join("local.txt"), "local\n").unwrap();
+    std::fs::create_dir_all(proj.join("blocker")).unwrap();
+
+    let (ok, out) = oot(&["update", "--change", &target_id[..7]], &proj);
+    assert!(!ok, "merge with untracked collision should fail: {out}");
+    assert!(
+        out.contains("cannot overwrite existing directory")
+            || out.contains("would be overwritten")
+            || out.contains("blocker"),
+        "{out}"
+    );
+    assert!(
+        proj.join("victim.txt").exists(),
+        "victim.txt deleted despite merge collision bail: {out}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("victim.txt")).unwrap(),
+        "doomed\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(proj.join("local.txt")).unwrap(),
+        "local\n"
     );
 
     let _ = std::fs::remove_dir_all(&tmp);

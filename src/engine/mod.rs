@@ -155,8 +155,7 @@ impl Engine {
                     // top-level injection hiding beside a function edit still
                     // gets its own dispute, while whitespace-only churn and
                     // pure function-body edits stay silent here.
-                    let top_changed = squash_ws(&without_defs(&b, &base_fns))
-                        != squash_ws(&without_defs(&h, &head_fns));
+                    let top_changed = top_level_changed(&b, &base_fns, &h, &head_fns);
                     if top_changed {
                         disputes.push(meaning(
                             &mut n,
@@ -516,8 +515,7 @@ impl Engine {
                     // trusted target side, so ours-only drift stays silent,
                     // and identical changes on both sides count as converged.
                     if t_src != b_src && o_src != t_src {
-                        let top_changed = squash_ws(&without_defs(&b_src, &b_fns))
-                            != squash_ws(&without_defs(&t_src, &t_fns));
+                        let top_changed = top_level_changed(&b_src, &b_fns, &t_src, &t_fns);
                         if top_changed {
                             disputes.push(meaning(
                                 &mut n,
@@ -641,6 +639,23 @@ fn squash_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Whether top-level (non-function) content differs between two snapshots.
+/// Under the size cap this blanks defs and ignores whitespace. Oversize
+/// files skip AST extraction, so their def maps are empty anyway; fall back
+/// to a plain byte comparison instead of allocating blanked and squashed
+/// copies several times the file size.
+fn top_level_changed(
+    base: &str,
+    base_fns: &FunctionMap,
+    head: &str,
+    head_fns: &FunctionMap,
+) -> bool {
+    if base.len() > MAX_AST_PARSE_SIZE_BYTES || head.len() > MAX_AST_PARSE_SIZE_BYTES {
+        return base != head;
+    }
+    squash_ws(&without_defs(base, base_fns)) != squash_ws(&without_defs(head, head_fns))
+}
+
 /// Align two def lists for one name: identical source text pairs first
 /// (each def consumed once, silently — those are unchanged), then remaining
 /// leftovers pair by relative order and count as changed. Returns matched
@@ -709,10 +724,20 @@ fn rename_score(candidate: &str, original: &str) -> u8 {
 /// token boundaries like the space between a lifetime (`'a`) and its type
 /// (`str`) are preserved; the result is squashed for stable comparison.
 fn strip_param_names(sig: &str) -> (String, bool) {
-    let Some(open) = sig.find('(') else {
+    // The function name is blanked to \0 in rename signatures; the param
+    // list follows it. Searching from \0 skips decorator/attribute parens
+    // that appear earlier in the text (e.g. `@dec(1) def f(a):`).
+    let open = if let Some(blank) = sig.find('\u{0}') {
+        sig[blank..]
+            .find('(')
+            .map(|byte_offset| blank + byte_offset)
+    } else {
+        sig.find('(')
+    };
+    let Some(open) = open else {
         return (squash_ws(sig), false);
     };
-    // Find the `)` that closes the first `(`.
+    // Find the `)` that closes the param list.
     let mut depth = 0;
     let mut close = None;
     for (i, c) in sig[open..].char_indices() {
@@ -734,18 +759,46 @@ fn strip_param_names(sig: &str) -> (String, bool) {
     out.push_str(&sig[..=open]);
     let mut had_names = false;
     let mut segment = String::new();
-    let mut seg_depth = 0;
+    let mut paren_depth = 0i32;
+    let mut angle_depth = 0i32;
+    let mut brace_depth = 0i32;
+    let mut bracket_depth = 0i32;
     for c in params.chars() {
+        let at_top = paren_depth == 0 && angle_depth == 0 && brace_depth == 0 && bracket_depth == 0;
         match c {
             '(' => {
-                seg_depth += 1;
+                paren_depth += 1;
                 segment.push(c);
             }
             ')' => {
-                seg_depth -= 1;
+                paren_depth -= 1;
                 segment.push(c);
             }
-            ',' if seg_depth == 0 => {
+            '<' => {
+                angle_depth += 1;
+                segment.push(c);
+            }
+            '>' => {
+                angle_depth -= 1;
+                segment.push(c);
+            }
+            '{' => {
+                brace_depth += 1;
+                segment.push(c);
+            }
+            '}' => {
+                brace_depth -= 1;
+                segment.push(c);
+            }
+            '[' => {
+                bracket_depth += 1;
+                segment.push(c);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                segment.push(c);
+            }
+            ',' if at_top => {
                 let (s, h) = strip_segment(&segment);
                 out.push_str(&s);
                 out.push(',');
@@ -884,7 +937,10 @@ fn find_divergent_renames(
 
 /// Maximum file size in bytes to subject to full Tree-Sitter AST extraction.
 /// Files exceeding this cap skip recursive AST parsing to prevent denial of
-/// service on massive generated or bundled assets.
+/// service on massive generated or bundled assets. Top-level change
+/// detection falls back to a byte comparison for such files (see
+/// [`top_level_changed`]) instead of copying them into blanked/squashed
+/// buffers.
 pub const MAX_AST_PARSE_SIZE_BYTES: usize = 5 * 1024 * 1024;
 
 fn parse_source(parser: &mut Parser, language: &Language, source: &str) -> Option<Tree> {
@@ -1050,11 +1106,6 @@ fn insert(
     if key.is_empty() {
         return false;
     }
-    let Ok(src) = body.utf8_text(source.as_bytes()) else {
-        return false;
-    };
-    let src = src.to_string();
-    let row = body.start_position().row + 1;
     // Blanking span: climb through single-statement wrappers so an added
     // `const f = ...;` leaves no `const ;` crumbs that fake a top-level
     // dispute. Multi-declarator parents (`const a=.., b=..`) stay put so a
@@ -1087,19 +1138,29 @@ fn insert(
     }
     let start_byte = span_node.start_byte();
     let end_byte = span_node.end_byte();
-    // Signature: the body with its own name blanked wherever it
-    // appears, so two functions that differ only by what they are
-    // called compare equal and pair as a rename. Blanking only the
-    // definition would leave recursive self-calls holding the old
-    // name, and a rename that updates them would never match.
+    // Source comes from the full span, not the inner body, so an
+    // `export_statement` wrapper (e.g. `export const f = ...`) is part of
+    // what is compared. Taking the inner text alone made adding or
+    // removing `export` invisible to both function alignment and the
+    // blanked top-level residue.
+    let Ok(src) = span_node.utf8_text(source.as_bytes()) else {
+        return false;
+    };
+    let src = src.to_string();
+    let row = body.start_position().row + 1;
+    // Signature: the span with its own name blanked wherever it appears,
+    // so two functions that differ only by what they are called compare
+    // equal and pair as a rename. Blanking only the definition would leave
+    // recursive self-calls holding the old name, and a rename that updates
+    // them would never match.
     let signature = match name_node {
         Some(n)
-            if n.start_byte() >= body.start_byte()
-                && n.end_byte() <= body.end_byte()
+            if n.start_byte() >= span_node.start_byte()
+                && n.end_byte() <= span_node.end_byte()
                 && n.start_byte() <= n.end_byte() =>
         {
-            let rel_start = n.start_byte() - body.start_byte();
-            let rel_end = n.end_byte() - body.start_byte();
+            let rel_start = n.start_byte() - span_node.start_byte();
+            let rel_end = n.end_byte() - span_node.start_byte();
             if rel_end <= src.len()
                 && src.is_char_boundary(rel_start)
                 && src.is_char_boundary(rel_end)
@@ -1192,6 +1253,36 @@ mod tests {
             details,
             vec!["renamed function `fact` to `factorial`"],
             "recursive rename must pair as one rename, got {details:?}"
+        );
+    }
+
+    #[test]
+    fn test_decorated_python_param_rename_detected() {
+        // ENGINE-05: decorator parens appear before the function's param list.
+        // The body must not reference the renamed param, or rename scoring
+        // (which requires word-for-word body match) rejects it independently.
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "lib.py".into(),
+            "@register(1)\ndef alpha(a):\n    return 42\n".into(),
+        );
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "lib.py".into(),
+            "@register(1)\ndef beta(b):\n    return 42\n".into(),
+        );
+
+        let loose = Engine::new().unwrap().with_rename_min_score(80);
+        let details: Vec<String> = loose
+            .diff_snapshots(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
+        assert_eq!(
+            details,
+            vec!["renamed function `alpha` to `beta`"],
+            "decorated param rename must pair at threshold 80, got {details:?}"
         );
     }
 
@@ -1414,6 +1505,77 @@ mod tests {
         assert!(
             !disputes.iter().any(|d| d.detail.contains("`handle`")),
             "member-expression assignment should not be treated as a named function"
+        );
+    }
+
+    #[test]
+    fn test_engine_js_export_visibility_change_is_reported() {
+        // ENGINE-08: adding `export` changes the public API surface and
+        // must be reported as a change to the exported function.
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files
+            .insert("index.js".into(), "const f = () => 1;\n".into());
+
+        let mut head = Snapshot::default();
+        head.files
+            .insert("index.js".into(), "export const f = () => 1;\n".into());
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert!(
+            disputes.iter().any(|d| d.detail.contains("`f`")),
+            "export addition must be reported, got {:?}",
+            disputes
+        );
+
+        let mut base2 = Snapshot::default();
+        base2
+            .files
+            .insert("index.js".into(), "function f() {}\n".into());
+
+        let mut head2 = Snapshot::default();
+        head2
+            .files
+            .insert("index.js".into(), "export function f() {}\n".into());
+
+        let disputes2 = eng.diff_snapshots(&base2, &head2).unwrap();
+        assert!(
+            disputes2.iter().any(|d| d.detail.contains("`f`")),
+            "export addition must be reported, got {:?}",
+            disputes2
+        );
+    }
+
+    #[test]
+    fn test_engine_js_call_with_callback_is_not_a_function() {
+        // ENGINE-09: `const sorted = items.sort(...)` holds a call
+        // result, not a function. A comparator edit must surface as a
+        // top-level change, not a phantom named function `sorted`.
+        let eng = Engine::new().unwrap();
+
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "index.js".into(),
+            "const sorted = items.sort((a, b) => a - b);\n".into(),
+        );
+
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "index.js".into(),
+            "const sorted = items.sort((a, b) => a + b);\n".into(),
+        );
+
+        let disputes = eng.diff_snapshots(&base, &head).unwrap();
+        assert!(
+            !disputes.iter().any(|d| d.detail.contains("`sorted`")),
+            "call result must not be tracked as function `sorted`, got {:?}",
+            disputes
+        );
+        assert!(
+            disputes.iter().any(|d| d.detail.contains("top-level")),
+            "comparator edit should surface as a top-level change, got {:?}",
+            disputes
         );
     }
 
@@ -1751,6 +1913,22 @@ mod tests {
             rename_score("fn \0(a: Foo<A, B>) { x }", "fn \0(c: Foo<A, B>) { x }"),
             80
         );
+        // ENGINE-04: commas inside generics/braces/brackets must not split params.
+        assert_eq!(
+            rename_score("fn \0(a: Foo<A, B>) { x }", "fn \0(c: Foo<A, C>) { x }"),
+            0,
+            "different generic type args must not be erased as param names"
+        );
+        // ENGINE-05: the param list follows the blanked name; decorator/attribute
+        // parens earlier in the signature must not be mistaken for it.
+        assert_eq!(
+            rename_score(
+                "@register(1)\ndef \0(a):\n    return 42\n",
+                "@register(1)\ndef \0(b):\n    return 42\n"
+            ),
+            80,
+            "decorator parens must not hide the real param list"
+        );
         assert_eq!(
             rename_score("fn \0(x: &'a str) { y }", "fn \0(x: &'b str) { y }"),
             80
@@ -1940,6 +2118,42 @@ mod tests {
             disputes.is_empty(),
             "convergent add/add must be clean, got {:?}",
             disputes
+        );
+    }
+
+    #[test]
+    fn test_top_level_changed_oversize_uses_byte_comparison() {
+        // Oversize files skip AST extraction, so `top_level_changed` must
+        // not blank/squash-copy them: it falls back to byte inequality.
+        // A whitespace-only diff therefore counts as changed, while the
+        // old always-squash path stayed silent for it.
+        let big = "x".repeat(MAX_AST_PARSE_SIZE_BYTES + 16);
+        let empty = FunctionMap::new();
+
+        assert!(!top_level_changed(&big, &empty, &big, &empty));
+        assert!(top_level_changed(&big, &empty, &format!("{big} "), &empty));
+
+        // Same fallback through the public 2-way diff: identical oversize
+        // files stay silent, a changed oversize file is reported.
+        let eng = Engine::new().unwrap();
+        let mut base = Snapshot::default();
+        base.files
+            .insert("src/lib.rs".into(), big.clone().into_bytes());
+        let mut same = Snapshot::default();
+        same.files
+            .insert("src/lib.rs".into(), big.clone().into_bytes());
+        assert!(eng.diff_snapshots(&base, &same).unwrap().is_empty());
+
+        let mut changed = Snapshot::default();
+        changed
+            .files
+            .insert("src/lib.rs".into(), format!("{big}y").into_bytes());
+        let disputes = eng.diff_snapshots(&base, &changed).unwrap();
+        assert!(
+            disputes
+                .iter()
+                .any(|d| d.detail.contains("file content modified")),
+            "oversize change must still be reported, got {disputes:?}"
         );
     }
 }
