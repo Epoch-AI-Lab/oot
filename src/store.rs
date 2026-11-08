@@ -833,11 +833,20 @@ impl Store {
                 let close = rest.find('>')?;
                 let name = rest[..open].trim();
                 let email = rest[open + 1..close].trim();
-                Some((name.to_string(), email.to_string()))
+                let date = {
+                    let raw = rest[close + 1..].trim();
+                    if raw.is_empty() {
+                        None
+                    } else {
+                        Some(raw.to_string())
+                    }
+                };
+                Some((name.to_string(), email.to_string(), date))
             });
         Ok(Some(TagMeta {
-            tagger_name: tagger.as_ref().map(|(n, _)| n.clone()),
-            tagger_email: tagger.as_ref().map(|(_, e)| e.clone()),
+            tagger_name: tagger.as_ref().map(|(n, _, _)| n.clone()),
+            tagger_email: tagger.as_ref().map(|(_, e, _)| e.clone()),
+            tagger_date: tagger.as_ref().and_then(|(_, _, d)| d.clone()),
             // A signed tag's signature lives in its message body: keep the
             // prose, drop the armor, or a recreated tag would carry the
             // stale signature text (and a fresh one after it) in its message.
@@ -912,6 +921,9 @@ impl Store {
         if let (Some(name), Some(email)) = (&meta.tagger_name, &meta.tagger_email) {
             cmd.env("GIT_COMMITTER_NAME", name.replace('\n', " "))
                 .env("GIT_COMMITTER_EMAIL", email.replace('\n', " "));
+        }
+        if let Some(date) = &meta.tagger_date {
+            cmd.env("GIT_COMMITTER_DATE", date);
         }
         cmd.current_dir(out_repo);
         run(&mut cmd)?;
@@ -2979,6 +2991,10 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<()> {
 pub struct TagMeta {
     pub tagger_name: Option<String>,
     pub tagger_email: Option<String>,
+    /// Raw Git tagger date (`<unix-ts> <offset>`), preserved so a recreated
+    /// tag keeps its original timestamp instead of "now".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tagger_date: Option<String>,
     pub message: String,
     pub signed: bool,
 }
