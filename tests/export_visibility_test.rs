@@ -99,7 +99,7 @@ fn test_filtered_export_strips_private_paths_everywhere() {
     // directly would see unreferenced objects; a --no-local clone receives
     // exactly the reachable object set, same as a push to GitHub.
     let clone = tmp.join("clone");
-    let _ = Command::new("git")
+    let clone_out = Command::new("git")
         .args([
             "clone",
             "--no-local",
@@ -108,13 +108,18 @@ fn test_filtered_export_strips_private_paths_everywhere() {
             clone.to_str().unwrap(),
         ])
         .output()
-        .unwrap();
+        .expect("git clone should run");
+    assert!(
+        clone_out.status.success(),
+        "clone of export failed: {}",
+        String::from_utf8_lossy(&clone_out.stderr)
+    );
     let check = Command::new("git")
         .arg("-C")
         .arg(&clone)
         .args(["cat-file", "-e", &env_blob])
         .output()
-        .unwrap();
+        .expect("git cat-file should run");
     assert!(
         !check.status.success(),
         "secret blob {env_blob} is reachable from the export"
