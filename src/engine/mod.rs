@@ -969,6 +969,51 @@ fn collect(node: Node, source: &str, map: &mut FunctionMap, config: &LangConfig)
     }
 }
 
+/// Copy of `src` with every whole-token occurrence of `name` replaced
+/// by a single `\0`, so a rename that also updates recursive
+/// self-calls compares equal. A name that is not a plain identifier
+/// (e.g. a JS private `#f` or a quoted key) cannot be matched as a
+/// token, so only the definition span (`def_start..def_end`) is
+/// blanked, as before.
+fn blank_name_occurrences(src: &str, name: &str, def_start: usize, def_end: usize) -> String {
+    let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    if name.is_empty() || !name.chars().all(is_ident) {
+        let mut sig = String::with_capacity(src.len());
+        sig.push_str(&src[..def_start]);
+        sig.push('\u{0}');
+        sig.push_str(&src[def_end..]);
+        return sig;
+    }
+    let mut sig = String::with_capacity(src.len());
+    let mut token = String::new();
+    let mut in_token = false;
+    for c in src.chars() {
+        if is_ident(c) {
+            token.push(c);
+            in_token = true;
+        } else {
+            if in_token {
+                if token.as_str() == name {
+                    sig.push('\u{0}');
+                } else {
+                    sig.push_str(&token);
+                }
+                token.clear();
+                in_token = false;
+            }
+            sig.push(c);
+        }
+    }
+    if in_token {
+        if token.as_str() == name {
+            sig.push('\u{0}');
+        } else {
+            sig.push_str(&token);
+        }
+    }
+    sig
+}
+
 /// Record a named function under `key`. Every definition is kept; diffing
 /// aligns same-key groups by content (see [`align_defs`]).
 fn insert(
@@ -1018,9 +1063,11 @@ fn insert(
     }
     let start_byte = span_node.start_byte();
     let end_byte = span_node.end_byte();
-    // Signature: the body with its own name blanked, so two functions
-    // that differ only by what they are called compare equal and pair
-    // as a rename.
+    // Signature: the body with its own name blanked wherever it
+    // appears, so two functions that differ only by what they are
+    // called compare equal and pair as a rename. Blanking only the
+    // definition would leave recursive self-calls holding the old
+    // name, and a rename that updates them would never match.
     let signature = match name_node {
         Some(n)
             if n.start_byte() >= body.start_byte()
@@ -1033,11 +1080,7 @@ fn insert(
                 && src.is_char_boundary(rel_start)
                 && src.is_char_boundary(rel_end)
             {
-                let mut sig = String::with_capacity(src.len());
-                sig.push_str(&src[..rel_start]);
-                sig.push('\u{0}');
-                sig.push_str(&src[rel_end..]);
-                sig
+                blank_name_occurrences(&src, &key, rel_start, rel_end)
             } else {
                 src.clone()
             }
@@ -1097,6 +1140,34 @@ mod tests {
             details,
             vec!["renamed function `alpha` to `beta`"],
             "threshold 80 must pair it as one rename"
+        );
+    }
+
+    #[test]
+    fn test_recursive_function_rename_pairs_as_rename() {
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "src/lib.rs".into(),
+            "pub fn fact(n: i32) -> i32 { if n <= 1 { 1 } else { n * fact(n - 1) } }\n".into(),
+        );
+        let mut head = Snapshot::default();
+        head.files.insert(
+            "src/lib.rs".into(),
+            "pub fn factorial(n: i32) -> i32 { if n <= 1 { 1 } else { n * factorial(n - 1) } }\n"
+                .into(),
+        );
+
+        let eng = Engine::new().unwrap();
+        let details: Vec<String> = eng
+            .diff_snapshots(&base, &head)
+            .unwrap()
+            .iter()
+            .map(|d| d.detail.clone())
+            .collect();
+        assert_eq!(
+            details,
+            vec!["renamed function `fact` to `factorial`"],
+            "recursive rename must pair as one rename, got {details:?}"
         );
     }
 
