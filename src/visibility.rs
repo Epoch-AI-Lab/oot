@@ -15,6 +15,7 @@ use std::path::Path;
 /// embargo bundles, which are sign+encrypted through the gpg binary the
 /// same way Oot already shells out to git. Oot owns the rule and the gate.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VisibilityPolicy {
     /// Path fragments that are private. A touched path matching any entry
     /// raises a visibility dispute.
@@ -105,7 +106,12 @@ impl VisibilityPolicy {
     /// Load a visibility policy from a TOML configuration file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let p: VisibilityPolicy = toml::from_str(&text)?;
+        let p: VisibilityPolicy = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse visibility policy from {}: {e}",
+                path.display()
+            )
+        })?;
         if let Some(date_str) = &p.embargo_until {
             if parse_date_ymd(date_str).is_none() {
                 anyhow::bail!(
@@ -439,5 +445,36 @@ mod tests {
         let disputes = policy.check(&change2);
         assert_eq!(disputes.len(), 1);
         assert_eq!(disputes[0].location, "secrets/key.pem");
+    }
+
+    #[test]
+    fn test_visibility_policy_rejects_unknown_fields() {
+        let err = toml::from_str::<VisibilityPolicy>("embargo_untii = \"2099-01-01\"")
+            .expect_err("typoed field must not be silently ignored");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_visibility_policy_load_rejects_unknown_fields_and_names_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "oot_visibility_unknown_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("visibility.toml");
+        std::fs::write(&path, "private_path = [\"secret\"]\n").unwrap();
+        let err = VisibilityPolicy::load(&path).expect_err("unknown field must fail load");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field"), "{msg}");
+        assert!(msg.contains("visibility.toml"), "{msg}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
