@@ -116,8 +116,10 @@ impl GitAdapter {
             .with_context(|| format!("Failed to query authors for range '{rev_range}'"))?;
 
         if !output.status.success() {
-            // Return empty list rather than hard failing on single refs with no history
-            return Ok(Vec::new());
+            return Err(anyhow!(
+                "Failed to query authors for range '{rev_range}': {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
 
         let text = String::from_utf8(output.stdout)?;

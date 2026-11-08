@@ -259,3 +259,18 @@ fn test_jj_conflicted_commit_detected_not_parsed() {
         "conflicted file must be excluded from the parseable snapshot"
     );
 }
+
+#[test]
+fn test_jj_authors_bogus_revset_errors() {
+    if !jj_available() {
+        return;
+    }
+    let (_repo, adapter) = setup_base_and_head(false);
+
+    let result = adapter.authors("no-such-revset-xyz", "also-no-such-revset-xyz");
+    assert!(
+        result.is_err(),
+        "authors() must propagate jj failures instead of returning an empty list, got: {:?}",
+        result
+    );
+}
