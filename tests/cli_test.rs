@@ -534,3 +534,52 @@ fn test_cli_invalid_source_fails() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("unknown source: invalid_vcs"));
 }
+
+#[test]
+fn test_cli_change_without_store_reports_store_error() {
+    let bin = get_bin_path();
+    let temp_root = std::env::temp_dir().join(format!("oot_cli_no_store_{}", std::process::id()));
+    std::fs::create_dir_all(&temp_root).unwrap();
+
+    // `--change` alone selects store mode; with no `.oot` at or above this
+    // empty temp dir, the run must surface the store-open cause, not the
+    // generic base/head/base-ref usage hint (which omits `--change`).
+    let output = Command::new(&bin)
+        .args(["adjudicate", "--change", "abc1234"])
+        .current_dir(&temp_root)
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no Oot store found"),
+        "expected the store-open cause, got:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("provide --docket <file>"),
+        "must not fall through to the usage hint, got:\n{stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&temp_root);
+}
+
+#[test]
+fn test_cli_docket_positional_and_change_conflict() {
+    let bin = get_bin_path();
+
+    // The positional id and `--change` are mutually exclusive; passing both
+    // must be a usage error rather than silently rendering one of them.
+    let output = Command::new(&bin)
+        .args(["docket", "aaaaaaa", "--change", "bbbbbbb"])
+        .output()
+        .expect("Failed to execute oot CLI");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // clap conflict error contains either flag name
+    assert!(
+        stderr.contains("cannot be used with") || stderr.contains("conflicts"),
+        "expected a clap mutual-exclusion error, got:\n{stderr}"
+    );
+}

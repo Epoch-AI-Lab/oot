@@ -130,10 +130,10 @@ enum Commands {
     /// Render a docket persisted by a previous `oot adjudicate --change`.
     Docket {
         /// Change id or unique prefix.
-        #[arg(value_name = "ID")]
+        #[arg(value_name = "ID", conflicts_with = "change")]
         id: Option<String>,
         /// Change id or unique prefix.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "id")]
         change: Option<String>,
     },
     /// Show embargo state: held/lifted until date plus recipient count.
@@ -281,11 +281,13 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
             };
             let eng = Engine::new()?.with_rename_min_score(meaning_policy.rename_min_score);
 
-            // Store-backed adjudication: `--change <id|prefix>` engages only
-            // when an Oot store opens here and no other adjudication mode was
-            // requested; otherwise the existing modes below behave untouched.
-            // Once engaged, an unresolvable id fails loudly rather than
-            // silently falling through.
+            // Store-backed adjudication: `--change <id|prefix>` selects store
+            // mode only when no other adjudication mode was requested;
+            // otherwise the existing modes below behave untouched. A missing
+            // store propagates its `Store::open` error here instead of
+            // falling through to a usage hint, and once engaged an
+            // unresolvable id fails loudly rather than silently falling
+            // through.
             let other_mode = source.is_some()
                 || base.is_some()
                 || head.is_some()
@@ -294,7 +296,7 @@ fn main() -> anyhow::Result<std::process::ExitCode> {
                 || repo.is_some()
                 || docket.is_some();
             let store = match (change.clone(), other_mode) {
-                (Some(_), false) => Store::open(".").ok(),
+                (Some(_), false) => Some(Store::open(".")?),
                 _ => None,
             };
             if let Some(store) = store {
