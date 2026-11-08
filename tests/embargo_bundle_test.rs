@@ -298,7 +298,19 @@ fn test_embargo_bundle_survives_invalid_tag() {
 /// subkey, which is what made the original pin logic reject the primary
 /// fingerprint an operator would actually copy. Returns (home, primary fpr).
 fn make_subkey_signing_key() -> (std::path::PathBuf, String) {
-    let (home, _primary) = make_test_key();
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let home = std::env::temp_dir()
+        .join(format!("oot-subkey-gpg-{}", std::process::id()))
+        .join(format!("key-{seq}"));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("gpg home");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let keygen = Command::new("gpg")
         .env("GNUPGHOME", &home)
         .args([
@@ -320,9 +332,10 @@ fn make_subkey_signing_key() -> (std::path::PathBuf, String) {
         "subkey primary keygen failed: {}",
         String::from_utf8_lossy(&keygen.stderr)
     );
+    // Select the key we just created, not any other key in the home.
     let list = Command::new("gpg")
         .env("GNUPGHOME", &home)
-        .args(["--list-keys", "--with-colons"])
+        .args(["--list-keys", "--with-colons", "oot-subkey@example.com"])
         .output()
         .expect("gpg should run");
     let fpr = String::from_utf8_lossy(&list.stdout)
