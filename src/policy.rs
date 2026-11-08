@@ -8,6 +8,7 @@ use std::path::Path;
 
 /// Thresholds for *meaning* disputes. Visibility has its own policy.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MeaningPolicy {
     /// Severity names (lowercase, e.g. `"high"`) that block the change.
     #[serde(default = "default_block_on")]
@@ -47,7 +48,12 @@ impl MeaningPolicy {
     /// Load a meaning policy from a TOML configuration file.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)?;
-        let p: MeaningPolicy = toml::from_str(&text)?;
+        let p: MeaningPolicy = toml::from_str(&text).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to parse meaning policy from {}: {e}",
+                path.display()
+            )
+        })?;
         if p.rename_min_score > 100 {
             anyhow::bail!(
                 "invalid rename_min_score: '{}' (expected 0-100)",
@@ -196,5 +202,36 @@ mod tests {
         // Under custom policy, review level blocks
         assert_eq!(policy.evaluate(&review_dispute), Verdict::Blocked);
         assert!(!policy.requires_review(&review_dispute));
+    }
+
+    #[test]
+    fn test_meaning_policy_rejects_unknown_fields() {
+        let err = toml::from_str::<MeaningPolicy>("block_onn = [\"high\"]")
+            .expect_err("typoed field must not be silently ignored");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_meaning_policy_load_rejects_unknown_fields_and_names_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "oot_policy_unknown_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("policy.toml");
+        std::fs::write(&path, "revieww_on = [\"high\"]\n").unwrap();
+        let err = MeaningPolicy::load(&path).expect_err("unknown field must fail load");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown field"), "{msg}");
+        assert!(msg.contains("policy.toml"), "{msg}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
     }
 }
