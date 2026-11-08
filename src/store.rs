@@ -1388,14 +1388,9 @@ impl Store {
         if out_dir.exists() {
             bail!("bundle directory already exists: {}", out_dir.display());
         }
-        std::fs::create_dir_all(out_dir)?;
-        // Plaintext private history goes inside; keep the bundle private on
-        // disk until the user seals it, regardless of the umask.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700))?;
-        }
+        // Plaintext private history goes inside; make the bundle private
+        // in the mkdir itself, not after a world-readable window.
+        create_private_dir(out_dir)?;
         // Unfiltered replay: full history, private changes included.
         let repo_dir = out_dir.join("repo");
         std::fs::create_dir_all(&repo_dir)?;
@@ -2879,6 +2874,32 @@ fn create_private(path: &Path) -> Result<&Path> {
     Ok(path)
 }
 
+/// Create `path` and any parents as directories only their owner can
+/// enter, private from the `mkdir` itself. `create_dir_all` takes no
+/// mode, so the directory exists briefly at the umask default before a
+/// later chmod tightens it, and plaintext embargo or decrypted trees
+/// sit world-readable in between. The requested 0700 can only be
+/// narrowed by the umask, never widened, so the directory is never
+/// exposed to group or other. The bundle and verify output dirs are
+/// created through this; dirs inside them inherit the privacy.
+fn create_private_dir(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(path)
+            .with_context(|| format!("failed to create {}", path.display()))?;
+    }
+    Ok(())
+}
+
 fn run(cmd: &mut Command) -> Result<()> {
     let output = cmd
         .output()
@@ -3300,16 +3321,13 @@ fn embargo_verify_inner(
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::create_dir_all(out_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(out_dir, std::fs::Permissions::from_mode(0o700)) {
-            // Leave nothing behind, or the retry reports "output already
-            // exists" instead of the permission problem.
-            let _ = std::fs::remove_dir_all(out_dir);
-            return Err(e.into());
-        }
+    // Decrypted plaintext goes inside; make the output dir private in the
+    // mkdir itself, not after a world-readable window.
+    if let Err(e) = create_private_dir(out_dir) {
+        // Leave nothing behind, or the retry reports "output already
+        // exists" instead of the creation problem.
+        let _ = std::fs::remove_dir_all(out_dir);
+        return Err(e);
     }
     let tmp_tar = {
         let name = out_dir
@@ -4468,6 +4486,23 @@ mod tests {
         let guard = PlaintextGuard::arm(vec![dir.join("never-existed")]).unwrap();
         assert!(guard.remove_now().is_ok(), "absent path is not a failure");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_create_private_dir_is_owner_only() {
+        let dir = guard_tmp("private-dir");
+        let nested = dir.join("a").join("b");
+        create_private_dir(&nested).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "private dir must be owner-only: {mode:o}");
+            // Re-creating an existing private dir still succeeds, like
+            // create_dir_all, so the callers' exists guards stay meaningful.
+            create_private_dir(&nested).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
