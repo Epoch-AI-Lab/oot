@@ -391,6 +391,20 @@ fn test_update_unknown_and_ambiguous_prefix() {
     assert!(!ok, "{out}");
     assert!(out.contains("no change"), "{out}");
 
+    // Two crafted changes sharing a prefix make resolve_change's ambiguous
+    // branch observable through the CLI (the real "first" id is a hash and
+    // does not collide with this prefix).
+    let changes = proj.join(".oot/changes");
+    for tail in ["1", "2"] {
+        let id = format!("aaaa00000000000000000000000000000000000{tail}");
+        let record = r#"{"parents":[],"tree":"4b825dc642cb6eb9a060e54bf8d69288fbee4904","author":{"name":"K","email":"k@oot.dev","time":0,"offset":"+0000"},"committer":{"name":"K","email":"k@oot.dev","time":0,"offset":"+0000"},"message":"crafted\n","source_sha":null}"#.to_string();
+        std::fs::write(changes.join(format!("{id}.json")), record)
+            .unwrap_or_else(|e| panic!("write crafted change {id}: {e}"));
+    }
+    let (ok, out) = oot(&["update", "--change", "aaaa"], &proj);
+    assert!(!ok, "{out}");
+    assert!(out.contains("ambiguous change prefix 'aaaa'"), "{out}");
+
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

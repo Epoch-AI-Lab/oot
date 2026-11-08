@@ -663,10 +663,12 @@ fn test_engine_3way_rename_rename_divergence_is_high_with_pinned_detail() {
         x
     };
 
+    // Ours is padded so `g` lands on line 2 while theirs' `k` stays on line 1.
+    // The location must follow theirs; using ours would produce line 2.
     let disputes = engine
         .diff_3way(
             &snap("pub fn f() -> i32 { 1 }\n"),
-            &snap("pub fn g() -> i32 { 1 }\n"),
+            &snap("\npub fn g() -> i32 { 1 }\n"),
             &snap("pub fn k() -> i32 { 1 }\n"),
         )
         .expect("Diff failed");
