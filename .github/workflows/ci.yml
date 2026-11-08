@@ -41,8 +41,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       # Pinned so jj CLI output stays stable for the adapter tests.
       - name: Install Jujutsu
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          curl -sL -o /tmp/jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.44.0/jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz
+          # The releases/download edge can 504 for minutes; gh uses the
+          # API path instead. Curl (with retries) stays as fallback.
+          gh release download v0.44.0 -R jj-vcs/jj \
+            -p 'jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz' -O /tmp/jj.tar.gz \
+            || curl -fsSL --retry 5 --retry-delay 3 --retry-all-errors -o /tmp/jj.tar.gz https://github.com/jj-vcs/jj/releases/download/v0.44.0/jj-v0.44.0-x86_64-unknown-linux-musl.tar.gz
           mkdir -p /tmp/jj-install
           tar -xzf /tmp/jj.tar.gz -C /tmp/jj-install
           sudo mv /tmp/jj-install/jj /usr/local/bin/jj
