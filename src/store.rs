@@ -19,6 +19,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 /// Directory name created inside a project root by `oot init`.
 pub const STORE_DIR: &str = ".oot";
@@ -39,11 +41,174 @@ const EMPTY_BLOB: &str = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391";
 #[derive(Debug)]
 pub struct StoreLock {
     path: PathBuf,
+    pid: u32,
 }
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        // Only remove the lock file if it still records our pid. If our
+        // lock went missing, the path may hold a different holder's lock,
+        // and removing that would break their mutual exclusion.
+        if read_lock_pid(&self.path) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// A lock counts as stale only when its owner is gone and the file is old.
+/// Age alone would steal locks from holders that run long (a `record`
+/// writing many blobs looks old within seconds); a pid check alone could
+/// steal from a process that just created the file but has not written
+/// the pid yet.
+const LOCK_STALE_AFTER: Duration = Duration::from_secs(10);
+
+/// Disambiguates stale-lock claim files created in flight.
+static STALE_CLAIM_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Read the owner pid recorded in a lock file, if present and parseable.
+fn read_lock_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// Is `pid` a live process? `/proc/<pid>` exists for live and zombie
+/// processes; a zombie is dead for locking purposes. Where `/proc` is
+/// absent (non-Linux), liveness cannot be told, so report alive and never
+/// steal a lock that might be live.
+#[cfg(unix)]
+fn pid_is_alive(pid: u32) -> bool {
+    if !Path::new("/proc").exists() {
+        return true;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            // The state is the first field after the closing paren (the
+            // comm field may itself contain spaces or parens).
+            let state = stat
+                .rsplit(')')
+                .next()
+                .and_then(|rest| rest.split_whitespace().next());
+            state != Some("Z")
+        }
+        Err(_) => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn pid_is_alive(_pid: u32) -> bool {
+    true
+}
+
+/// File identity (device, inode), so a claim can be checked against the
+/// file it was observed through.
+#[cfg(unix)]
+fn file_ident(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_ident(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Snapshot of what a lock file claims to be: owner pid, mtime, identity.
+struct LockState {
+    pid: Option<u32>,
+    modified: SystemTime,
+    ident: Option<(u64, u64)>,
+}
+
+fn lock_state(path: &Path) -> Option<LockState> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(LockState {
+        pid: read_lock_pid(path),
+        modified: meta.modified().ok()?,
+        ident: file_ident(&meta),
+    })
+}
+
+/// True when the lock may be broken: old and ownerless. A lock with an
+/// unreadable owner and an old mtime comes from a process that died
+/// before writing the pid, so it counts as ownerless.
+fn lock_is_stale(state: &LockState) -> bool {
+    let old = state
+        .modified
+        .elapsed()
+        .is_ok_and(|elapsed| elapsed > LOCK_STALE_AFTER);
+    old && state.pid.is_none_or(|pid| !pid_is_alive(pid))
+}
+
+/// Attempt to break a stale lock; returns true when the caller should
+/// retry acquiring immediately (a stale lock was removed or claimed by
+/// another contender), false when it should keep waiting.
+///
+/// The stale lock is claimed by atomically renaming it to a unique name:
+/// exactly one contender wins the rename, and the winner deletes only
+/// that claimed file after re-verifying it is the stale file it observed
+/// (same identity, still stale). Unlinking the lock path directly would
+/// delete whatever became the current holder in between the check and
+/// the unlink, handing the lock to two processes at once.
+fn try_break_stale_lock(lock_path: &Path) -> bool {
+    let Some(observed) = lock_state(lock_path) else {
+        return false;
+    };
+    if !lock_is_stale(&observed) {
+        return false;
+    }
+
+    let seq = STALE_CLAIM_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let claim_name = format!("lock.stale-{}-{seq}-{nanos}", std::process::id());
+    let claim_path = lock_path.with_file_name(claim_name.as_str());
+
+    match std::fs::rename(lock_path, &claim_path) {
+        Ok(()) => {}
+        // Another contender claimed it (or the holder released it): retry.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+    }
+
+    // The claim is ours alone now. Delete it only if it is the same file
+    // verified as stale; otherwise a fresh lock was swapped in during
+    // the rename, and it goes back to the lock path untouched.
+    match lock_state(&claim_path) {
+        Some(claimed) if claimed.ident == observed.ident && lock_is_stale(&claimed) => {
+            let _ = std::fs::remove_file(&claim_path);
+            cleanup_stale_claim_files(lock_path);
+            true
+        }
+        _ => {
+            let _ = std::fs::rename(&claim_path, lock_path);
+            false
+        }
+    }
+}
+
+/// Remove leftover claim files from processes that died mid-break. Only
+/// claim files that are themselves stale go: a live claim is a fresh
+/// lock another contender has just moved aside and is about to verify.
+fn cleanup_stale_claim_files(lock_path: &Path) {
+    let Some(parent) = lock_path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("lock.stale-")
+        {
+            if let Some(state) = lock_state(&entry.path()) {
+                if lock_is_stale(&state) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
     }
 }
 
@@ -143,8 +308,20 @@ impl Store {
     }
 
     /// Acquire an exclusive advisory lock on the store.
+    ///
+    /// Acquisition is atomic (`create_new`): one contender wins, the rest
+    /// poll. A lock may be broken only when it is stale (old and
+    /// ownerless), and even then only via a rename-claim that deletes
+    /// solely the file it verified. A lock whose owner is still alive is
+    /// never stolen, however long the holder works. Contenders give up
+    /// after 5 seconds rather than steal a live lock.
     pub fn lock(&self) -> Result<StoreLock> {
+        self.lock_with_timeout(Duration::from_secs(5))
+    }
+
+    fn lock_with_timeout(&self, timeout: Duration) -> Result<StoreLock> {
         let lock_path = self.root.join("lock");
+        let pid = std::process::id();
         let start = std::time::Instant::now();
         loop {
             match std::fs::OpenOptions::new()
@@ -154,25 +331,20 @@ impl Store {
             {
                 Ok(file) => {
                     use std::io::Write;
-                    let _ = writeln!(&file, "{}", std::process::id());
-                    return Ok(StoreLock { path: lock_path });
+                    let _ = writeln!(&file, "{pid}");
+                    return Ok(StoreLock {
+                        path: lock_path,
+                        pid,
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    // Break stale lock if older than 10 seconds
-                    if let Ok(meta) = std::fs::metadata(&lock_path) {
-                        if let Ok(mtime) = meta.modified() {
-                            if let Ok(elapsed) = mtime.elapsed() {
-                                if elapsed > std::time::Duration::from_secs(10) {
-                                    let _ = std::fs::remove_file(&lock_path);
-                                    continue;
-                                }
-                            }
-                        }
+                    if try_break_stale_lock(&lock_path) {
+                        continue;
                     }
-                    if start.elapsed() > std::time::Duration::from_secs(5) {
+                    if start.elapsed() > timeout {
                         bail!("timed out waiting for store lock on {:?}", lock_path);
                     }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(e) => return Err(e.into()),
             }
@@ -4798,5 +4970,87 @@ mod tests {
         assert_eq!(format_date(&mk(1_700_000_000, "+0000")), "2023-11-14");
         // Exotic historical offset still parses.
         assert_eq!(format_date(&mk(1, "+0045")), "1970-01-01");
+    }
+
+    fn backdate(path: &Path, secs: u64) {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("lock file should open");
+        file.set_modified(SystemTime::now() - Duration::from_secs(secs))
+            .expect("mtime should be settable");
+    }
+
+    /// The stale-lock breaker must steal from a dead owner but never from
+    /// a live one: an old mtime means nothing when the holder's pid is
+    /// still a running process (a long `record` looks old within
+    /// seconds). The old mtime-only breaker stole this lock outright.
+    #[test]
+    fn test_lock_breaks_dead_stale_lock_but_not_live_one() {
+        let tmp = std::env::temp_dir().join(format!("oot-lock-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+        let lock_path = store.path().join("lock");
+
+        // A holder that already exited: its stale lock gets broken.
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("true should spawn");
+        let dead_pid = child.id();
+        child.wait().expect("child should exit");
+        assert!(!pid_is_alive(dead_pid), "test setup: pid must be dead");
+        std::fs::write(&lock_path, format!("{dead_pid}\n")).unwrap();
+        backdate(&lock_path, 15);
+
+        let lock = store.lock().expect("stale dead lock must be broken");
+        assert_eq!(read_lock_pid(&lock_path), Some(std::process::id()));
+        drop(lock);
+        assert!(!lock_path.exists(), "drop must release our lock");
+
+        // A live holder — this process — is never stolen from, however
+        // old the lock file looks.
+        std::fs::write(&lock_path, format!("{}\n", std::process::id())).unwrap();
+        backdate(&lock_path, 15);
+        let err = store
+            .lock_with_timeout(Duration::from_millis(200))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("timed out waiting for store lock"),
+            "live lock must be waited out, not stolen: {err}"
+        );
+        assert_eq!(
+            read_lock_pid(&lock_path),
+            Some(std::process::id()),
+            "the live lock file must survive"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Releasing a lock must not delete whatever the lock path holds if
+    /// it is not us anymore: a displaced holder's lock is someone else's
+    /// mutual exclusion, and the old unconditional remove broke it.
+    #[test]
+    fn test_lock_release_keeps_other_holders_file() {
+        let tmp = std::env::temp_dir().join(format!("oot-lock-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+        let lock_path = store.path().join("lock");
+
+        let lock = store.lock().expect("uncontended lock must succeed");
+        // Simulate displacement: the path now records a different pid.
+        std::fs::write(&lock_path, "1\n").unwrap();
+        drop(lock);
+        assert!(
+            lock_path.exists(),
+            "drop must not remove another holder's lock"
+        );
+        assert_eq!(read_lock_pid(&lock_path), Some(1));
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

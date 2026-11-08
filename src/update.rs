@@ -16,6 +16,9 @@ pub fn run(
 ) -> anyhow::Result<std::process::ExitCode> {
     let root = std::env::current_dir()?;
     let store = Store::open(&root)?;
+    // Materializing mutates the working copy and the store's HEAD: hold
+    // the lock across it. A dry run only reads, so it stays unlocked.
+    let _lock = if dry_run { None } else { Some(store.lock()?) };
 
     // Resolve target tree.
     let is_change_target = change.is_some();
