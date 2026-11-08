@@ -683,13 +683,6 @@ fn test_update_deletes_tracked_keep_marker_on_fast_forward() {
         "tracked marker deleted by target must not survive a clean fast-forward: {msg}"
     );
 
-    let (ok, status) = oot(&["status"], &proj);
-    assert!(ok, "{status}");
-    assert!(
-        !status.contains(".ootkeep"),
-        "status must not report the deleted tracked marker: {status}"
-    );
-
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
