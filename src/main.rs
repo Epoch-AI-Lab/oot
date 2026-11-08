@@ -1258,9 +1258,15 @@ fn is_git_ignored(root: &std::path::Path, path: &str) -> bool {
                 let _ = writeln!(stdin, "{path}");
             }
             drop(c.stdin.take());
-            c.wait().map(|s| s.success()).unwrap_or(false)
+            match c.wait() {
+                // Fail closed: only git's exit code 1 means "not ignored".
+                // Exit 0 is ignored; any other outcome (128, signal,
+                // wait error) must hide the path, never record it.
+                Ok(status) => !matches!(status.code(), Some(1)),
+                Err(_) => true,
+            }
         }
-        Err(_) => false,
+        Err(_) => true,
     }
 }
 
@@ -1381,5 +1387,35 @@ mod tests {
         assert!(wildcard_match("*bar", "foobar"));
         assert!(!wildcard_match("*.log", "a.txt"));
         assert!(!wildcard_match("foo*", "barfoo"));
+    }
+
+    #[test]
+    fn test_is_git_ignored_fails_closed_on_git_error() {
+        // `git check-ignore` exits 0 when ignored, 1 when not ignored, and
+        // 128 on errors like "not a git repository". Every non-1 outcome
+        // must read as ignored so a git failure can never make a
+        // `.gitignore`d file recordable (X-10).
+        let base = std::env::temp_dir().join(format!("oot-checkignore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+
+        // No .git here: git errors with exit 128, which fails closed.
+        let norepo = base.join("norepo");
+        std::fs::create_dir_all(&norepo).unwrap();
+        assert!(is_git_ignored(&norepo, "secrets/key.pem"));
+
+        // Real repo: exit 0 (ignored) and exit 1 (not ignored) stay exact.
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let init = Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init should run");
+        assert!(init.status.success());
+        std::fs::write(repo.join(".gitignore"), "*.log\n").unwrap();
+        assert!(is_git_ignored(&repo, "junk.log"));
+        assert!(!is_git_ignored(&repo, "src/main.rs"));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
