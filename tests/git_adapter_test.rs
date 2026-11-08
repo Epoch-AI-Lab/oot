@@ -204,6 +204,7 @@ fn test_git_adapter_3way_semantic_conflict() {
         custom_merge_base: None,
         change_name: Some("auth-3way".into()),
         intent: Some("refactor target_fn".into()),
+        authors: None,
     };
 
     let docket = adapter
