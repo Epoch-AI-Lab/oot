@@ -19,10 +19,10 @@ pub fn run(
 
     // Resolve target tree.
     let is_change_target = change.is_some();
-    let (target_tree, target_desc) = if let Some(c) = change {
+    let (target_tree, target_desc, target_branch) = if let Some(c) = change {
         let id = store.resolve_change(&c)?;
         let rec = store.get_change(&id)?;
-        (rec.tree, format!("change {}", &id[..7.min(id.len())]))
+        (rec.tree, format!("change {}", &id[..7.min(id.len())]), None)
     } else {
         let b = crate::resolve_branch(&store, branch.clone())?;
         let hid = store
@@ -32,14 +32,19 @@ pub fn run(
         (
             rec.tree,
             format!("branch {b} @ {}", &hid[..7.min(hid.len())]),
+            Some(b),
         )
     };
 
-    // Current head for dirty check — infer current branch if store has a unique single
-    // branch. For multi-branch stores without explicit current branch tracking, current_tree
-    // is empty so uncommitted work is safely protected via 3-way merge conflict handling.
+    // Current head for dirty check — prefer .oot/HEAD (set by record/update), fall back
+    // to single-branch inference. Multi-branch stores with no HEAD and dirty work cannot
+    // safely 3-way merge without a base; bail loudly instead of fabricating an empty base.
     let (current_branch_opt, current_tree) = {
-        let inferred_branch = crate::resolve_branch(&store, None).ok();
+        let inferred_branch = store
+            .get_head_branch()
+            .ok()
+            .flatten()
+            .or_else(|| crate::resolve_branch(&store, None).ok());
         let inferred_tree = match &inferred_branch {
             Some(b) => store
                 .head_id(b)
@@ -101,6 +106,9 @@ pub fn run(
             println!("would update to {target_desc}: already up to date");
             return Ok(std::process::ExitCode::SUCCESS);
         }
+        if let Some(b) = &target_branch {
+            store.set_head_branch(b)?;
+        }
         println!("already up to date");
         return Ok(std::process::ExitCode::SUCCESS);
     }
@@ -112,6 +120,12 @@ pub fn run(
     //   No data loss, keep work changes where target didn't touch the same path.
     //   Conflicts keep work and warn.
     let needs_merge = dirty && !work_is_clean && !force;
+    if needs_merge && current_branch_opt.is_none() {
+        anyhow::bail!(
+            "cannot determine current branch for 3-way merge in a multi-branch store; \
+             set .oot/HEAD or use --force to overwrite work"
+        );
+    }
 
     if dry_run {
         if needs_merge {
@@ -163,6 +177,7 @@ pub fn run(
             &snapshot,
             &target_desc,
             &files,
+            target_branch.as_deref(),
         );
     }
 
@@ -373,7 +388,7 @@ fn dry_run_merge(
 #[allow(clippy::too_many_arguments)]
 fn materialize_merge(
     root: &Path,
-    _store: &Store,
+    store: &Store,
     work: &std::collections::HashMap<String, (String, bool)>,
     head_filtered: &std::collections::HashMap<String, (String, bool)>,
     target_filtered: &std::collections::HashMap<String, (String, bool)>,
@@ -381,6 +396,7 @@ fn materialize_merge(
     snapshot: &oot::change::Snapshot,
     target_desc: &str,
     _work_files: &[oot::store::WorkFile],
+    target_branch: Option<&str>,
 ) -> anyhow::Result<std::process::ExitCode> {
     use std::collections::HashSet;
     // Build quick lookup for work files that are keep-work: we just leave them.
@@ -544,6 +560,9 @@ fn materialize_merge(
             conflicts.join(", ")
         );
         eprintln!("hint: `oot record -m \"wip before {target_desc}\"` to save work, then resolve");
+    }
+    if let Some(b) = target_branch {
+        store.set_head_branch(b)?;
     }
     // Report kept work
     let kept_count = work_keep_set.len();
