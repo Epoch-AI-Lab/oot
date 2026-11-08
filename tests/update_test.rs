@@ -690,9 +690,12 @@ fn test_update_keep_marker_exact_vs_suffix() {
     std::fs::create_dir_all(&proj).unwrap();
     assert!(oot(&["init"], &proj).0);
 
-    // First tree has NEITHER marker; second adds both the exact marker and
-    // a suffix lookalike. A clean update back to first must therefore guard
-    // only the exact `.ootkeep` — the suffix file must be deleted.
+    // First tree has NEITHER marker; second adds both the exact marker and a
+    // suffix lookalike (both tracked). UPDATE-08: a tracked marker deleted by
+    // the target follows the target like any other file, so a clean
+    // fast-forward back to first removes logs/.ootkeep. The suffix file
+    // doc.ootkeep is not a keep marker (is_keep_marker matches exact basenames
+    // .ootkeep/.oothave only) and must also be deleted.
     std::fs::write(proj.join("a.txt"), "v1\n").unwrap();
     let (ok, msg) = oot(&["record", "-m", "first"], &proj);
     assert!(ok, "{msg}");
@@ -713,25 +716,18 @@ fn test_update_keep_marker_exact_vs_suffix() {
         .next()
         .unwrap();
 
-    // Clean fast-forward without --force hits the keep-marker guard:
-    // work == head == second, target (first) lacks both files.
+    // Clean fast-forward without --force: work == head == second, target
+    // (first) lacks both files. Tracked markers follow the target (UPDATE-08);
+    // the suffix lookalike is not a keep marker.
     let (ok, msg) = oot(&["update", "--change", first_id], &proj);
     assert!(ok, "{msg}");
     assert!(
-        proj.join("logs/.ootkeep").exists(),
-        "exact .ootkeep must survive when target lacks it"
+        !proj.join("logs/.ootkeep").exists(),
+        "tracked .ootkeep deleted by target must not survive a clean fast-forward (UPDATE-08)"
     );
     assert!(
         !proj.join("doc.ootkeep").exists(),
-        "suffix doc.ootkeep must be deleted when not in target"
-    );
-
-    // --force disables the guard: the preserved marker must now be deleted.
-    let (ok, msg) = oot(&["update", "--change", first_id, "--force"], &proj);
-    assert!(ok, "{msg}");
-    assert!(
-        !proj.join("logs/.ootkeep").exists(),
-        "--force must delete the preserved marker"
+        "suffix doc.ootkeep is not a keep marker and must be deleted when not in target"
     );
 
     // Second project: neither tree contains the marker. A fresh untracked
