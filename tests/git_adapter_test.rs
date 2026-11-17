@@ -77,6 +77,41 @@ impl TempGitRepo {
         String::from_utf8(output.stdout).unwrap().trim().to_string()
     }
 
+    /// Commit only what is already staged. Unlike `commit`, this does not run
+    /// `git add .`, so a staged gitlink whose target is not checked out stays
+    /// in the index.
+    fn commit_staged(&self, msg: &str) -> String {
+        let status = Command::new("git")
+            .args(["commit", "-m", msg])
+            .current_dir(&self.path)
+            .status()
+            .expect("git commit failed");
+        assert!(status.success());
+
+        let output = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&self.path)
+            .output()
+            .expect("git rev-parse HEAD failed");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    /// Stage a gitlink at `rel_path` pointing at `target_sha`, which need not
+    /// be an object in this repository.
+    fn stage_gitlink(&self, rel_path: &str, target_sha: &str) {
+        let status = Command::new("git")
+            .args([
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{target_sha},{rel_path}"),
+            ])
+            .current_dir(&self.path)
+            .status()
+            .expect("git update-index failed");
+        assert!(status.success());
+    }
+
     fn create_and_checkout_branch(&self, branch: &str) {
         let status = Command::new("git")
             .args(["checkout", "-b", branch])
@@ -158,6 +193,32 @@ fn test_git_adapter_snapshot_extraction() {
     assert_eq!(
         snapshot.files.get("assets/blob.bin").unwrap(),
         &[0xFF, 0x00, 0x81]
+    );
+}
+
+#[test]
+fn test_gitlink_advance_changes_snapshot() {
+    let repo = TempGitRepo::new("gitlink_advance");
+    repo.write_file("file.txt", "hello\n");
+    repo.commit("initial commit with file");
+
+    let first_sha = "1111111111111111111111111111111111111111";
+    repo.stage_gitlink("sub", first_sha);
+    let c1 = repo.commit_staged("add gitlink");
+
+    let second_sha = "2222222222222222222222222222222222222222";
+    repo.stage_gitlink("sub", second_sha);
+    let c2 = repo.commit_staged("advance gitlink");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let before = adapter.extract_snapshot(&c1).expect("snapshot at c1");
+    let after = adapter.extract_snapshot(&c2).expect("snapshot at c2");
+
+    assert_eq!(before.files["sub"].as_slice(), first_sha.as_bytes());
+    assert_eq!(after.files["sub"].as_slice(), second_sha.as_bytes());
+    assert_ne!(
+        before.files, after.files,
+        "a commit that only advances a gitlink must produce a different snapshot"
     );
 }
 

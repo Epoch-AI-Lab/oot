@@ -170,25 +170,33 @@ impl GitAdapter {
                 )
             })?;
             let parts: Vec<&str> = meta.split_whitespace().collect();
-            if parts.len() >= 3 && parts[1] == "blob" {
+            if parts.len() >= 3 && (parts[1] == "blob" || parts[1] == "commit") {
                 // Include symlinks (mode 120000): their blob is the target path
                 // bytes. Skipping them hid symlink changes from visibility checks
                 // and 3-way adjudication (SEC-05, X-08).
+                // Gitlinks (mode 160000) have no blob to read; their tree "content"
+                // is the target commit sha. Use those bytes so advancing a pointer
+                // shows up as a change instead of an empty snapshot.
                 crate::store::validate_tree_path(path)?;
-                let blob_sha = parts[2];
-                let blob_output = Command::new("git")
-                    .args(["cat-file", "blob", blob_sha])
-                    .current_dir(&self.repo_root)
-                    .output()
-                    .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
+                let content = if parts[1] == "commit" {
+                    parts[2].as_bytes().to_vec()
+                } else {
+                    let blob_sha = parts[2];
+                    let blob_output = Command::new("git")
+                        .args(["cat-file", "blob", blob_sha])
+                        .current_dir(&self.repo_root)
+                        .output()
+                        .with_context(|| format!("Failed to fetch blob {blob_sha} for {path}"))?;
 
-                if !blob_output.status.success() {
-                    return Err(anyhow!(
-                        "Failed to read blob {blob_sha} for {path}: {}",
-                        String::from_utf8_lossy(&blob_output.stderr).trim()
-                    ));
-                }
-                files.insert(path.to_string(), blob_output.stdout);
+                    if !blob_output.status.success() {
+                        return Err(anyhow!(
+                            "Failed to read blob {blob_sha} for {path}: {}",
+                            String::from_utf8_lossy(&blob_output.stderr).trim()
+                        ));
+                    }
+                    blob_output.stdout
+                };
+                files.insert(path.to_string(), content);
             }
         }
 
