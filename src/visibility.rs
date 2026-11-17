@@ -339,14 +339,14 @@ pub fn parse_date_ymd(s: &str) -> Option<(i64, u32, u32)> {
     if parts.len() != 3 {
         return None;
     }
-    let p0: i64 = parts[0].parse().ok()?;
+    let p0: u32 = parts[0].parse().ok()?;
     let p1: u32 = parts[1].parse().ok()?;
-    let p2: i64 = parts[2].parse().ok()?;
+    let p2: u32 = parts[2].parse().ok()?;
 
     let (y, m, d) = if p0 >= 1000 {
-        (p0, p1, p2 as u32)
+        (i64::from(p0), p1, p2)
     } else if p2 >= 1000 {
-        (p2, p1, p0 as u32)
+        (i64::from(p2), p1, p0)
     } else {
         return None;
     };

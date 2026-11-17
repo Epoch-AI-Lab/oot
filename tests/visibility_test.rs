@@ -1,6 +1,6 @@
 use oot::change::{Change, Snapshot, Source};
 use oot::dispute::{Kind, Severity};
-use oot::visibility::VisibilityPolicy;
+use oot::visibility::{parse_date_ymd, VisibilityPolicy};
 use std::path::Path;
 
 #[test]
@@ -328,4 +328,30 @@ fn test_embargo_date_formats_and_validation() {
         embargo_recipients: vec![],
     }
     .is_under_embargo());
+}
+
+#[test]
+fn test_embargo_date_rejects_wrapping_components() {
+    // 2^32 + 1 used to wrap to 1 in the ISO day slot and get accepted.
+    assert_eq!(parse_date_ymd("2026-02-4294967297"), None);
+    // The same value in the day-first year slot used to load as an absurd year.
+    assert_eq!(parse_date_ymd("1-02-4294967297"), None);
+
+    let tmp = std::env::temp_dir().join(format!("oot-wrap-date-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    for bad in ["2026-02-4294967297", "1-02-4294967297"] {
+        let path = tmp.join("bad.toml");
+        std::fs::write(&path, format!("embargo_until = \"{bad}\"\n")).unwrap();
+        let err = VisibilityPolicy::load(&path).expect_err("wrapping date must fail to load");
+        assert!(
+            err.to_string().contains("invalid embargo_until"),
+            "expected invalid embargo_until error for '{bad}', got: {err}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&tmp);
+
+    // Valid dates in both forms, including a leap day, still parse.
+    assert_eq!(parse_date_ymd("2024-02-29"), Some((2024, 2, 29)));
+    assert_eq!(parse_date_ymd("01-03-2099"), Some((2099, 3, 1)));
 }
