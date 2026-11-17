@@ -143,6 +143,28 @@ fn test_docket_save_and_load_toml_file() {
 }
 
 #[test]
+fn test_docket_save_with_long_file_name() {
+    let original = sample_docket();
+    let dir = std::env::temp_dir().join(format!("oot_docket_longname_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // 230 a's plus ".json" is 235 bytes: legal for the target, but the old
+    // temp name added ~30 bytes and overflowed NAME_MAX.
+    let file_path = dir.join(format!("{}.json", "a".repeat(230)));
+
+    docket::save(&original, &file_path).expect("save with long file name failed");
+    assert!(file_path.exists(), "docket file was not created");
+
+    let loaded = docket::load(&file_path).expect("load failed");
+    assert_eq!(loaded.change, original.change);
+    assert_eq!(loaded.verdict, original.verdict);
+    assert_eq!(loaded.intent, original.intent);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_docket_load_from_example_fixture() {
     let fixture_path = Path::new("fixtures/example.json");
     let docket = docket::load(fixture_path).expect("Failed to load fixtures/example.json");

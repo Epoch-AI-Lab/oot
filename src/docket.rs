@@ -37,11 +37,18 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "docket".to_string());
+    // Truncate the name so a target near NAME_MAX cannot overflow the temp
+    // name; floor to a char boundary to avoid slicing into a multi-byte char.
+    let name_part = if file_name.len() > 128 {
+        &file_name[..file_name.floor_char_boundary(128)]
+    } else {
+        &file_name
+    };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()));
+    let tmp = dir.join(format!(".{name_part}.tmp-{}-{nanos}", std::process::id()));
 
     let write_result = (|| -> anyhow::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
