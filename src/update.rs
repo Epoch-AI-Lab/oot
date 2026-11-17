@@ -600,14 +600,9 @@ fn check_untracked_overwrite(full: &Path, path: &str, contents: &[u8]) -> Result
     let meta = std::fs::symlink_metadata(full)
         .with_context(|| format!("failed to inspect existing path '{path}' before update"))?;
     let file_type = meta.file_type();
-    if file_type.is_dir() {
-        anyhow::bail!(
-            "cannot overwrite existing directory '{path}' with a file during update; remove it or pass --force"
-        );
-    }
     // read() below follows symlinks, so classify the target, not the link. A
     // link to a FIFO would block that read forever and a link to a device never
-    // yields file bytes. A dangling link surfaces as an inspect error.
+    // yields file bytes.
     let effective_type = if file_type.is_symlink() {
         std::fs::metadata(full)
             .with_context(|| format!("failed to inspect existing path '{path}' before update"))?
@@ -615,6 +610,13 @@ fn check_untracked_overwrite(full: &Path, path: &str, contents: &[u8]) -> Result
     } else {
         file_type
     };
+    // A symlink can point at a directory, which lstat above cannot see. Report
+    // it as a directory rather than as a FIFO.
+    if effective_type.is_dir() {
+        anyhow::bail!(
+            "cannot overwrite existing directory '{path}' with a file during update; remove it or pass --force"
+        );
+    }
     // A FIFO blocks forever and a device/socket never yields file bytes.
     if !effective_type.is_file() {
         anyhow::bail!(
