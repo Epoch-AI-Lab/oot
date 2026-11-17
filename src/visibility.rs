@@ -88,12 +88,31 @@ impl VisibilityPolicy {
     }
 }
 
+/// Separator between list items in the canonical form. Kept as-is so the
+/// rest of `canonical_fields()` and every other field's encoding are unchanged.
+const CANON_SEPARATOR: char = '\u{1f}';
+/// Escape marker used inside an item so the separator can be escaped. Chosen
+/// because it is a control char that does not occur in real paths, branches,
+/// recipients, or dates, so ordinary policies keep their existing fingerprint.
+const CANON_ESCAPE: char = '\u{1e}';
+
+/// Append a list to the canonical form, escaping the separator inside items.
+///
+/// Without escaping, `["a", "b"]` and `["a<US>b"]` (`US` = `CANON_SEPARATOR`)
+/// serialize identically, so two different policies share an `audit_key`.
+/// Escaping both the separator and the escape marker makes the encoding
+/// injective while leaving items that contain neither byte-for-byte unchanged.
 fn push_canonical_list(out: &mut String, items: &[String]) {
     let mut sorted = items.to_vec();
     sorted.sort();
     for item in sorted {
-        out.push_str(&item);
-        out.push('\u{1f}');
+        for ch in item.chars() {
+            if ch == CANON_SEPARATOR || ch == CANON_ESCAPE {
+                out.push(CANON_ESCAPE);
+            }
+            out.push(ch);
+        }
+        out.push(CANON_SEPARATOR);
     }
 }
 

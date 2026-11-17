@@ -355,3 +355,62 @@ fn test_embargo_date_rejects_wrapping_components() {
     assert_eq!(parse_date_ymd("2024-02-29"), Some((2024, 2, 29)));
     assert_eq!(parse_date_ymd("01-03-2099"), Some((2099, 3, 1)));
 }
+
+// Regression (V16): `\u{1f}` is the canonical list separator. An item that
+// contains it used to collide with two separate items, giving both policies
+// the same audit_key. Escaping the separator inside items must break the tie.
+#[test]
+fn test_visibility_fingerprint_separator_collision_is_injective() {
+    let dir = std::env::temp_dir().join(format!(
+        "oot_visibility_sep_collision_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let two_items = dir.join("two_items.toml");
+    let one_embedded_item = dir.join("one_embedded_item.toml");
+    std::fs::write(&two_items, "private_paths = [\"a\", \"b\"]\n").unwrap();
+    // TOML \u001F escape loads the unit separator into a single item.
+    std::fs::write(&one_embedded_item, "private_paths = [\"a\\u001Fb\"]\n").unwrap();
+
+    let a = VisibilityPolicy::load(&two_items).expect("two-item policy must load");
+    let b =
+        VisibilityPolicy::load(&one_embedded_item).expect("embedded-separator policy must load");
+    assert_eq!(a.private_paths, vec!["a", "b"]);
+    assert_eq!(b.private_paths, vec!["a\u{1f}b"]);
+
+    eprintln!("two-item canonical: {:?}", a.canonical_fields());
+    eprintln!("two-item audit_key: {}", a.audit_key());
+    eprintln!("embedded canonical: {:?}", b.canonical_fields());
+    eprintln!("embedded audit_key: {}", b.audit_key());
+
+    assert_ne!(a.canonical_fields(), b.canonical_fields());
+    assert_ne!(a.audit_key(), b.audit_key());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// Ordinary policies keep their old fingerprint. This pins the canonical
+// encoding so a future change cannot silently move every audit_key (and wipe
+// every export cache) without someone updating these expected values.
+#[test]
+fn test_visibility_fingerprint_stable_for_ordinary_lists() {
+    let default_policy = VisibilityPolicy::default();
+    assert_eq!(
+        default_policy.canonical_fields(),
+        "embargo_until=;resign_key_id=;private_paths=.env\u{1f}secrets/\u{1f};private_branches=;embargo_recipients="
+    );
+    assert_eq!(default_policy.audit_key(), "95b1eab997115f3f");
+
+    let full = VisibilityPolicy {
+        private_paths: vec!["secrets/".into(), ".env".into()],
+        embargo_until: Some("2027-09-01".into()),
+        private_branches: vec!["internal-audit".into()],
+        resign_key_id: Some("KEY1".into()),
+        embargo_recipients: vec!["alice@example.com".into()],
+    };
+    assert_eq!(full.audit_key(), "ab0bf5b5d3376f1e");
+}
