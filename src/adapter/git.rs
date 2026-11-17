@@ -6,7 +6,7 @@ use crate::engine::Engine;
 use crate::policy::MeaningPolicy;
 use crate::visibility::VisibilityPolicy;
 use anyhow::{anyhow, Context, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -137,6 +137,13 @@ impl GitAdapter {
 
     /// Extract an in-memory `Snapshot` directly from Git object storage without touching the working tree.
     pub fn extract_snapshot(&self, rev: &str) -> Result<Snapshot> {
+        Ok(self.extract_snapshot_inner(rev)?.0)
+    }
+
+    /// Same extraction, but also returns the paths that are gitlinks (mode
+    /// 160000). Their "content" is a commit sha, not source, so the structural
+    /// engine must never parse it as code.
+    fn extract_snapshot_inner(&self, rev: &str) -> Result<(Snapshot, HashSet<String>)> {
         let output = Command::new("git")
             .args(["ls-tree", "-r", "-z", "--", rev])
             .current_dir(&self.repo_root)
@@ -152,6 +159,7 @@ impl GitAdapter {
 
         let raw = output.stdout;
         let mut files = HashMap::new();
+        let mut gitlinks = HashSet::new();
 
         // `git ls-tree -r -z` emits null-terminated records: "<mode> <type> <sha>\t<path>\0"
         for entry in raw.split(|&b| b == 0) {
@@ -179,6 +187,7 @@ impl GitAdapter {
                 // shows up as a change instead of an empty snapshot.
                 crate::store::validate_tree_path(path)?;
                 let content = if parts[1] == "commit" {
+                    gitlinks.insert(path.to_string());
                     parts[2].as_bytes().to_vec()
                 } else {
                     let blob_sha = parts[2];
@@ -200,7 +209,7 @@ impl GitAdapter {
             }
         }
 
-        Ok(Snapshot { files })
+        Ok((Snapshot { files }, gitlinks))
     }
 
     /// Adjudicate a 3-way Git merge between `base_ref` and `head_ref`.
@@ -225,9 +234,9 @@ impl GitAdapter {
             None => self.merge_base(&base_sha, &head_sha)?,
         };
 
-        let mb_snapshot = self.extract_snapshot(&merge_base_sha)?;
-        let base_snapshot = self.extract_snapshot(&base_sha)?;
-        let head_snapshot = self.extract_snapshot(&head_sha)?;
+        let (mb_snapshot, mb_gitlinks) = self.extract_snapshot_inner(&merge_base_sha)?;
+        let (base_snapshot, base_gitlinks) = self.extract_snapshot_inner(&base_sha)?;
+        let (head_snapshot, head_gitlinks) = self.extract_snapshot_inner(&head_sha)?;
 
         let mut authors = if let Some(explicit) = options.authors.clone() {
             let mut normalized = explicit;
@@ -257,7 +266,23 @@ impl GitAdapter {
             intent: options.intent.clone(),
         };
 
-        let mut disputes = engine.diff_3way(&mb_snapshot, &base_snapshot, &head_snapshot)?;
+        // A gitlink's content is a commit sha, not source. At a source-looking
+        // path (e.g. deps/lib.rs) the engine would parse that sha as code and
+        // raise a bogus content dispute on a pointer bump. Hand the engine
+        // snapshots with gitlink entries removed; the full snapshots below
+        // still reach finalize_adjudication, so the path stays in the intent.
+        fn without_gitlinks(snap: &Snapshot, gitlinks: &HashSet<String>) -> Snapshot {
+            let mut out = snap.clone();
+            for path in gitlinks {
+                out.files.remove(path);
+            }
+            out
+        }
+        let mut disputes = engine.diff_3way(
+            &without_gitlinks(&mb_snapshot, &mb_gitlinks),
+            &without_gitlinks(&base_snapshot, &base_gitlinks),
+            &without_gitlinks(&head_snapshot, &head_gitlinks),
+        )?;
         let vis_disputes = visibility_policy.check(&change);
         let cloaked = vis_disputes
             .iter()

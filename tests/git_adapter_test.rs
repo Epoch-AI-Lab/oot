@@ -216,10 +216,52 @@ fn test_gitlink_advance_changes_snapshot() {
 
     assert_eq!(before.files["sub"].as_slice(), first_sha.as_bytes());
     assert_eq!(after.files["sub"].as_slice(), second_sha.as_bytes());
+    assert_eq!(before.files["file.txt"].as_slice(), b"hello\n");
+    assert_eq!(after.files["file.txt"].as_slice(), b"hello\n");
     assert_ne!(
         before.files, after.files,
         "a commit that only advances a gitlink must produce a different snapshot"
     );
+}
+
+#[test]
+fn test_gitlink_at_source_path_raises_no_content_dispute() {
+    let repo = TempGitRepo::new("gitlink_source_path");
+    repo.write_file("src/lib.rs", "pub fn ok() {}\n");
+    repo.commit("initial");
+
+    let sha_a = "1111111111111111111111111111111111111111";
+    repo.stage_gitlink("deps/lib.rs", sha_a);
+    repo.commit_staged("add gitlink at source-looking path");
+
+    repo.create_and_checkout_branch("feature/gitlink");
+    let sha_b = "2222222222222222222222222222222222222222";
+    repo.stage_gitlink("deps/lib.rs", sha_b);
+    repo.commit_staged("advance gitlink");
+
+    let adapter = GitAdapter::new(&repo.path).expect("valid git repo");
+    let engine = Engine::new().expect("valid engine");
+    let docket = adapter
+        .adjudicate_3way(
+            "main",
+            "feature/gitlink",
+            &engine,
+            &MeaningPolicy::default(),
+            &VisibilityPolicy::default(),
+            &GitAdjudicateOptions::default(),
+        )
+        .expect("adjudicate 3way");
+
+    assert!(
+        !docket
+            .disputes
+            .iter()
+            .any(|d| d.detail.contains("file content modified")
+                || d.detail.contains("modified file content")),
+        "a gitlink pointer bump at a source path must not raise a content dispute: {:?}",
+        docket.disputes
+    );
+    assert_eq!(docket.intent, "deps/lib.rs");
 }
 
 #[test]

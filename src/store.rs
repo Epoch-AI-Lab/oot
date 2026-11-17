@@ -644,7 +644,7 @@ impl Store {
     /// Rebuild a [`Snapshot`] from a tree in the store's odb: `ls-tree -r -z`
     /// lists the blobs, `read_blob` fetches each one. Gitlinks (submodules)
     /// are skipped — they point at other commits rather than hold content,
-    /// so there is nothing to adjudicate.
+    /// so there is nothing to adjudicate; Oot's own trees never hold gitlinks, unlike the git adapter's snapshots.
     pub fn snapshot_from_tree(&self, tree: &str) -> Result<Snapshot> {
         let listed = Command::new("git")
             .args(["--git-dir"])
