@@ -252,3 +252,49 @@ fn test_gc_preserves_unexpired_odb_objects_and_allows_resurrection() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn test_gc_index_rewrite_refuses_symlinked_temp() {
+    let tmp = std::env::temp_dir().join(format!("oot-gc-symlink-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    assert!(oot(&["init"], &tmp).0);
+
+    // One live change, then one orphan for gc to prune and trigger the rewrite.
+    std::fs::write(tmp.join("file1.txt"), "v1\n").unwrap();
+    let (_, msg) = oot(&["record", "-m", "c1"], &tmp);
+    let c1 = extract_id(&msg);
+
+    std::fs::write(tmp.join("file2.txt"), "v2\n").unwrap();
+    let (_, msg) = oot(&["record", "-m", "c2"], &tmp);
+    let c2 = extract_id(&msg);
+
+    std::fs::write(tmp.join(".oot/refs/main"), format!("{c1}\n")).unwrap();
+
+    // Plant a symlink at the fixed temp path pointing at a file we care about.
+    let victim = tmp.join("victim.txt");
+    std::fs::write(&victim, "do not clobber me\n").unwrap();
+    std::os::unix::fs::symlink(&victim, tmp.join(".oot/.index.tmp")).unwrap();
+
+    let (ok, out) = oot(&["gc", "--force"], &tmp);
+    assert!(ok, "gc force failed: {out}");
+
+    assert_eq!(
+        std::fs::read_to_string(&victim).unwrap(),
+        "do not clobber me\n",
+        "gc must not write through a symlinked index temp"
+    );
+
+    let meta = std::fs::symlink_metadata(tmp.join(".oot/.index")).unwrap();
+    assert!(
+        meta.is_file(),
+        ".oot/.index must be a regular file after gc"
+    );
+
+    let index = std::fs::read_to_string(tmp.join(".oot/.index")).unwrap();
+    assert!(index.contains(&c1), ".index lost the live change");
+    assert!(!index.contains(&c2), ".index kept the pruned change");
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}

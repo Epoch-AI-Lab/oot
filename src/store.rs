@@ -2652,14 +2652,55 @@ impl Store {
                     .into_iter()
                     .filter(|id| changes_dir.join(format!("{id}.json")).exists())
                     .collect();
-                let tmp_index = self.root.join(".index.tmp");
                 let mut content = String::new();
                 for id in kept_ordered {
                     content.push_str(&id);
                     content.push('\n');
                 }
-                std::fs::write(&tmp_index, content)?;
-                std::fs::rename(tmp_index, self.root.join(".index"))?;
+                let index_path = self.root.join(".index");
+                let tmp_index = self.root.join(".index.tmp");
+                // A link at the final path must not be written through.
+                refuse_symlink(&index_path, "store index")?;
+                // Clear any stale temp, including a planted symlink. unlink
+                // removes the link itself, not its target. create_new plus
+                // O_NOFOLLOW below cover a link swapped in before open.
+                match std::fs::remove_file(&tmp_index) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(e).with_context(|| {
+                            format!("failed to clear index temp {}", tmp_index.display())
+                        });
+                    }
+                }
+                let write_res = (|| -> Result<()> {
+                    use std::io::Write;
+                    let mut opts = std::fs::OpenOptions::new();
+                    opts.write(true).create_new(true);
+                    #[cfg(target_os = "linux")]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        opts.custom_flags(0o400000); // O_NOFOLLOW
+                    }
+                    let mut f = opts.open(&tmp_index).with_context(|| {
+                        format!("failed to create index temp file {}", tmp_index.display())
+                    })?;
+                    f.write_all(content.as_bytes()).with_context(|| {
+                        format!("failed to write index temp file {}", tmp_index.display())
+                    })?;
+                    Ok(())
+                })();
+                if let Err(e) = write_res {
+                    let _ = std::fs::remove_file(&tmp_index);
+                    return Err(e);
+                }
+                std::fs::rename(&tmp_index, &index_path).with_context(|| {
+                    format!(
+                        "failed to rename {} -> {}",
+                        tmp_index.display(),
+                        index_path.display()
+                    )
+                })?;
             }
         }
 
