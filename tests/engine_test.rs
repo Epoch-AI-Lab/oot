@@ -1276,6 +1276,62 @@ fn test_engine_whitespace_only_change_is_silent() {
 }
 
 #[test]
+fn test_engine_whitespace_in_literal_is_disputed() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"hello world\";\n".as_bytes().to_vec(),
+    );
+
+    // Only the space inside the string literal changed.
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"helloworld\";\n".as_bytes().to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "literal edit must dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
+#[test]
+fn test_engine_whitespace_outside_literal_is_silent() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"hello world\";\n".as_bytes().to_vec(),
+    );
+
+    // Reindent and respace the code; the literal stays byte-identical.
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "   const   greeting=\"hello world\" ;  \n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes.is_empty(),
+        "formatting churn outside literals must not dispute: {:?}",
+        disputes
+    );
+}
+
+#[test]
 fn test_engine_function_edit_plus_injection_flags_both() {
     let engine = Engine::new().expect("Failed to initialize engine");
 

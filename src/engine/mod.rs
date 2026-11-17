@@ -639,11 +639,86 @@ fn squash_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Like [`squash_ws`], but preserves whitespace inside string/char/template
+/// literals and comments while dropping it in code. Top-level comparison
+/// needs this: an edit to `"hello world"` is a real change, not formatting
+/// churn, so that whitespace must survive into the compared text. Tracks the
+/// delimiters used by the languages in [`crate::engine::language`]: `'` `"`
+/// and backtick strings, `//` and `#` line comments, and `/* */` blocks.
+fn squash_ws_keep_literals(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            out.push(c);
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                out.push('*');
+                out.push('/');
+                in_block_comment = false;
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                // A backslash escapes the next char inside the literal.
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else {
+                if c == q {
+                    quote = None;
+                }
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                out.push('/');
+                out.push('/');
+                in_line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push('/');
+                out.push('*');
+                in_block_comment = true;
+            }
+            '#' => {
+                out.push(c);
+                in_line_comment = true;
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            _ if !c.is_whitespace() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether top-level (non-function) content differs between two snapshots.
-/// Under the size cap this blanks defs and ignores whitespace. Oversize
-/// files skip AST extraction, so their def maps are empty anyway; fall back
-/// to a plain byte comparison instead of allocating blanked and squashed
-/// copies several times the file size.
+/// Under the size cap this blanks defs and ignores whitespace outside of
+/// literals and comments. Oversize files skip AST extraction, so their def
+/// maps are empty anyway; fall back to a plain byte comparison instead of
+/// allocating blanked and squashed copies several times the file size.
 fn top_level_changed(
     base: &str,
     base_fns: &FunctionMap,
@@ -653,7 +728,8 @@ fn top_level_changed(
     if base.len() > MAX_AST_PARSE_SIZE_BYTES || head.len() > MAX_AST_PARSE_SIZE_BYTES {
         return base != head;
     }
-    squash_ws(&without_defs(base, base_fns)) != squash_ws(&without_defs(head, head_fns))
+    squash_ws_keep_literals(&without_defs(base, base_fns))
+        != squash_ws_keep_literals(&without_defs(head, head_fns))
 }
 
 /// Align two def lists for one name: identical source text pairs first
