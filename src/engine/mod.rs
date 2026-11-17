@@ -155,7 +155,7 @@ impl Engine {
                     // top-level injection hiding beside a function edit still
                     // gets its own dispute, while whitespace-only churn and
                     // pure function-body edits stay silent here.
-                    let top_changed = top_level_changed(&b, &base_fns, &h, &head_fns);
+                    let top_changed = top_level_changed(&b, &base_fns, &h, &head_fns, config.name);
                     if top_changed {
                         disputes.push(meaning(
                             &mut n,
@@ -515,7 +515,8 @@ impl Engine {
                     // trusted target side, so ours-only drift stays silent,
                     // and identical changes on both sides count as converged.
                     if t_src != b_src && o_src != t_src {
-                        let top_changed = top_level_changed(&b_src, &b_fns, &t_src, &t_fns);
+                        let top_changed =
+                            top_level_changed(&b_src, &b_fns, &t_src, &t_fns, config.name);
                         if top_changed {
                             disputes.push(meaning(
                                 &mut n,
@@ -639,21 +640,123 @@ fn squash_ws(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// Like [`squash_ws`], but preserves whitespace inside string/char/template
+/// literals and comments while dropping it in code. Top-level comparison
+/// needs this: an edit to `"hello world"` is a real change, not formatting
+/// churn, so that whitespace must survive into the compared text.
+///
+/// Delimiters are language-specific. `#` opens a line comment only in Python;
+/// elsewhere it is ordinary code (a Rust attribute, a JS private field). `'`
+/// opens a string everywhere except Rust, where it is only a char literal
+/// `'x'` and is otherwise a lifetime (`'a`) or label. Also tracks `"` and
+/// backtick strings, `//` line comments, and `/* */` blocks.
+fn squash_ws_keep_literals(s: &str, lang: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let python_comments = lang == "python";
+    let rust_chars = lang == "rust";
+
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            out.push(c);
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && chars.peek() == Some(&'/') {
+                chars.next();
+                out.push('*');
+                out.push('/');
+                in_block_comment = false;
+            } else {
+                out.push(c);
+            }
+            continue;
+        }
+        if let Some(q) = quote {
+            if c == '\\' {
+                // A backslash escapes the next char inside the literal.
+                out.push(c);
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else {
+                if c == q {
+                    quote = None;
+                }
+                out.push(c);
+            }
+            continue;
+        }
+        match c {
+            '/' if chars.peek() == Some(&'/') => {
+                chars.next();
+                out.push('/');
+                out.push('/');
+                in_line_comment = true;
+            }
+            '/' if chars.peek() == Some(&'*') => {
+                chars.next();
+                out.push('/');
+                out.push('*');
+                in_block_comment = true;
+            }
+            '#' if python_comments => {
+                out.push(c);
+                in_line_comment = true;
+            }
+            '\'' if rust_chars => {
+                // A Rust `'` opens a char literal only when another `'` closes
+                // it right away (`'x'` or `'\n'`). Otherwise it is a lifetime
+                // or label and must stay plain code, so reformatting around
+                // `&'a str` stays whitespace-insensitive.
+                let mut look = chars.clone();
+                let is_char = match look.next() {
+                    Some('\\') => {
+                        look.next();
+                        look.peek() == Some(&'\'')
+                    }
+                    Some(_) => look.peek() == Some(&'\''),
+                    None => false,
+                };
+                if is_char {
+                    quote = Some(c);
+                }
+                out.push(c);
+            }
+            '\'' | '"' | '`' => {
+                quote = Some(c);
+                out.push(c);
+            }
+            _ if !c.is_whitespace() => out.push(c),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Whether top-level (non-function) content differs between two snapshots.
-/// Under the size cap this blanks defs and ignores whitespace. Oversize
-/// files skip AST extraction, so their def maps are empty anyway; fall back
-/// to a plain byte comparison instead of allocating blanked and squashed
-/// copies several times the file size.
+/// Under the size cap this blanks defs and ignores whitespace outside of
+/// literals and comments. Oversize files skip AST extraction, so their def
+/// maps are empty anyway; fall back to a plain byte comparison instead of
+/// allocating blanked and squashed copies several times the file size.
 fn top_level_changed(
     base: &str,
     base_fns: &FunctionMap,
     head: &str,
     head_fns: &FunctionMap,
+    lang: &str,
 ) -> bool {
     if base.len() > MAX_AST_PARSE_SIZE_BYTES || head.len() > MAX_AST_PARSE_SIZE_BYTES {
         return base != head;
     }
-    squash_ws(&without_defs(base, base_fns)) != squash_ws(&without_defs(head, head_fns))
+    squash_ws_keep_literals(&without_defs(base, base_fns), lang)
+        != squash_ws_keep_literals(&without_defs(head, head_fns), lang)
 }
 
 /// Align two def lists for one name: identical source text pairs first
@@ -2130,8 +2233,14 @@ mod tests {
         let big = "x".repeat(MAX_AST_PARSE_SIZE_BYTES + 16);
         let empty = FunctionMap::new();
 
-        assert!(!top_level_changed(&big, &empty, &big, &empty));
-        assert!(top_level_changed(&big, &empty, &format!("{big} "), &empty));
+        assert!(!top_level_changed(&big, &empty, &big, &empty, "rust"));
+        assert!(top_level_changed(
+            &big,
+            &empty,
+            &format!("{big} "),
+            &empty,
+            "rust"
+        ));
 
         // Same fallback through the public 2-way diff: identical oversize
         // files stay silent, a changed oversize file is reported.
