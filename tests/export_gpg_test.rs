@@ -289,6 +289,15 @@ fn test_filtered_export_preserves_signed_empty_commit() {
     );
     git(&src, &["update-ref", "refs/heads/main", &signed_empty]);
 
+    // Put a commit that touches the private path on a side branch. Export
+    // withholds it and creates .oot/export-log.jsonl, but main stays at the
+    // clean signed empty commit so its identity and signature survive.
+    git(&src, &["checkout", "--quiet", "-b", "withhold"]);
+    std::fs::write(src.join(".env"), "SECRET=supersecret\n").unwrap();
+    git(&src, &["add", "."]);
+    git(&src, &["commit", "--quiet", "-m", "add env"]);
+    git(&src, &["checkout", "--quiet", "main"]);
+
     std::fs::write(
         proj.join("visibility.toml"),
         "private_paths = [\".env\"]\nprivate_branches = []\n",
@@ -314,7 +323,7 @@ fn test_filtered_export_preserves_signed_empty_commit() {
         "signed empty payload altered"
     );
 
-    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap_or_default();
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
     assert!(
         !log.contains("empty after private-path stripping"),
         "clean signed empty must not be logged as stripped: {log}"
