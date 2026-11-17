@@ -314,7 +314,7 @@ fn test_filtered_export_preserves_signed_empty_commit() {
         "signed empty payload altered"
     );
 
-    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap_or_default();
+    let log = std::fs::read_to_string(proj.join(".oot/export-log.jsonl")).unwrap();
     assert!(
         !log.contains("empty after private-path stripping"),
         "clean signed empty must not be logged as stripped: {log}"
