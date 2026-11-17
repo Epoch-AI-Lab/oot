@@ -599,9 +599,17 @@ fn check_untracked_overwrite(full: &Path, path: &str, contents: &[u8]) -> Result
     }
     let meta = std::fs::symlink_metadata(full)
         .with_context(|| format!("failed to inspect existing path '{path}' before update"))?;
-    if meta.file_type().is_dir() {
+    let file_type = meta.file_type();
+    if file_type.is_dir() {
         anyhow::bail!(
             "cannot overwrite existing directory '{path}' with a file during update; remove it or pass --force"
+        );
+    }
+    // Reading a FIFO blocks forever and a device/socket never yields file bytes.
+    // Symlinks and regular files keep the read-and-compare behavior below.
+    if !file_type.is_file() && !file_type.is_symlink() {
+        anyhow::bail!(
+            "cannot overwrite existing non-regular file '{path}' (FIFO, socket, or device) during update; remove it or pass --force"
         );
     }
     let existing_bytes = std::fs::read(full)
