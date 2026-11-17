@@ -253,6 +253,7 @@ fn test_gc_preserves_unexpired_odb_objects_and_allows_resurrection() {
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
+#[cfg(unix)]
 #[test]
 fn test_gc_index_rewrite_refuses_symlinked_temp() {
     let tmp = std::env::temp_dir().join(format!("oot-gc-symlink-{}", std::process::id()));
@@ -295,6 +296,15 @@ fn test_gc_index_rewrite_refuses_symlinked_temp() {
     let index = std::fs::read_to_string(tmp.join(".oot/.index")).unwrap();
     assert!(index.contains(&c1), ".index lost the live change");
     assert!(!index.contains(&c2), ".index kept the pruned change");
+
+    // gc now uses a random temp name, so the planted link at the old fixed
+    // path is never touched. Its survival proves the open-to-rename swap
+    // target is no longer predictable.
+    let planted = std::fs::symlink_metadata(tmp.join(".oot/.index.tmp")).unwrap();
+    assert!(
+        planted.file_type().is_symlink(),
+        "gc reused the predictable .index.tmp name"
+    );
 
     let _ = std::fs::remove_dir_all(&tmp);
 }

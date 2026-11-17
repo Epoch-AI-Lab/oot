@@ -826,10 +826,19 @@ impl Store {
         if self.index()?.iter().any(|e| e == id) {
             return Ok(());
         }
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.root.join(".index"))?;
+        let index_path = self.root.join(".index");
+        // Refuse a planted link, and keep O_NOFOLLOW on the open so a link
+        // swapped in between the check and the open cannot redirect the
+        // append to an arbitrary file.
+        refuse_symlink(&index_path, "store index")?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).append(true);
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.custom_flags(0o400000); // O_NOFOLLOW
+        }
+        let mut f = opts.open(&index_path)?;
         writeln!(f, "{id}")?;
         Ok(())
     }
@@ -2658,21 +2667,14 @@ impl Store {
                     content.push('\n');
                 }
                 let index_path = self.root.join(".index");
-                let tmp_index = self.root.join(".index.tmp");
+                // Unpredictable temp name: an attacker cannot inotify the
+                // create and swap a symlink into the open-to-rename window.
+                // Keep it in self.root so rename stays on one filesystem.
+                let tmp_index = self.root.join(format!(".index.tmp-{}", random_hex()));
                 // A link at the final path must not be written through.
                 refuse_symlink(&index_path, "store index")?;
-                // Clear any stale temp, including a planted symlink. unlink
-                // removes the link itself, not its target. create_new plus
-                // O_NOFOLLOW below cover a link swapped in before open.
-                match std::fs::remove_file(&tmp_index) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        return Err(e).with_context(|| {
-                            format!("failed to clear index temp {}", tmp_index.display())
-                        });
-                    }
-                }
+                // create_new + O_NOFOLLOW still guard the open: if the random
+                // name collided with a planted link, neither writes through.
                 let write_res = (|| -> Result<()> {
                     use std::io::Write;
                     let mut opts = std::fs::OpenOptions::new();
@@ -3859,6 +3861,26 @@ fn refuse_symlink(path: &Path, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// 16-hex-char random suffix for temp files.
+/// Tries /dev/urandom first (Linux), falls back to a hash of time+pid+thread.
+/// Mirrored from update.rs, which lives in the binary crate and cannot be
+/// called from this library crate.
+fn random_hex() -> String {
+    let mut buf = [0u8; 8];
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        use std::io::Read;
+        if f.read_exact(&mut buf).is_ok() {
+            return buf.iter().map(|b| format!("{b:02x}")).collect();
+        }
+    }
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    SystemTime::now().hash(&mut h);
+    std::process::id().hash(&mut h);
+    std::thread::current().id().hash(&mut h);
+    format!("{:016x}", h.finish())
+}
+
 /// The secret-key state for `entry` in the local keyring: absent, present
 /// but unusable, or usable. Oot only resolves; it never generates or
 /// fetches keys.
@@ -4965,6 +4987,42 @@ mod tests {
         assert_eq!(
             store.refs().unwrap(),
             vec![("feature/one".to_string(), id.clone())]
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_index_temp_suffix_is_unpredictable() {
+        let a = super::random_hex();
+        let b = super::random_hex();
+        assert_eq!(a.len(), 16);
+        assert_ne!(a, b, "temp suffix must change each call");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_index_push_refuses_symlinked_index() {
+        let tmp =
+            std::env::temp_dir().join(format!("oot-index-push-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let project = tmp.join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let store = Store::init(&project).unwrap();
+
+        let victim = tmp.join("victim.txt");
+        std::fs::write(&victim, "do not clobber me\n").unwrap();
+        std::os::unix::fs::symlink(&victim, project.join(".oot/.index")).unwrap();
+
+        let err = store.index_push("abc123").unwrap_err();
+        assert!(
+            err.to_string().contains("must not be a symlink"),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not clobber me\n",
+            "index_push must not append through a symlink"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
