@@ -1385,3 +1385,72 @@ fn test_update_fifo_at_untracked_path_fails_fast() {
 
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[cfg(unix)]
+#[test]
+fn test_update_symlink_to_fifo_at_untracked_path_fails_fast() {
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmp = unique_tmp("symlink-fifo");
+    let _ = std::fs::remove_dir_all(&tmp);
+    let proj = tmp.join("proj");
+    std::fs::create_dir_all(&proj).unwrap();
+    assert!(oot(&["init"], &proj).0);
+
+    std::fs::write(proj.join("base.txt"), "base\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "main", "-m", "base"], &proj);
+    assert!(ok, "{msg}");
+
+    // Store f as a plain file on feat so update has to materialize it.
+    std::fs::write(proj.join("f"), "payload\n").unwrap();
+    let (ok, msg) = oot(&["record", "--branch", "feat", "-m", "add f"], &proj);
+    assert!(ok, "{msg}");
+
+    // Return to a clean main, then drop f so it is untracked again.
+    let (ok, msg) = oot(&["update", "--branch", "main", "--force"], &proj);
+    assert!(ok, "{msg}");
+    let _ = std::fs::remove_file(proj.join("f"));
+
+    // f itself is now a symlink straight into a FIFO. collect_worktree skips
+    // symlinks, so f stays untracked and update must write it.
+    let fifo = tmp.join("fifo");
+    assert!(
+        Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success(),
+        "mkfifo should succeed"
+    );
+    symlink(&fifo, proj.join("f")).unwrap();
+
+    // A regression reads through the link into the FIFO while holding the
+    // store lock. Guard the update with a timeout so the test fails, not hangs.
+    let (tx, rx) = mpsc::channel();
+    let cwd = proj.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(oot(&["update", "--branch", "feat"], &cwd));
+    });
+    let (ok, out) = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(result) => result,
+        Err(_) => panic!("oot update hung on symlink to FIFO at f"),
+    };
+
+    assert!(!ok, "update must reject a symlink to a FIFO at f: {out}");
+    assert!(out.contains("'f'"), "error must name the path: {out}");
+    assert!(
+        out.contains("non-regular"),
+        "error must explain the special file: {out}"
+    );
+    assert!(
+        std::fs::symlink_metadata(proj.join("f"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "the bail must not have removed the original symlink"
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+}
