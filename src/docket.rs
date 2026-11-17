@@ -4,6 +4,9 @@ use crate::dispute::Docket;
 use std::io::Write;
 use std::path::Path;
 
+/// 128 leaves ~70 bytes for the dot prefix, `.tmp-`, pid and nanos suffix, keeping totals under NAME_MAX 255.
+pub const TEMP_NAME_MAX_BYTES: usize = 128;
+
 /// Serialize an adjudication [`Docket`] to a pretty-printed JSON string.
 pub fn to_json(d: &Docket) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(d)?)
@@ -37,11 +40,18 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "docket".to_string());
+    // Truncate the name so a target near NAME_MAX cannot overflow the temp
+    // name; floor to a char boundary to avoid slicing into a multi-byte char.
+    let name_part = if file_name.len() > TEMP_NAME_MAX_BYTES {
+        &file_name[..file_name.floor_char_boundary(TEMP_NAME_MAX_BYTES)]
+    } else {
+        &file_name
+    };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let tmp = dir.join(format!(".{file_name}.tmp-{}-{nanos}", std::process::id()));
+    let tmp = dir.join(format!(".{name_part}.tmp-{}-{nanos}", std::process::id()));
 
     let write_result = (|| -> anyhow::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
