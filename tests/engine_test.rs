@@ -1276,6 +1276,62 @@ fn test_engine_whitespace_only_change_is_silent() {
 }
 
 #[test]
+fn test_engine_whitespace_in_literal_is_disputed() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"hello world\";\n".as_bytes().to_vec(),
+    );
+
+    // Only the space inside the string literal changed.
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"helloworld\";\n".as_bytes().to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "literal edit must dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
+#[test]
+fn test_engine_whitespace_outside_literal_is_silent() {
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const greeting = \"hello world\";\n".as_bytes().to_vec(),
+    );
+
+    // Reindent and respace the code; the literal stays byte-identical.
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "   const   greeting=\"hello world\" ;  \n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes.is_empty(),
+        "formatting churn outside literals must not dispute: {:?}",
+        disputes
+    );
+}
+
+#[test]
 fn test_engine_function_edit_plus_injection_flags_both() {
     let engine = Engine::new().expect("Failed to initialize engine");
 
@@ -1371,4 +1427,131 @@ fn test_engine_toplevel_injection_on_function_line_is_caught() {
         "function body is unchanged, must not flag a function change: {:?}",
         disputes
     );
+}
+
+#[test]
+fn test_engine_rust_lifetime_and_attribute_reformat_is_silent() {
+    // Rust `'` is a lifetime or char literal, not a string delimiter, and `#`
+    // is an attribute, not a comment. Reformatting around both is pure churn.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "src/types.rs".to_string(),
+        "type Pair<'a> = &'a str;\n#[derive(Debug, Clone)]\nstruct Thing<'a> { name: &'a str }\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "src/types.rs".to_string(),
+        "type Pair < 'a > = & 'a str ;\n#[derive(Debug,Clone)]\nstruct Thing < 'a > { name : & 'a str }\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert!(
+        disputes.is_empty(),
+        "whitespace-only Rust reformat of lifetimes and attributes must not dispute: {:?}",
+        disputes
+    );
+}
+
+#[test]
+fn test_engine_line_comment_whitespace_is_disputed() {
+    // A `//` comment is kept verbatim, so editing the text inside it is a real
+    // change even when the only difference is whitespace.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "const admin = false; // keep this note\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "const admin = false; // keep  this note\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "line-comment edit must dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
+#[test]
+fn test_engine_block_comment_whitespace_is_disputed() {
+    // Same for `/* */`: whitespace inside a block comment survives squashing.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "config.js".to_string(),
+        "/* a block comment here */\nconst admin = false;\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "config.js".to_string(),
+        "/* a block  comment here */\nconst admin = false;\n"
+            .as_bytes()
+            .to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "block-comment edit must dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0]
+        .detail
+        .contains("top-level or non-function definitions"));
+}
+
+#[test]
+fn test_engine_python_hash_comment_whitespace_is_disputed() {
+    // `#` is a comment opener in Python (py/pyi route here), so whitespace
+    // inside it is preserved while the same `#` in Rust is plain code.
+    let engine = Engine::new().expect("Failed to initialize engine");
+
+    let mut base = Snapshot::default();
+    base.files.insert(
+        "settings.py".to_string(),
+        "# note: two words\nDEBUG = False\n".as_bytes().to_vec(),
+    );
+
+    let mut head = Snapshot::default();
+    head.files.insert(
+        "settings.py".to_string(),
+        "# note: two  words\nDEBUG = False\n".as_bytes().to_vec(),
+    );
+
+    let disputes = engine.diff_snapshots(&base, &head).expect("Diff failed");
+    assert_eq!(
+        disputes.len(),
+        1,
+        "Python hash-comment edit must dispute: {:?}",
+        disputes
+    );
+    assert!(disputes[0]
+        .detail
+        .contains("top-level or non-function definitions"));
 }
