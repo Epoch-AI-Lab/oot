@@ -4,6 +4,9 @@ use crate::dispute::Docket;
 use std::io::Write;
 use std::path::Path;
 
+/// 128 leaves ~70 bytes for the dot prefix, `.tmp-`, pid and nanos suffix, keeping totals under NAME_MAX 255.
+pub const TEMP_NAME_MAX_BYTES: usize = 128;
+
 /// Serialize an adjudication [`Docket`] to a pretty-printed JSON string.
 pub fn to_json(d: &Docket) -> anyhow::Result<String> {
     Ok(serde_json::to_string_pretty(d)?)
@@ -39,8 +42,8 @@ pub(crate) fn atomic_write(path: &Path, contents: &[u8]) -> anyhow::Result<()> {
         .unwrap_or_else(|| "docket".to_string());
     // Truncate the name so a target near NAME_MAX cannot overflow the temp
     // name; floor to a char boundary to avoid slicing into a multi-byte char.
-    let name_part = if file_name.len() > 128 {
-        &file_name[..file_name.floor_char_boundary(128)]
+    let name_part = if file_name.len() > TEMP_NAME_MAX_BYTES {
+        &file_name[..file_name.floor_char_boundary(TEMP_NAME_MAX_BYTES)]
     } else {
         &file_name
     };

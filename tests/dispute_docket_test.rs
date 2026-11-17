@@ -165,6 +165,68 @@ fn test_docket_save_with_long_file_name() {
 }
 
 #[test]
+fn test_docket_save_with_multibyte_name_splitting_byte_128() {
+    let original = sample_docket();
+    let dir = std::env::temp_dir().join(format!("oot_docket_multibyte_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Three-byte chars put byte 128 inside a character: the nearest boundary
+    // at or below it is 126, so a plain &name[..128] would panic here.
+    let name = format!("{}.json", "中".repeat(80));
+    assert!(
+        !name.is_char_boundary(128),
+        "byte 128 must split a character"
+    );
+    let file_path = dir.join(&name);
+
+    docket::save(&original, &file_path).expect("save with multibyte name failed");
+
+    let loaded = docket::load(&file_path).expect("load failed");
+    assert_eq!(loaded.change, original.change);
+    assert_eq!(loaded.verdict, original.verdict);
+    assert_eq!(loaded.intent, original.intent);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_docket_save_at_name_max_edge() {
+    let original = sample_docket();
+    let dir = std::env::temp_dir().join(format!("oot_docket_namemax_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Pin NAME_MAX: use the longest name this filesystem actually accepts.
+    // Most hosts allow 255; some mounts cap at 254. Either way a temp name
+    // built from the untruncated target overflows it.
+    let max = (1..=255)
+        .rev()
+        .find(|len| {
+            let probe = dir.join("a".repeat(*len));
+            if std::fs::File::create(&probe).is_ok() {
+                let _ = std::fs::remove_file(&probe);
+                true
+            } else {
+                false
+            }
+        })
+        .expect("could not create a file in the test directory");
+    let name = format!("{}.json", "a".repeat(max - 5));
+    assert_eq!(name.len(), max);
+    let file_path = dir.join(&name);
+
+    docket::save(&original, &file_path).expect("save at NAME_MAX edge failed");
+
+    let loaded = docket::load(&file_path).expect("load failed");
+    assert_eq!(loaded.change, original.change);
+    assert_eq!(loaded.verdict, original.verdict);
+    assert_eq!(loaded.intent, original.intent);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn test_docket_load_from_example_fixture() {
     let fixture_path = Path::new("fixtures/example.json");
     let docket = docket::load(fixture_path).expect("Failed to load fixtures/example.json");
