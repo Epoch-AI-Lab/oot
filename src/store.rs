@@ -2667,8 +2667,8 @@ impl Store {
                     content.push('\n');
                 }
                 let index_path = self.root.join(".index");
-                // Unpredictable temp name: an attacker cannot inotify the
-                // create and swap a symlink into the open-to-rename window.
+                // Random temp name: a fixed name could be pre-planted with a
+                // symlink before gc runs, which the open would then follow.
                 // Keep it in self.root so rename stays on one filesystem.
                 let tmp_index = self.root.join(format!(".index.tmp-{}", random_hex()));
                 // A link at the final path must not be written through.
